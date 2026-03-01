@@ -1,6 +1,7 @@
 ﻿// FILE: Core/AppState.cs
 using HyForce.Data;
 using HyForce.Networking;
+using HyForce.Protocol;
 using System.Collections.Concurrent;
 
 namespace HyForce.Core;
@@ -40,13 +41,11 @@ public class AppState : IDisposable
     public List<string> InGameLog { get; } = new();
     public const int MaxInGameLogLines = 1000;
 
-    // FIXED: Use the requested export path
     public string ExportDirectory { get; set; } = @"C:\Users\benja\source\repos\HyForce\Exported logs";
 
     public event Action? OnPacketReceived;
     public event Action? OnSecurityEvent;
 
-    // NEW: Memory reading events
     public event Action? OnMemoryDataUpdated;
 
     public AppState()
@@ -60,7 +59,6 @@ public class AppState : IDisposable
         TcpProxy.OnPacket += HandlePacket;
         UdpProxy.OnPacket += HandlePacket;
 
-        // Ensure export directory exists
         Directory.CreateDirectory(ExportDirectory);
     }
 
@@ -83,7 +81,7 @@ public class AppState : IDisposable
 
         TcpProxy.Start("127.0.0.1", tcpPort, TargetHost, TargetPort);
 
-        Thread.Sleep(200); // Small delay to ensure TCP proxy is up before starting UDP
+        Thread.Sleep(200);
 
         UdpProxy.Start("127.0.0.1", udpPort, TargetHost, TargetPort);
 
@@ -176,7 +174,6 @@ public class AppState : IDisposable
         AddInGameLog("All data cleared");
     }
 
-    // ENHANCED: Comprehensive diagnostics report
     public string GenerateDiagnostics()
     {
         var sb = new System.Text.StringBuilder();
@@ -188,7 +185,6 @@ public class AppState : IDisposable
         sb.AppendLine($"Session Duration: {(StartTime.HasValue ? FormatDuration(DateTime.Now - StartTime.Value) : "Not running")}");
         sb.AppendLine();
 
-        // SYSTEM INFO
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                              SYSTEM INFORMATION                               ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
@@ -198,7 +194,6 @@ public class AppState : IDisposable
         sb.AppendLine($"Processor Count: {Environment.ProcessorCount}");
         sb.AppendLine();
 
-        // CONFIGURATION
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                                CONFIGURATION                                  ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
@@ -208,7 +203,6 @@ public class AppState : IDisposable
         sb.AppendLine($"Export Path: {ExportDirectory}");
         sb.AppendLine();
 
-        // PROXY STATUS
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                                PROXY STATUS                                   ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
@@ -223,7 +217,6 @@ public class AppState : IDisposable
         sb.AppendLine($"  - Total Clients: {UdpProxy.TotalClients}");
         sb.AppendLine();
 
-        // TRAFFIC STATISTICS
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                              TRAFFIC STATISTICS                               ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
@@ -238,7 +231,6 @@ public class AppState : IDisposable
         sb.AppendLine($"Unique Opcodes: {PacketLog.UniqueOpcodes}");
         sb.AppendLine();
 
-        // TOP OPCODES
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                                TOP 20 OPCODES                                 ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
@@ -251,64 +243,38 @@ public class AppState : IDisposable
         }
         sb.AppendLine();
 
-        // REGISTRY DATA
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                                REGISTRY DATA                                  ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
-        sb.AppendLine($"RegistrySync Received: {Protocol.RegistrySyncParser.RegistrySyncReceived}");
-        sb.AppendLine($"Found at Opcode: 0x{Protocol.RegistrySyncParser.FoundAtOpcode:X4}");
+        sb.AppendLine($"RegistrySync Received: {RegistrySyncParser.RegistrySyncReceived}");
+        sb.AppendLine($"Found at Opcode: 0x{RegistrySyncParser.FoundAtOpcode:X4}");
         sb.AppendLine();
-        sb.AppendLine($"Items Parsed: {Protocol.RegistrySyncParser.NumericIdToName.Count:N0}");
-        sb.AppendLine($"String IDs: {Protocol.RegistrySyncParser.StringIdToName.Count:N0}");
-        sb.AppendLine($"Player Names: {Protocol.RegistrySyncParser.PlayerNamesSeen.Count:N0}");
-        sb.AppendLine($"Total Entries: {Protocol.RegistrySyncParser.TotalParsed}");
+        sb.AppendLine($"Items Parsed: {RegistrySyncParser.NumericIdToName.Count:N0}");
+        sb.AppendLine($"String IDs: {RegistrySyncParser.StringIdToName.Count:N0}");
+        sb.AppendLine($"Player Names: {RegistrySyncParser.PlayerNamesSeen.Count:N0}");
+        sb.AppendLine($"Total Entries: {RegistrySyncParser.TotalParsed}");
         sb.AppendLine();
 
-        // ITEM SAMPLES (first 50)
-        if (Protocol.RegistrySyncParser.NumericIdToName.Count > 0)
+        if (RegistrySyncParser.NumericIdToName.Count > 0)
         {
             sb.AppendLine("--- Sample Items (First 50) ---");
-            foreach (var item in Protocol.RegistrySyncParser.NumericIdToName.Take(50))
+            foreach (var item in RegistrySyncParser.NumericIdToName.Take(50))
             {
                 sb.AppendLine($"  [{item.Key:X8}] {item.Value}");
             }
             sb.AppendLine();
         }
 
-        // PLAYER SAMPLES
-        if (Protocol.RegistrySyncParser.PlayerNamesSeen.Count > 0)
+        if (RegistrySyncParser.PlayerNamesSeen.Count > 0)
         {
             sb.AppendLine("--- Detected Players ---");
-            foreach (var player in Protocol.RegistrySyncParser.PlayerNamesSeen.Take(50))
+            foreach (var player in RegistrySyncParser.PlayerNamesSeen.Take(50))
             {
                 sb.AppendLine($"  - {player}");
             }
             sb.AppendLine();
         }
 
-        // OPCODE BREAKDOWN
-        if (Protocol.RegistrySyncParser.OpcodeEntryCount.Count > 0)
-        {
-            sb.AppendLine("--- Opcode Entry Counts ---");
-            foreach (var oc in Protocol.RegistrySyncParser.OpcodeEntryCount.OrderBy(x => x.Key))
-            {
-                sb.AppendLine($"  0x{oc.Key:X2}: {oc.Value} entries");
-            }
-            sb.AppendLine();
-        }
-
-        // PARSE LOG
-        if (Protocol.RegistrySyncParser.ParseLog.Count > 0)
-        {
-            sb.AppendLine("--- Parse Log ---");
-            foreach (var log in Protocol.RegistrySyncParser.ParseLog.OrderBy(x => x.Key))
-            {
-                sb.AppendLine($"  0x{log.Key:X2}: {log.Value}");
-            }
-            sb.AppendLine();
-        }
-
-        // DATABASE
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                               PLAYER DATABASE                                 ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
@@ -316,7 +282,6 @@ public class AppState : IDisposable
         sb.AppendLine($"Unique Players: {Database.Players.Count:N0}");
         sb.AppendLine();
 
-        // SECURITY EVENTS
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                               SECURITY EVENTS                                 ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
@@ -325,7 +290,6 @@ public class AppState : IDisposable
         sb.AppendLine($"By Category: {string.Join(", ", categories)}");
         sb.AppendLine();
 
-        // RECENT EVENTS (last 20)
         sb.AppendLine("--- Recent Events (Last 20) ---");
         foreach (var evt in SecurityEvents.OrderByDescending(e => e.Timestamp).Take(20))
         {
@@ -340,7 +304,6 @@ public class AppState : IDisposable
         }
         sb.AppendLine();
 
-        // IN-GAME LOG (last 50 lines)
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                                IN-GAME LOG                                    ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
@@ -353,7 +316,6 @@ public class AppState : IDisposable
         }
         sb.AppendLine();
 
-        // END
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine("                           END OF DIAGNOSTICS REPORT                           ");
         sb.AppendLine("═══════════════════════════════════════════════════════════════════════════════");
@@ -376,7 +338,6 @@ public class AppState : IDisposable
                 $"0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeName}) {pkt.ByteLength} bytes " +
                 $"[{pkt.CompressionMethod}] [{(pkt.EncryptionHint == "encrypted" ? "ENC" : "CLR")}]");
 
-            // Add hex preview for smaller packets
             if (pkt.ByteLength <= 256 && !string.IsNullOrEmpty(pkt.RawHexPreview))
             {
                 sb.AppendLine($"  HEX: {pkt.RawHexPreview}");
@@ -386,7 +347,6 @@ public class AppState : IDisposable
         return sb.ToString();
     }
 
-    // FIXED: Export methods with proper path handling
     public void ExportDiagnostics()
     {
         try
@@ -434,19 +394,14 @@ public class AppState : IDisposable
             string basePath = Path.Combine(ExportDirectory, $"hyforce_full_export_{timestamp}");
             Directory.CreateDirectory(basePath);
 
-            // Export diagnostics
             File.WriteAllText(Path.Combine(basePath, "diagnostics.txt"), GenerateDiagnostics());
-
-            // Export packet log
             File.WriteAllText(Path.Combine(basePath, "packets.txt"), ExportPacketLog());
 
-            // Export in-game log
             lock (InGameLog)
             {
                 File.WriteAllLines(Path.Combine(basePath, "ingame_log.txt"), InGameLog);
             }
 
-            // Export security events
             var securitySb = new System.Text.StringBuilder();
             securitySb.AppendLine("=== SECURITY EVENTS ===");
             foreach (var evt in SecurityEvents.OrderBy(e => e.Timestamp))
@@ -459,27 +414,24 @@ public class AppState : IDisposable
             }
             File.WriteAllText(Path.Combine(basePath, "security_events.txt"), securitySb.ToString());
 
-            // Export items
-            if (Protocol.RegistrySyncParser.NumericIdToName.Count > 0)
+            if (RegistrySyncParser.NumericIdToName.Count > 0)
             {
                 var itemsSb = new System.Text.StringBuilder();
                 itemsSb.AppendLine("=== ITEMS ===");
-                foreach (var item in Protocol.RegistrySyncParser.NumericIdToName.OrderBy(x => x.Key))
+                foreach (var item in RegistrySyncParser.NumericIdToName.OrderBy(x => x.Key))
                 {
                     itemsSb.AppendLine($"{item.Key:X8} = {item.Value}");
                 }
                 File.WriteAllText(Path.Combine(basePath, "items.txt"), itemsSb.ToString());
             }
 
-            // Export players
-            if (Protocol.RegistrySyncParser.PlayerNamesSeen.Count > 0)
+            if (RegistrySyncParser.PlayerNamesSeen.Count > 0)
             {
-                File.WriteAllLines(Path.Combine(basePath, "players.txt"), Protocol.RegistrySyncParser.PlayerNamesSeen);
+                File.WriteAllLines(Path.Combine(basePath, "players.txt"), RegistrySyncParser.PlayerNamesSeen);
             }
 
             AddInGameLog($"[SUCCESS] Full export completed to {basePath}");
 
-            // Try to open folder
             try
             {
                 System.Diagnostics.Process.Start("explorer.exe", basePath);

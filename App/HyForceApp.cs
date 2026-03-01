@@ -1,5 +1,6 @@
 ﻿using HyForce.Core;
 using HyForce.Tabs;
+using HyForce.Networking;
 using HyForce.UI;
 using ImGuiNET;
 using Veldrid;
@@ -48,7 +49,7 @@ public class HyForceApp
         _tabs.Add(new ItemsTab(_state));      // ADD THIS
         _tabs.Add(new PacketFeedTab(_state));
         _tabs.Add(new SecurityAuditTab(_state));
-        _tabs.Add(new AnalyticsTab(_state));
+        _tabs.Add(new PacketAnalyticsTab(_state));
         _tabs.Add(new LogTab(_state));
         _tabs.Add(new MemoryTab(_state));
         _tabs.Add(new SettingsTab(_state));
