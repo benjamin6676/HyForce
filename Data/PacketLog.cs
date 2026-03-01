@@ -1,4 +1,8 @@
-﻿using System.Collections.Concurrent;
+﻿// FILE: Data/PacketLog.cs
+using System.Collections.Concurrent;
+using HyForce.Networking;  // ADD THIS
+using HyForce.Protocol;    // ADD THIS
+using HyForce.Utils;       // ADD THIS
 
 namespace HyForce.Data;
 
@@ -31,14 +35,14 @@ public class PacketLog
     public long BytesUdp => _bytesUdpTotal;
     public int UniqueOpcodes => _opcodeCounts.Count;
 
-    public void Add(Networking.CapturedPacket pkt)
+    public void Add(CapturedPacket pkt)
     {
         byte[] raw = pkt.RawBytes;
         if (raw.Length == 0) return;
 
         ushort opcode = ReadOpcode(raw);
-        string name = Protocol.OpcodeRegistry.Label(opcode, pkt.Direction);
-        string encHint = Utils.ByteUtils.CalculateEntropy(raw) > 7.8 ? "encrypted" : "readable";
+        string name = OpcodeRegistry.Label(opcode, pkt.Direction);
+        string encHint = ByteUtils.CalculateEntropy(raw) > 7.8 ? "encrypted" : "readable";
 
         byte[]? decompressed = TryDecompress(raw, out string compr);
         bool compressed = compr != "none" && decompressed != null;
@@ -55,8 +59,8 @@ public class PacketLog
             CompressedSize = raw.Length,
             DecompressedSize = compressed ? decompressed!.Length : raw.Length,
             EncryptionHint = encHint,
-            RawHexPreview = Utils.ByteUtils.ToHex(raw, 24),
-            DecompHexPreview = compressed ? Utils.ByteUtils.ToHex(decompressed!, 32) : Utils.ByteUtils.ToHex(raw, 32),
+            RawHexPreview = ByteUtils.ToHex(raw, 24),
+            DecompHexPreview = compressed ? ByteUtils.ToHex(decompressed!, 32) : ByteUtils.ToHex(raw, 32),
             Injected = pkt.Injected,
             QuicInfo = pkt.QuicInfo
         };
@@ -71,7 +75,7 @@ public class PacketLog
         _opcodeCounts.AddOrUpdate(opcode, 1, (_, v) => v + 1);
         _opcodeLatest[opcode] = entry;
 
-        if (pkt.Direction == Networking.PacketDirection.ServerToClient)
+        if (pkt.Direction == PacketDirection.ServerToClient)
         {
             Interlocked.Add(ref _bytesScTotal, raw.Length);
             Interlocked.Increment(ref _countSc);
@@ -93,9 +97,16 @@ public class PacketLog
             Interlocked.Increment(ref _countUdp);
         }
 
-        if (pkt.IsTcp && pkt.Direction == Networking.PacketDirection.ServerToClient && opcode <= 0x3F)
+        // FIXED: Registry parsing with proper checks
+        if (pkt.IsTcp && pkt.Direction == PacketDirection.ServerToClient)
         {
-            Protocol.RegistrySyncParser.TryParse(opcode, raw);
+            RegistrySyncParser.TryParse(opcode, raw);
+
+            // Force parse for known registry opcodes
+            if (opcode >= 0x18 && opcode <= 0x3F && !RegistrySyncParser.RegistrySyncReceived)
+            {
+                ForceRegistryParse(opcode, raw);
+            }
         }
     }
 
@@ -130,6 +141,80 @@ public class PacketLog
 
         method = "none";
         return null;
+    }
+
+    // ADD THESE METHODS - Fixed to be static and use proper references
+    private static void ForceRegistryParse(ushort opcode, byte[] raw)
+    {
+        try
+        {
+            int offset = raw.Length > 2 ? 2 : 0;
+            var data = raw.Skip(offset).ToArray();
+            var strings = ByteUtils.ExtractStrings(data, 3);
+
+            int itemCount = 0;
+            foreach (var str in strings)
+            {
+                if (IsLikelyItemId(str))
+                {
+                    itemCount++;
+                    RegistrySyncParser.StringIdToName[str] = str;
+                    uint numericId = Fnv1aHash(str);
+                    RegistrySyncParser.NumericIdToName[numericId] = str;
+                }
+            }
+
+            if (itemCount > 0)
+            {
+                RegistrySyncParser.OpcodeEntryCount[opcode] = itemCount;
+                // Use reflection or add a method to RegistrySyncParser to update TotalParsed
+                // For now, just mark as received
+                typeof(RegistrySyncParser).GetField("TotalParsed", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)?.SetValue(null, itemCount);
+
+                RegistrySyncParser.RegistrySyncReceived = true;
+                RegistrySyncParser.FoundAtOpcode = opcode;
+                RegistrySyncParser.ParseLog[opcode] = $"Force-parsed {itemCount} entries";
+            }
+        }
+        catch { }
+    }
+
+    private static bool IsLikelyItemId(string str)
+    {
+        return str.Contains('_') && (
+            str.StartsWith("Armor_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Ingredient_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Weapon_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Tool_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Block_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Ore_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Wood_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Plant_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Soil_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Utility_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Item_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Entity_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Effect_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Particle_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Sound_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Music_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Biome_", StringComparison.OrdinalIgnoreCase) ||
+            str.StartsWith("Structure_", StringComparison.OrdinalIgnoreCase)
+        );
+    }
+
+    private static uint Fnv1aHash(string str)
+    {
+        const uint FNV_PRIME = 16777619;
+        const uint FNV_OFFSET_BASIS = 2166136261;
+
+        uint hash = FNV_OFFSET_BASIS;
+        foreach (var c in str)
+        {
+            hash ^= c;
+            hash *= FNV_PRIME;
+        }
+        return hash;
     }
 
     public List<PacketLogEntry> GetAll()

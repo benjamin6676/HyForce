@@ -1,4 +1,5 @@
-﻿using HyForce.Core;
+﻿// FILE: Tabs/ConnectTab.cs
+using HyForce.Core;
 using HyForce.UI;
 using ImGuiNET;
 using System.Numerics;
@@ -14,6 +15,8 @@ public class ConnectTab : ITab
     private readonly byte[] _bufServerPort = new byte[8];
     private readonly byte[] _bufUnifiedPort = new byte[8];
     private bool _showAdvanced = false;
+
+    private int _selectedPresetIndex = 3; // Default to "Blank"
 
     public ConnectTab(AppState state)
     {
@@ -32,7 +35,6 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // CRITICAL WARNING
         if (!_state.IsRunning)
         {
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.95f, 0.28f, 0.22f, 1));
@@ -67,7 +69,67 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // Mode selector
+        // SERVER PRESET SELECTOR - FIXED AND VISIBLE
+        ImGui.TextColored(Theme.ColAccent, "Server Preset:");
+
+        var presets = _state.Config.GetAllPresets();
+        string[] presetNames = presets.Select(p => p.Name).ToArray();
+
+        ImGui.SetNextItemWidth(leftW - 32);
+        if (ImGui.Combo("##presetSelector", ref _selectedPresetIndex, presetNames, presetNames.Length))
+        {
+            var selected = presets[_selectedPresetIndex];
+
+            if (selected.Name != "Blank" && !string.IsNullOrEmpty(selected.IpAddress))
+            {
+                System.Text.Encoding.ASCII.GetBytes(selected.IpAddress).CopyTo(_bufServerIp, 0);
+                System.Text.Encoding.ASCII.GetBytes(selected.Port.ToString()).CopyTo(_bufServerPort, 0);
+                _state.TargetHost = selected.IpAddress;
+                _state.TargetPort = selected.Port;
+
+                _state.AddInGameLog($"[PRESET] Loaded {selected.Name}: {selected.IpAddress}:{selected.Port}");
+            }
+            else
+            {
+                Array.Clear(_bufServerIp, 0, _bufServerIp.Length);
+                Array.Clear(_bufServerPort, 0, _bufServerPort.Length);
+                System.Text.Encoding.ASCII.GetBytes("5520").CopyTo(_bufServerPort, 0);
+                _state.TargetHost = "";
+                _state.TargetPort = 5520;
+            }
+        }
+
+        if (_selectedPresetIndex < presets.Count)
+        {
+            var current = presets[_selectedPresetIndex];
+            if (!string.IsNullOrEmpty(current.Description))
+            {
+                ImGui.TextColored(Theme.ColTextMuted, $"  {current.Description}");
+            }
+            if (!string.IsNullOrEmpty(current.IpAddress))
+            {
+                ImGui.TextColored(Theme.ColTextMuted, $"  {current.IpAddress}:{current.Port}");
+            }
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        // MANUAL SERVER CONFIGURATION WITH COPY-PASTE
+
+        ImGui.Text("Target Server IP:");
+        RenderInputWithPaste("##srvIp", _bufServerIp, (val) => _state.TargetHost = val, leftW - 32);
+
+        ImGui.Spacing();
+
+        ImGui.Text("Server Port:");
+        RenderPortInputWithPaste("##srvPort", _bufServerPort, (val) => { if (int.TryParse(val, out int p)) _state.TargetPort = p; }, 120);
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         ImGui.Text("Proxy Mode:");
         bool unified = _state.UseUnifiedPort;
 
@@ -87,31 +149,10 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // Server IP
-        ImGui.Text("Target Server IP:");
-        ImGui.SetNextItemWidth(leftW - 32);
-        if (ImGui.InputText("##srvIp", _bufServerIp, (uint)_bufServerIp.Length))
-            _state.TargetHost = System.Text.Encoding.ASCII.GetString(_bufServerIp).TrimEnd('\0');
-
-        ImGui.Spacing();
-        ImGui.Text("Server Port:");
-        ImGui.SetNextItemWidth(90);
-        if (ImGui.InputText("##srvPort", _bufServerPort, (uint)_bufServerPort.Length))
-            if (int.TryParse(System.Text.Encoding.ASCII.GetString(_bufServerPort).TrimEnd('\0'), out int p))
-                _state.TargetPort = p;
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        // Port configuration
         if (_state.UseUnifiedPort)
         {
             ImGui.Text("Unified Port (TCP + UDP):");
-            ImGui.SetNextItemWidth(90);
-            if (ImGui.InputText("##unifiedPort", _bufUnifiedPort, (uint)_bufUnifiedPort.Length))
-                if (int.TryParse(System.Text.Encoding.ASCII.GetString(_bufUnifiedPort).TrimEnd('\0'), out int p))
-                    _state.UnifiedPort = p;
+            RenderPortInputWithPaste("##unifiedPort", _bufUnifiedPort, (val) => { if (int.TryParse(val, out int p)) _state.UnifiedPort = p; }, 120);
 
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1),
@@ -129,7 +170,6 @@ public class ConnectTab : ITab
 
         ImGui.Spacing();
 
-        // Control buttons
         if (!_state.IsRunning)
         {
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.7f, 0.3f, 1f));
@@ -149,7 +189,6 @@ public class ConnectTab : ITab
         if (ImGui.Button("Clear All Data", new Vector2(leftW - 24, 28)))
             _state.ClearAll();
 
-        // Advanced options
         ImGui.Spacing();
         ImGui.Checkbox("Show Advanced/Debug", ref _showAdvanced);
 
@@ -169,7 +208,99 @@ public class ConnectTab : ITab
             {
                 TestLocalConnection();
             }
+
+            if (ImGui.Button("Copy Config to Clipboard", new Vector2(leftW - 24, 28)))
+            {
+                var configText = $"Server: {_state.TargetHost}:{_state.TargetPort}\n" +
+                               $"Mode: {(_state.UseUnifiedPort ? "Unified" : "Separate")}\n" +
+                               $"Listen: 127.0.0.1:{_state.UnifiedPort}";
+                CopyToClipboard(configText);
+                _state.AddInGameLog("[DEBUG] Config copied to clipboard");
+            }
         }
+    }
+
+    private void RenderInputWithPaste(string id, byte[] buffer, Action<string> onChange, float width)
+    {
+        float inputWidth = width - 70;
+
+        ImGui.SetNextItemWidth(inputWidth);
+        ImGui.PushID(id);
+
+        if (ImGui.InputText("", buffer, (uint)buffer.Length, ImGuiInputTextFlags.AutoSelectAll))
+        {
+            string val = System.Text.Encoding.ASCII.GetString(buffer).TrimEnd('\0');
+            onChange(val);
+        }
+
+        ImGui.PopID();
+
+        ImGui.SameLine();
+
+        ImGui.PushID(id + "_paste");
+        if (ImGui.Button("Paste", new Vector2(60, 0)))
+        {
+            string? clipboard = GetClipboardText();
+            if (!string.IsNullOrEmpty(clipboard))
+            {
+                Array.Clear(buffer, 0, buffer.Length);
+                var bytes = System.Text.Encoding.ASCII.GetBytes(clipboard);
+                int copyLength = Math.Min(bytes.Length, buffer.Length - 1);
+                Array.Copy(bytes, buffer, copyLength);
+
+                string val = System.Text.Encoding.ASCII.GetString(buffer).TrimEnd('\0');
+                onChange(val);
+
+                _state.AddInGameLog($"[PASTE] Pasted into {id}");
+            }
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Paste from clipboard");
+        ImGui.PopID();
+    }
+
+    private void RenderPortInputWithPaste(string id, byte[] buffer, Action<string> onChange, float width)
+    {
+        float inputWidth = width - 70;
+
+        ImGui.SetNextItemWidth(inputWidth);
+        ImGui.PushID(id);
+
+        if (ImGui.InputText("", buffer, (uint)buffer.Length,
+            ImGuiInputTextFlags.CharsDecimal | ImGuiInputTextFlags.AutoSelectAll))
+        {
+            string val = System.Text.Encoding.ASCII.GetString(buffer).TrimEnd('\0');
+            onChange(val);
+        }
+
+        ImGui.PopID();
+
+        ImGui.SameLine();
+
+        ImGui.PushID(id + "_paste");
+        if (ImGui.Button("Paste", new Vector2(60, 0)))
+        {
+            string? clipboard = GetClipboardText();
+            if (!string.IsNullOrEmpty(clipboard))
+            {
+                var digits = new string(clipboard.Where(char.IsDigit).ToArray());
+                if (!string.IsNullOrEmpty(digits))
+                {
+                    Array.Clear(buffer, 0, buffer.Length);
+                    var bytes = System.Text.Encoding.ASCII.GetBytes(digits);
+                    int copyLength = Math.Min(bytes.Length, buffer.Length - 1);
+                    Array.Copy(bytes, buffer, copyLength);
+
+                    string val = System.Text.Encoding.ASCII.GetString(buffer).TrimEnd('\0');
+                    onChange(val);
+
+                    _state.AddInGameLog($"[PASTE] Pasted port: {val}");
+                }
+            }
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Paste from clipboard");
+        ImGui.PopID();
     }
 
     private void RenderRightPanel(float rightW)
@@ -179,7 +310,6 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // Visual status indicators
         RenderStatusIndicator("TCP Proxy", _state.TcpProxy.IsRunning,
             _state.TcpProxy.IsRunning ? $"Port {_state.TcpProxy.ListenPort}" : "Stopped",
             _state.TcpProxy.ActiveSessions);
@@ -194,12 +324,10 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // Traffic stats
         ImGui.Text("Traffic Statistics");
         ImGui.Separator();
         ImGui.Spacing();
 
-        // Big numbers
         ImGui.TextColored(Theme.ColAccent, $"{_state.TotalPackets:N0}");
         ImGui.SameLine();
         ImGui.Text("total packets");
@@ -218,14 +346,12 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // Registry status
         ImGui.Text("Registry Status");
         ImGui.Separator();
         ImGui.Spacing();
 
         bool regRx = Protocol.RegistrySyncParser.RegistrySyncReceived;
 
-        // Big registry indicator
         var regColor = regRx ? Theme.ColSuccess : Theme.ColWarn;
         var drawList = ImGui.GetWindowDrawList();
         var pos = ImGui.GetCursorScreenPos();
@@ -239,6 +365,13 @@ public class ConnectTab : ITab
         {
             ImGui.Text($"Items Parsed: {Protocol.RegistrySyncParser.NumericIdToName.Count:N0}");
             ImGui.Text($"Players Seen: {Protocol.RegistrySyncParser.PlayerNamesSeen.Count:N0}");
+
+            if (ImGui.Button("Copy Item List", new Vector2(120, 0)))
+            {
+                var items = string.Join("\n", Protocol.RegistrySyncParser.NumericIdToName.Select(x => $"{x.Key:X8}: {x.Value}"));
+                CopyToClipboard(items);
+                _state.AddInGameLog("[COPY] Item list copied to clipboard");
+            }
         }
         else
         {
@@ -254,7 +387,6 @@ public class ConnectTab : ITab
             ImGui.TextWrapped("4. Check Windows Firewall isn't blocking");
         }
 
-        // Debug info
         if (_showAdvanced)
         {
             ImGui.Spacing();
@@ -264,12 +396,18 @@ public class ConnectTab : ITab
             ImGui.Text($"Listen: 127.0.0.1:{_state.UnifiedPort}");
             ImGui.Text($"TCP Status: {_state.TcpProxy.StatusMessage}");
             ImGui.Text($"UDP Status: {_state.UdpProxy.StatusMessage}");
+
+            if (ImGui.Button("Copy Debug Info", new Vector2(120, 0)))
+            {
+                CopyToClipboard($"Target: {_state.TargetHost}:{_state.TargetPort}\n" +
+                              $"TCP: {_state.TcpProxy.StatusMessage}\n" +
+                              $"UDP: {_state.UdpProxy.StatusMessage}");
+            }
         }
     }
 
     private void RenderStatusIndicator(string name, bool isRunning, string status, int sessions)
     {
-        // Color dot
         var color = isRunning ? Theme.ColSuccess : Theme.ColDanger;
         var drawList = ImGui.GetWindowDrawList();
         var pos = ImGui.GetCursorScreenPos();
@@ -277,7 +415,6 @@ public class ConnectTab : ITab
             ImGui.ColorConvertFloat4ToU32(color));
         ImGui.Dummy(new Vector2(25, 20));
 
-        // Status text
         ImGui.SameLine();
         ImGui.BeginGroup();
         ImGui.TextColored(color, name);
@@ -302,6 +439,31 @@ public class ConnectTab : ITab
         catch (Exception ex)
         {
             _state.AddInGameLog($"[TEST] Connection failed: {ex.Message}");
+        }
+    }
+
+    // CROSS-PLATFORM CLIPBOARD HELPERS using TextCopy
+    private string? GetClipboardText()
+    {
+        try
+        {
+            return TextCopy.ClipboardService.GetText();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void CopyToClipboard(string text)
+    {
+        try
+        {
+            TextCopy.ClipboardService.SetText(text);
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[ERROR] Failed to copy: {ex.Message}");
         }
     }
 }

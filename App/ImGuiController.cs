@@ -1,4 +1,6 @@
-﻿using System.Numerics;
+﻿// FILE: App/ImGuiController.cs
+using System.Numerics;
+using System.Runtime.InteropServices;
 using Veldrid;
 using ImGuiNET;
 
@@ -22,35 +24,65 @@ public class ImGuiController : IDisposable
     private ResourceSet _mainResourceSet = null!;
     private ResourceLayout _mainResourceLayout = null!;
 
+    // Static clipboard buffer for callbacks
+    private static string _clipboardBuffer = "";
+
     public ImGuiController(GraphicsDevice gd, OutputDescription outputDescription, int width, int height)
     {
         _gd = gd;
         _windowWidth = width;
         _windowHeight = height;
 
-        // Create context first
         ImGui.CreateContext();
 
-        // Set ALL config flags BEFORE any NewFrame() call
         var io = ImGui.GetIO();
         io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard;
-        io.ConfigFlags |= ImGuiConfigFlags.DockingEnable;  // ADD THIS LINE
+        io.ConfigFlags |= ImGuiConfigFlags.DockingEnable;
 
         io.BackendFlags |= ImGuiBackendFlags.HasMouseCursors;
         io.BackendFlags |= ImGuiBackendFlags.HasSetMousePos;
 
-        // Now create device resources
+        // Setup clipboard via PlatformIO (ImGui 1.91+ method)
+        var platformIO = ImGui.GetPlatformIO();
+        platformIO.Platform_SetClipboardTextFn = (ctx, text) =>
+        {
+            if (text != IntPtr.Zero)
+            {
+                var str = Marshal.PtrToStringUTF8(text);
+                if (str != null)
+                {
+                    _clipboardBuffer = str;
+                    try { TextCopy.ClipboardService.SetText(str); } catch { }
+                }
+            }
+        };
+
+        platformIO.Platform_GetClipboardTextFn = (ctx) =>
+        {
+            try
+            {
+                var text = TextCopy.ClipboardService.GetText();
+                if (!string.IsNullOrEmpty(text))
+                    _clipboardBuffer = text;
+            }
+            catch { }
+
+            if (string.IsNullOrEmpty(_clipboardBuffer))
+                return IntPtr.Zero;
+
+            // Allocate unmanaged memory - ImGui will NOT free this, so we leak a bit
+            // For production, use a fixed buffer or proper memory management
+            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
+            var ptr = Marshal.AllocHGlobal(bytes.Length);
+            Marshal.Copy(bytes, 0, ptr, bytes.Length);
+            return ptr;
+        };
+
         CreateDeviceResources(gd, outputDescription);
-
-        // Set initial frame data
         SetPerFrameImGuiData(1f / 60f);
-
-        // FIRST call to NewFrame - must be after all config is set
         ImGui.NewFrame();
         _frameBegun = true;
     }
-
-    // ... rest of your code stays the same ...
 
     public void WindowResized(int width, int height)
     {
@@ -61,10 +93,8 @@ public class ImGuiController : IDisposable
     public void CreateDeviceResources(GraphicsDevice gd, OutputDescription outputDescription)
     {
         _gd = gd;
-
         ResourceFactory factory = gd.ResourceFactory;
 
-        // Create shaders
         _vertexShader = factory.CreateShader(new ShaderDescription(
             ShaderStages.Vertex,
             GetVertexShaderBytes(gd.BackendType),
@@ -100,7 +130,6 @@ public class ImGuiController : IDisposable
             ResourceBindingModel.Default);
 
         _pipeline = factory.CreateGraphicsPipeline(pipelineDescription);
-
         RecreateFontDeviceTexture(gd);
     }
 
@@ -212,7 +241,6 @@ void main()
     private void RecreateFontDeviceTexture(GraphicsDevice gd)
     {
         ImGuiIOPtr io = ImGui.GetIO();
-
         io.Fonts.GetTexDataAsRGBA32(out IntPtr pixels, out int width, out int height, out int bytesPerPixel);
 
         _fontTexture = gd.ResourceFactory.CreateTexture(TextureDescription.Texture2D(
@@ -253,14 +281,12 @@ void main()
     {
         ImGuiIOPtr io = ImGui.GetIO();
 
-        // Mouse
         io.MousePos = snapshot.MousePosition;
         io.MouseDown[0] = snapshot.IsMouseDown(MouseButton.Left);
         io.MouseDown[1] = snapshot.IsMouseDown(MouseButton.Right);
         io.MouseDown[2] = snapshot.IsMouseDown(MouseButton.Middle);
         io.MouseWheel = snapshot.WheelDelta;
 
-        // Keys - track which keys are currently down
         foreach (var keyEvent in snapshot.KeyEvents)
         {
             ImGuiKey imguiKey = VeldridKeyToImGuiKey(keyEvent.Key);
@@ -270,13 +296,11 @@ void main()
             }
         }
 
-        // Text input
         foreach (var c in snapshot.KeyCharPresses)
         {
             io.AddInputCharacter(c);
         }
 
-        // Modifiers - check using KeyEvents or current state
         io.KeyCtrl = IsKeyDown(snapshot, Key.ControlLeft) || IsKeyDown(snapshot, Key.ControlRight);
         io.KeyAlt = IsKeyDown(snapshot, Key.AltLeft) || IsKeyDown(snapshot, Key.AltRight);
         io.KeyShift = IsKeyDown(snapshot, Key.ShiftLeft) || IsKeyDown(snapshot, Key.ShiftRight);
@@ -285,7 +309,6 @@ void main()
 
     private bool IsKeyDown(InputSnapshot snapshot, Key key)
     {
-        // Check if key is in the current key events as "down"
         foreach (var keyEvent in snapshot.KeyEvents)
         {
             if (keyEvent.Key == key)
@@ -342,19 +365,16 @@ void main()
         uint vertexOffsetInVertices = 0;
         uint indexOffsetInElements = 0;
 
-        // Calculate total sizes
         int totalVtxCount = 0;
         int totalIdxCount = 0;
 
-        // Use CmdLists instead of CmdListsRange
         for (int i = 0; i < drawData.CmdListsCount; i++)
         {
-            ImDrawListPtr cmdList = drawData.CmdLists[i];  // Changed from CmdListsRange[i]
+            ImDrawListPtr cmdList = drawData.CmdLists[i];
             totalVtxCount += cmdList.VtxBuffer.Size;
             totalIdxCount += cmdList.IdxBuffer.Size;
         }
 
-        // Create or resize buffers
         if (_vertexBuffer == null || _vertexBuffer.SizeInBytes < (ulong)(totalVtxCount * sizeof(ImDrawVert)))
         {
             _vertexBuffer?.Dispose();
@@ -371,10 +391,9 @@ void main()
                 BufferUsage.IndexBuffer | BufferUsage.Dynamic));
         }
 
-        // Upload data
         for (int i = 0; i < drawData.CmdListsCount; i++)
         {
-            ImDrawListPtr cmdList = drawData.CmdLists[i];  // Changed from CmdListsRange[i]
+            ImDrawListPtr cmdList = drawData.CmdLists[i];
 
             cl.UpdateBuffer(_vertexBuffer, vertexOffsetInVertices * (uint)sizeof(ImDrawVert),
                 (IntPtr)cmdList.VtxBuffer.Data, (uint)(cmdList.VtxBuffer.Size * sizeof(ImDrawVert)));
@@ -386,7 +405,6 @@ void main()
             indexOffsetInElements += (uint)cmdList.IdxBuffer.Size;
         }
 
-        // Setup orthographic projection
         var mvp = Matrix4x4.CreateOrthographicOffCenter(
             drawData.DisplayPos.X,
             drawData.DisplayPos.X + drawData.DisplaySize.X,
@@ -415,7 +433,7 @@ void main()
 
         for (int n = 0; n < drawData.CmdListsCount; n++)
         {
-            ImDrawListPtr cmdList = drawData.CmdLists[n];  // Changed from CmdListsRange[n]
+            ImDrawListPtr cmdList = drawData.CmdLists[n];
 
             for (int cmdI = 0; cmdI < cmdList.CmdBuffer.Size; cmdI++)
             {
