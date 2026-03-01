@@ -20,7 +20,7 @@ public class HyForceApp
     private readonly CommandList _commandList;
 
     private readonly AppState _state;
-    private readonly PacketHandler _packetHandler;
+    private readonly Protocol.PacketHandler _packetHandler;  // FIXED: Fully qualified name
     private readonly List<ITab> _tabs = new();
     private readonly Theme _theme;
     private int _selectedTab = 0;
@@ -43,7 +43,7 @@ public class HyForceApp
         _theme = new Theme();
 
         // Initialize packet handler before tabs
-        _packetHandler = new PacketHandler(_state);
+        _packetHandler = new Protocol.PacketHandler(_state);
 
         // Wire up packet handling
         _state.TcpProxy.OnPacket += _packetHandler.ProcessPacket;
@@ -992,7 +992,7 @@ public class AppState : IDisposable
     // FIXED: Use the requested export path
     public string ExportDirectory { get; set; } = @"C:\Users\benja\source\repos\HyForce\Exported logs";
 
-    public event Action? OnPacketReceived;
+    public event PacketReceivedHandler? OnPacketReceived;  // CHANGED from Action
     public event Action? OnSecurityEvent;
 
     // NEW: Memory reading events
@@ -1061,7 +1061,7 @@ public class AppState : IDisposable
         PacketLog.Add(packet);
         AnalyzePacket(packet);
         Database.ProcessPacket(packet);
-        OnPacketReceived?.Invoke();
+        OnPacketReceived?.Invoke(packet);  // CHANGED to pass packet
     }
 
     private void AnalyzePacket(CapturedPacket packet)
@@ -1087,7 +1087,7 @@ public class AppState : IDisposable
 
         if (packet.IsTcp && packet.Direction == PacketDirection.ServerToClient)
         {
-            if (packet.Opcode == OpcodeRegistry.RegistryOpcode ||
+            if (packet.Opcode == Protocol.OpcodeRegistry.RegistryOpcode ||
                 (packet.Opcode >= 0x28 && packet.Opcode <= 0x3F))
             {
                 LogSecurityEvent("Registry", $"RegistrySync detected: 0x{packet.Opcode:X2}", new Dictionary<string, object>
@@ -1130,7 +1130,7 @@ public class AppState : IDisposable
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("+------------------------------------------------------------------------------+");
-        sb.AppendLine("¦                    HYFORCE V22-ENHANCED - FULL DIAGNOSTICS REPORT            ¦");
+        sb.AppendLine("                    HYFORCE V22-ENHANCED - FULL DIAGNOSTICS REPORT            ");
         sb.AppendLine("+------------------------------------------------------------------------------+");
         sb.AppendLine();
         sb.AppendLine($"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
@@ -1161,12 +1161,12 @@ public class AppState : IDisposable
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                                PROXY STATUS                                   ");
         sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine($"TCP Proxy: {(TcpProxy.IsRunning ? "RUNNING ?" : "STOPPED")}");
+        sb.AppendLine($"TCP Proxy: {(TcpProxy.IsRunning ? "RUNNING " : "STOPPED")}");
         sb.AppendLine($"  - Status: {TcpProxy.StatusMessage}");
         sb.AppendLine($"  - Active Sessions: {TcpProxy.ActiveSessions}");
         sb.AppendLine($"  - Total Connections: {TcpProxy.TotalConnections}");
         sb.AppendLine();
-        sb.AppendLine($"UDP Proxy: {(UdpProxy.IsRunning ? "RUNNING ?" : "STOPPED")}");
+        sb.AppendLine($"UDP Proxy: {(UdpProxy.IsRunning ? "RUNNING " : "STOPPED")}");
         sb.AppendLine($"  - Status: {UdpProxy.StatusMessage}");
         sb.AppendLine($"  - Active Sessions: {UdpProxy.ActiveSessions}");
         sb.AppendLine($"  - Total Clients: {UdpProxy.TotalClients}");
@@ -1194,7 +1194,7 @@ public class AppState : IDisposable
         var topOpcodes = PacketLog.GetOpcodeCounts().OrderByDescending(x => x.Value).Take(20);
         foreach (var kv in topOpcodes)
         {
-            var name = OpcodeRegistry.Label(kv.Key, PacketDirection.ServerToClient);
+            var name = Protocol.OpcodeRegistry.Label(kv.Key, PacketDirection.ServerToClient);
             var pct = TotalPackets > 0 ? (kv.Value / (double)TotalPackets * 100) : 0;
             sb.AppendLine($"  0x{kv.Key:X4} ({name,-20}): {kv.Value,6} packets ({pct:F1}%)");
         }
@@ -1659,9 +1659,68 @@ using HyForce.Networking;
 
 namespace HyForce.Core;
 
-public delegate void PacketHandler(CapturedPacket packet);
+// RENAMED from PacketHandler to PacketReceivedHandler to avoid ambiguity
+public delegate void PacketReceivedHandler(CapturedPacket packet);
 public delegate void LogHandler(string message, string category);
 public delegate void SecurityEventHandler(SecurityEvent evt);
+
+
+===== FILE: C:\Users\benja\source\repos\HyForce\Data\PacketAnalysis.cs =====
+
+// FILE: Data/PacketAnalysis.cs
+using System.Collections.Generic;
+
+namespace HyForce.Data;
+
+public class PacketAnalysis
+{
+    public ushort Opcode { get; set; }
+    public string OpcodeHex { get; set; } = "";
+    public string PacketName { get; set; } = "Unknown";
+    public PacketCategory Category { get; set; }
+    public string Description { get; set; } = "";
+    public bool IsCritical { get; set; }
+    public int PayloadOffset { get; set; }
+    public int PayloadLength { get; set; }
+    public Dictionary<string, string> Fields { get; set; } = new();
+    public double Entropy { get; set; }
+    public bool EncryptionLikely { get; set; }
+    public bool IsRegistrySync { get; set; }
+    public string CompressionHint { get; set; } = "";
+    public string QuicHeaderType { get; set; } = "";
+    public string QuicVersion { get; set; } = "";
+}
+
+
+===== FILE: C:\Users\benja\source\repos\HyForce\Data\PacketCategory.cs =====
+
+namespace HyForce.Data;
+
+public enum PacketCategory
+{
+    Connection,
+    Authentication,
+    Setup,
+    Assets,
+    Player,
+    Movement,
+    Input,
+    Combat,
+    Blocks,
+    World,
+    Entities,
+    Inventory,
+    Interface,
+    WorldMap,
+    Network,
+    Debug,
+    Interaction,
+    Machinima,
+    Camera,
+    BuilderTools,
+    ClientSetup,  // ADDED - Missing value
+    Unknown
+}
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Data\PacketLog.cs =====
@@ -1990,49 +2049,87 @@ namespace HyForce.Data;
 
 public class PacketPattern
 {
-    public string Name { get; set; } = "";
-    public string Description { get; set; } = "";
-    public ushort? Opcode { get; set; }
-    public int? MinSize { get; set; }
-    public int? MaxSize { get; set; }
-    public PacketDirection? Direction { get; set; }
-    public bool IsTcp { get; set; }
-    public byte[]? Signature { get; set; }
-    public Func<byte[], bool>? CustomMatcher { get; set; }
+    public ushort Opcode { get; set; }
+    public string PacketName { get; set; } = "";
+    public int Count { get; set; }
+    public int AvgSize { get; set; }
+    public PacketDirection Direction { get; set; }
+    public bool IsPeriodic { get; set; }
+    public double PeriodMs { get; set; }
+    public bool IsBurst { get; set; }
+    public double RatePerSecond { get; set; }
+}
 
-    public bool Matches(PacketLogEntry entry, byte[] rawData)
+
+===== FILE: C:\Users\benja\source\repos\HyForce\Data\PacketPatternDetector.cs =====
+
+// FILE: Data/PacketPatternDetector.cs
+using HyForce.Networking;
+using HyForce.Protocol;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace HyForce.Data;
+
+public static class PacketPatternDetector
+{
+    public static List<PacketPattern> DetectPatterns(List<PacketLogEntry> packets)
     {
-        if (Opcode.HasValue && entry.OpcodeDecimal != Opcode.Value)
-            return false;
+        var patterns = new List<PacketPattern>();
 
-        if (MinSize.HasValue && entry.ByteLength < MinSize.Value)
-            return false;
+        // Group by opcode
+        var grouped = packets.GroupBy(p => p.OpcodeDecimal);
 
-        if (MaxSize.HasValue && entry.ByteLength > MaxSize.Value)
-            return false;
-
-        if (Direction.HasValue && entry.Direction != Direction.Value)
-            return false;
-
-        if (entry.IsTcp != IsTcp)
-            return false;
-
-        if (Signature != null && Signature.Length > 0)
+        foreach (var group in grouped)
         {
-            if (rawData.Length < Signature.Length)
-                return false;
+            var list = group.ToList();
+            if (list.Count < 5) continue; // Need at least 5 packets for pattern
 
-            for (int i = 0; i < Signature.Length; i++)
+            var pattern = new PacketPattern
             {
-                if (rawData[i] != Signature[i])
-                    return false;
+                Opcode = group.Key,
+                PacketName = list[0].OpcodeName,
+                Count = list.Count,
+                AvgSize = (int)list.Average(p => p.ByteLength),
+                Direction = list[0].Direction
+            };
+
+            // Detect periodic patterns
+            if (list.Count >= 10)
+            {
+                var intervals = new List<double>();
+                for (int i = 1; i < list.Count; i++)
+                {
+                    intervals.Add((list[i].Timestamp - list[i - 1].Timestamp).TotalMilliseconds);
+                }
+
+                var avgInterval = intervals.Average();
+                var variance = intervals.Select(i => Math.Abs(i - avgInterval)).Average();
+
+                if (variance < avgInterval * 0.1) // Less than 10% variance
+                {
+                    pattern.IsPeriodic = true;
+                    pattern.PeriodMs = avgInterval;
+                }
             }
+
+            // Detect burst patterns
+            var timeSpan = list.Last().Timestamp - list.First().Timestamp;
+            if (timeSpan.TotalSeconds > 0)
+            {
+                var rate = list.Count / timeSpan.TotalSeconds;
+                if (rate > 50) // More than 50 packets per second
+                {
+                    pattern.IsBurst = true;
+                    pattern.RatePerSecond = rate;
+                }
+            }
+
+            patterns.Add(pattern);
         }
 
-        if (CustomMatcher != null)
-            return CustomMatcher(rawData);
-
-        return true;
+        return patterns.OrderByDescending(p => p.Count).ToList();
     }
 }
 
@@ -2373,12 +2470,16 @@ public class CapturedPacket
 
 // FILE: Protocol/OpcodeRegistry.cs (ENHANCED VERSION)
 using HyForce.Networking;
+using HyForce.Data;
 using System.Collections.Generic;
 
 namespace HyForce.Protocol;
 
 public static class OpcodeRegistry
 {
+    // ADDED: Missing constant
+    public const ushort RegistryOpcode = 0x18;
+
     // C2S Packets (Client-to-Server) - Player Input
     public static readonly Dictionary<ushort, PacketInfo> C2S_Opcodes = new()
     {
@@ -2608,13 +2709,6 @@ public static class OpcodeRegistry
     }
 }
 
-public enum PacketCategory
-{
-    Connection, Authentication, Setup, Assets, Player, Movement, Input,
-    Combat, Blocks, World, Entities, Inventory, Interface, WorldMap,
-    Network, Debug, Interaction, Machinima, Camera, BuilderTools, Unknown
-}
-
 public record PacketInfo(string Name, string Description, PacketCategory Category, bool IsCritical = false);
 
 
@@ -2639,7 +2733,11 @@ public class QuicHeaderInfo
     public uint Version { get; set; }
     public byte[] ClientConnectionId { get; set; } = Array.Empty<byte>();
     public byte[]? ServerConnectionId { get; set; }
+    public byte[]? DestinationConnectionId { get; set; }  // ADDED
+    public byte[]? SourceConnectionId { get; set; }       // ADDED
     public int PacketNumberLength { get; set; }
+    public ulong PacketNumber { get; set; }               // ADDED
+    public string HeaderType => IsLongHeader ? "Long" : "Short";  // ADDED
 }
 
 
@@ -2718,7 +2816,7 @@ public class TcpProxy : IDisposable
     public int ServerPort { get; private set; }
     public int ListenPort { get; private set; }
 
-    public event PacketHandler? OnPacket;
+    public event PacketReceivedHandler? OnPacket;  // CHANGED from PacketHandler
 
     private readonly Data.TestLog _log;
     private TcpListener? _listener;
@@ -2877,59 +2975,71 @@ namespace HyForce.Networking;
 
 public class TcpSession
 {
-    private readonly TcpClient _client;
-    private TcpClient? _server;
-    private NetworkStream? _clientStream;
-    private NetworkStream? _serverStream;
+    public TcpClient Client { get; }      // ADDED public getter
+    public TcpClient? Server { get; }     // ADDED public getter
+    private readonly NetworkStream? _clientStream;
+    private readonly NetworkStream? _serverStream;
     private readonly CancellationTokenSource _cts = new();
-    private readonly Action<byte[], PacketDirection> _onData;
-    private Task? _clientToServerTask;
-    private Task? _serverToClientTask;
+    private readonly string _targetHost;
+    private readonly int _targetPort;
+    private readonly Data.TestLog _log;
 
-    public IPEndPoint? RemoteEndPoint => _client.Client.RemoteEndPoint as IPEndPoint;
-    public bool IsConnected => _client.Connected && (_server?.Connected ?? false);
+    public IPEndPoint? RemoteEndPoint => Client.Client.RemoteEndPoint as IPEndPoint;
+    public bool IsConnected => Client.Connected && (Server?.Connected ?? false);
 
-    public TcpSession(TcpClient client, string targetHost, int targetPort, Action<byte[], PacketDirection> onData)
+    public TcpSession(TcpClient client, string targetHost, int targetPort, Data.TestLog log)
     {
-        _client = client;
-        _onData = onData;
+        Client = client;
+        _targetHost = targetHost;
+        _targetPort = targetPort;
+        _log = log;
 
         try
         {
-            _server = new TcpClient();
-            _server.Connect(targetHost, targetPort);
-            _clientStream = _client.GetStream();
-            _serverStream = _server.GetStream();
+            var server = new TcpClient();
+            server.Connect(targetHost, targetPort);
+            Server = server;
+            _clientStream = client.GetStream();
+            _serverStream = server.GetStream();
         }
         catch (Exception ex)
         {
-            _client.Close();
+            client.Close();
             throw;
         }
     }
 
-    public void Start()
+    // ADDED: New Run method with callback
+    public async Task Run(Func<byte[], PacketDirection, Task> onPacket, CancellationToken ct)
     {
-        _clientToServerTask = RelayAsync(_clientStream!, _serverStream!, PacketDirection.ClientToServer);
-        _serverToClientTask = RelayAsync(_serverStream!, _clientStream!, PacketDirection.ServerToClient);
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, ct);
+
+        var clientToServer = RelayAsync(_clientStream!, _serverStream!, PacketDirection.ClientToServer, onPacket, cts.Token);
+        var serverToClient = RelayAsync(_serverStream!, _clientStream!, PacketDirection.ServerToClient, onPacket, cts.Token);
+
+        await Task.WhenAny(clientToServer, serverToClient);
+
+        _cts.Cancel();
+        try { await Task.WhenAll(clientToServer, serverToClient); } catch { }
     }
 
-    private async Task RelayAsync(NetworkStream source, NetworkStream dest, PacketDirection direction)
+    private async Task RelayAsync(NetworkStream source, NetworkStream dest, PacketDirection direction, Func<byte[], PacketDirection, Task> onPacket, CancellationToken ct)
     {
         byte[] buffer = new byte[65536];
         try
         {
-            while (!_cts.Token.IsCancellationRequested)
+            while (!ct.IsCancellationRequested)
             {
-                int read = await source.ReadAsync(buffer, 0, buffer.Length, _cts.Token);
+                int read = await source.ReadAsync(buffer, 0, buffer.Length, ct);
                 if (read == 0) break;
 
                 byte[] data = new byte[read];
                 Buffer.BlockCopy(buffer, 0, data, 0, read);
 
-                _onData(data, direction);
+                // Call the packet callback
+                await onPacket(data, direction);
 
-                await dest.WriteAsync(data, 0, read, _cts.Token);
+                await dest.WriteAsync(data, 0, read, ct);
             }
         }
         catch (OperationCanceledException) { }
@@ -2941,8 +3051,8 @@ public class TcpSession
         _cts.Cancel();
         _clientStream?.Close();
         _serverStream?.Close();
-        _client?.Close();
-        _server?.Close();
+        Client?.Close();
+        Server?.Close();
     }
 }
 
@@ -2967,7 +3077,7 @@ public class UdpProxy : IDisposable
     public int ServerPort { get; private set; }
     public int ListenPort { get; private set; }
 
-    public event PacketHandler? OnPacket;
+    public event PacketReceivedHandler? OnPacket;  // CHANGED from PacketHandler
 
     private readonly Data.TestLog _log;
     private UdpClient? _listener;
@@ -4144,7 +4254,7 @@ public class PacketInspector
         if (!packet.IsTcp && packet.QuicInfo != null)
         {
             analysis.QuicHeaderType = packet.QuicInfo.HeaderType;
-            analysis.QuicVersion = packet.QuicInfo.Version;
+            analysis.QuicVersion = packet.QuicInfo.Version.ToString();
         }
 
         return analysis;
@@ -4432,7 +4542,7 @@ public static class RegistrySyncParser
         for (int offset = 0; offset < Math.Min(data.Length, 16); offset++)
         {
             var slice = data.Skip(offset).ToArray();
-            var strings = ExtractStrings(slice, 4);
+            var strings = ExtractStrings(slice);
 
             foreach (var str in strings)
             {
@@ -5586,7 +5696,7 @@ public class LogTab : ITab
     public LogTab(AppState state)
     {
         _state = state;
-        _state.OnPacketReceived += () => _logVersion++;
+        _state.OnPacketReceived += (packet) => _logVersion++;  // FIXED - accept the packet parameter
         _state.OnSecurityEvent += () => _logVersion++;
     }
 
@@ -6022,7 +6132,14 @@ public class MemoryTab : ITab
                 ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColWarn);
                 ImGui.Text(currentValue);
                 ImGui.PopStyleColor();
-                watch.LastValue = currentValue;
+                // Update the value in the list (not during iteration)
+                _watches[i] = new WatchEntry
+                {
+                    Address = watch.Address,
+                    Type = watch.Type,
+                    Name = watch.Name,
+                    LastValue = currentValue
+                };
             }
             else
             {
@@ -6226,8 +6343,9 @@ public class MemoryTab : ITab
             var currentValue = ReadMemoryValue(result.Address, result.Type);
             if (MatchesScan(currentValue, _scanValue))
             {
-                result.ValuePreview = currentValue;
-                newResults.Add(result);
+                var updatedResult = result;
+                updatedResult.ValuePreview = currentValue;
+                newResults.Add(updatedResult);
             }
         }
 
@@ -6550,7 +6668,20 @@ public class MemoryTab : ITab
 
     private void RefreshWatches()
     {
-        // Values are read dynamically during render
+        // Create a new list to avoid modifying foreach variable
+        var updatedWatches = new List<WatchEntry>();
+        foreach (var watch in _watches)
+        {
+            var currentValue = ReadMemoryValue(watch.Address, watch.Type);
+            updatedWatches.Add(new WatchEntry
+            {
+                Address = watch.Address,
+                Type = watch.Type,
+                Name = watch.Name,
+                LastValue = currentValue
+            });
+        }
+        _watches = updatedWatches;
     }
 
     private double CalculateEntropy(byte[] data, int offset, int length)
@@ -6673,10 +6804,11 @@ public class MemoryTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\PacketAnalyticsTab.cs =====
 
-// FILE: Tabs/PacketAnalyticsTab.cs (NEW)
 using HyForce.Core;
-using HyForce.Protocol;
+using HyForce.Data;
+using HyForce.Networking;
 using ImGuiNET;
+using System.Linq;
 using System.Numerics;
 
 namespace HyForce.Tabs;
@@ -6700,19 +6832,15 @@ public class PacketAnalyticsTab : ITab
         ImGui.Text("Packet Analytics Dashboard");
         ImGui.Separator();
 
-        // Top stats row
         RenderOverviewCards();
-
         ImGui.Separator();
 
-        // Category breakdown
         ImGui.BeginChild("Categories", new Vector2(300, 0), ImGuiChildFlags.Borders);
         RenderCategoryBreakdown();
         ImGui.EndChild();
 
         ImGui.SameLine();
 
-        // Pattern analysis
         ImGui.BeginChild("Patterns", new Vector2(0, 0), ImGuiChildFlags.Borders);
         RenderPatternAnalysis();
         ImGui.EndChild();
@@ -6722,7 +6850,6 @@ public class PacketAnalyticsTab : ITab
     {
         var packets = _state.PacketLog.GetAll();
 
-        // Total packets card
         ImGui.BeginChild("Card1", new Vector2(150, 80), ImGuiChildFlags.Borders);
         ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), "TOTAL");
         ImGui.Text($"{packets.Count:N0}");
@@ -6730,26 +6857,23 @@ public class PacketAnalyticsTab : ITab
 
         ImGui.SameLine();
 
-        // C2S card
-        var c2s = packets.Count(p => p.Direction == Networking.PacketDirection.ClientToServer);
+        var c2s = packets.Count(p => p.Direction == PacketDirection.ClientToServer);
         ImGui.BeginChild("Card2", new Vector2(150, 80), ImGuiChildFlags.Borders);
-        ImGui.TextColored(new Vector4(0.3f, 0.8f, 0.3f, 1), "C2S (Client?Server)");
+        ImGui.TextColored(new Vector4(0.3f, 0.8f, 0.3f, 1), "C2S");
         ImGui.Text($"{c2s:N0}");
         ImGui.EndChild();
 
         ImGui.SameLine();
 
-        // S2C card
-        var s2c = packets.Count(p => p.Direction == Networking.PacketDirection.ServerToClient);
+        var s2c = packets.Count(p => p.Direction == PacketDirection.ServerToClient);
         ImGui.BeginChild("Card3", new Vector2(150, 80), ImGuiChildFlags.Borders);
-        ImGui.TextColored(new Vector4(0.8f, 0.5f, 0.2f, 1), "S2C (Server?Client)");
+        ImGui.TextColored(new Vector4(0.8f, 0.5f, 0.2f, 1), "S2C");
         ImGui.Text($"{s2c:N0}");
         ImGui.EndChild();
 
         ImGui.SameLine();
 
-        // Unknown packets
-        var unknown = packets.Count(p => !OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction));
+        var unknown = packets.Count(p => !Protocol.OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction));
         ImGui.BeginChild("Card4", new Vector2(150, 80), ImGuiChildFlags.Borders);
         ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "UNKNOWN");
         ImGui.Text($"{unknown:N0}");
@@ -6796,21 +6920,19 @@ public class PacketAnalyticsTab : ITab
     {
         var packets = _state.PacketLog.GetAll();
 
-        // Update category stats
         _categoryStats = packets
-            .Select(p => OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction)?.Category ?? PacketCategory.Unknown)
+            .Select(p => Protocol.OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction)?.Category ?? PacketCategory.Unknown)
             .GroupBy(c => c)
             .ToDictionary(g => g.Key, g => g.Count());
 
-        // Update patterns
-        _patterns = PacketInspector.DetectPatterns(packets);
+        _patterns = PacketPatternDetector.DetectPatterns(packets);
     }
 }
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\PacketFeedTab.cs =====
 
-// FILE: Tabs/PacketFeedTab.cs (ENHANCED)
+// FILE: Tabs/PacketFeedTab.cs
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
@@ -6826,14 +6948,12 @@ public class PacketFeedTab : ITab
 {
     public string Name => "Packet Feed";
     private readonly AppState _state;
-    private readonly List<PacketLogEntry> _displayPackets = new();
     private PacketLogEntry? _selectedPacket;
     private string _filterOpcode = "";
-    private string _filterCategory = "";
     private bool _showOnlyCritical;
     private bool _showOnlyUnknown;
     private bool _autoScroll = true;
-    private int _lastPacketCount;
+    private bool _showPatternAnalysis = false;
 
     public PacketFeedTab(AppState state)
     {
@@ -6843,13 +6963,9 @@ public class PacketFeedTab : ITab
     public void Render()
     {
         var windowSize = ImGui.GetContentRegionAvail();
-
-        // Top toolbar
         RenderToolbar();
-
         ImGui.Separator();
 
-        // Main content: Packet list on left, details on right
         var listWidth = windowSize.X * 0.6f;
         var detailsWidth = windowSize.X - listWidth - 20;
 
@@ -6869,57 +6985,42 @@ public class PacketFeedTab : ITab
         ImGui.PushItemWidth(100);
         ImGui.InputText("Filter Opcode", ref _filterOpcode, 10);
         ImGui.SameLine();
-
-        ImGui.InputText("Filter Category", ref _filterCategory, 20);
-        ImGui.SameLine();
-
         ImGui.Checkbox("Critical Only", ref _showOnlyCritical);
         ImGui.SameLine();
-
         ImGui.Checkbox("Unknown Only", ref _showOnlyUnknown);
         ImGui.SameLine();
-
         ImGui.Checkbox("Auto-scroll", ref _autoScroll);
 
         if (ImGui.Button("Clear"))
         {
             _state.PacketLog.Clear();
-            _displayPackets.Clear();
         }
-
         ImGui.SameLine();
-
         if (ImGui.Button("Analyze Patterns"))
         {
-            ShowPatternAnalysis();
+            _showPatternAnalysis = true;
         }
     }
 
     private void RenderPacketList()
     {
         var packets = _state.PacketLog.GetLast(500);
-
-        // Apply filters
         var filtered = packets.Where(p =>
         {
             if (!string.IsNullOrEmpty(_filterOpcode) &&
                 !p.OpcodeDecimal.ToString("X4").Contains(_filterOpcode, StringComparison.OrdinalIgnoreCase))
                 return false;
-
             if (_showOnlyCritical)
             {
                 var info = OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction);
                 if (info?.IsCritical != true) return false;
             }
-
             if (_showOnlyUnknown && OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction))
                 return false;
-
             return true;
         }).ToList();
 
-        // Table header
-        if (ImGui.BeginTable("Packets", 6, ImGuiTableFlags.Resizable | ImGuiTableFlags.Reorderable | ImGuiTableFlags.RowBg))
+        if (ImGui.BeginTable("Packets", 6, ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg))
         {
             ImGui.TableSetupColumn("Time", ImGuiTableColumnFlags.WidthFixed, 80);
             ImGui.TableSetupColumn("Dir", ImGuiTableColumnFlags.WidthFixed, 40);
@@ -6932,58 +7033,43 @@ public class PacketFeedTab : ITab
             foreach (var pkt in filtered)
             {
                 ImGui.TableNextRow();
-
-                // Highlight selected
                 if (_selectedPacket == pkt)
                     ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.GetColorU32(new Vector4(0.2f, 0.4f, 0.6f, 0.5f)));
 
-                // Time
                 ImGui.TableSetColumnIndex(0);
                 ImGui.Text(pkt.Timestamp.ToString("HH:mm:ss.fff"));
 
-                // Direction with color
                 ImGui.TableSetColumnIndex(1);
                 var dirColor = pkt.Direction == PacketDirection.ClientToServer
-                    ? new Vector4(0.3f, 0.8f, 0.3f, 1) // Green for C2S
-                    : new Vector4(0.8f, 0.5f, 0.2f, 1); // Orange for S2C
+                    ? new Vector4(0.3f, 0.8f, 0.3f, 1)
+                    : new Vector4(0.8f, 0.5f, 0.2f, 1);
                 ImGui.TextColored(dirColor, pkt.DirStr);
 
-                // Opcode
                 ImGui.TableSetColumnIndex(2);
                 var isKnown = OpcodeRegistry.IsKnownOpcode(pkt.OpcodeDecimal, pkt.Direction);
                 var opcodeColor = isKnown ? new Vector4(1, 1, 1, 1) : new Vector4(1, 0.3f, 0.3f, 1);
                 ImGui.TextColored(opcodeColor, $"0x{pkt.OpcodeDecimal:X4}");
 
-                // Name
                 ImGui.TableSetColumnIndex(3);
                 var info = OpcodeRegistry.GetInfo(pkt.OpcodeDecimal, pkt.Direction);
                 var name = info?.Name ?? pkt.OpcodeName;
-                if (info?.IsCritical == true)
-                    ImGui.TextColored(new Vector4(1, 0.8f, 0.2f, 1), $"? {name}");
-                else
-                    ImGui.Text(name);
+                ImGui.Text(name);
 
-                // Size
                 ImGui.TableSetColumnIndex(4);
                 ImGui.Text($"{pkt.ByteLength}B");
 
-                // Info icons
                 ImGui.TableSetColumnIndex(5);
                 if (pkt.IsCompressed) ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), "[C]");
                 if (pkt.EncryptionHint == "encrypted") ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "[E]");
 
-                // Selection
                 if (ImGui.IsItemClicked())
                     _selectedPacket = pkt;
             }
-
             ImGui.EndTable();
         }
 
         if (_autoScroll && filtered.Count > 0)
-        {
             ImGui.SetScrollHereY(1.0f);
-        }
     }
 
     private void RenderPacketDetails()
@@ -6995,31 +7081,28 @@ public class PacketFeedTab : ITab
         }
 
         var pkt = _selectedPacket;
-        var analysis = PacketInspector.Analyze(new CapturedPacket
+        // Use fully qualified name to avoid ambiguity
+        var analysis = HyForce.Protocol.PacketInspector.Analyze(new CapturedPacket
         {
-            RawBytes = new byte[0], // Convert from entry
+            RawBytes = Array.Empty<byte>(),
             Direction = pkt.Direction,
             IsTcp = pkt.IsTcp,
-            Timestamp = pkt.Timestamp
+            Timestamp = pkt.Timestamp,
+            Opcode = pkt.OpcodeDecimal
         });
 
-        // Header
-        ImGui.PushFont(ImGui.GetIO().FontDefault);
         ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), analysis.PacketName);
-        ImGui.PopFont();
-
         ImGui.SameLine();
         ImGui.TextColored(Theme.ColTextMuted, $"0x{pkt.OpcodeDecimal:X4}");
 
         if (analysis.IsCritical)
         {
             ImGui.SameLine();
-            ImGui.TextColored(new Vector4(1, 0.8f, 0.2f, 1), " ? CRITICAL");
+            ImGui.TextColored(new Vector4(1, 0.8f, 0.2f, 1), " CRITICAL");
         }
 
         ImGui.Separator();
 
-        // Basic Info
         ImGui.Text("Direction: "); ImGui.SameLine();
         var dirColor = pkt.Direction == PacketDirection.ClientToServer
             ? new Vector4(0.3f, 0.8f, 0.3f, 1)
@@ -7028,18 +7111,15 @@ public class PacketFeedTab : ITab
 
         ImGui.Text($"Category: {analysis.Category}");
         ImGui.Text($"Description: {analysis.Description}");
-        ImGui.Text($"Size: {pkt.ByteLength} bytes ({pkt.ByteLength * 8} bits)");
+        ImGui.Text($"Size: {pkt.ByteLength} bytes");
         ImGui.Text($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
-        ImGui.Text($"Timestamp: {pkt.Timestamp:yyyy-MM-dd HH:mm:ss.fff}");
 
-        // Compression/Encryption
         ImGui.Separator();
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Processing Info");
 
         if (pkt.IsCompressed)
         {
             ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), $"Compression: {pkt.CompressionMethod}");
-            ImGui.Text($"  Compressed: {pkt.CompressedSize}B ? Decompressed: {pkt.DecompressedSize}B");
         }
         else
         {
@@ -7051,22 +7131,28 @@ public class PacketFeedTab : ITab
             : new Vector4(0.3f, 1, 0.3f, 1);
         ImGui.TextColored(encColor, $"Encryption: {pkt.EncryptionHint}");
 
-        if (!string.IsNullOrEmpty(analysis.CompressionHint))
-            ImGui.TextColored(new Vector4(1, 0.8f, 0.4f, 1), $"Note: {analysis.CompressionHint}");
-
-        // Entropy analysis
         ImGui.Separator();
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Entropy Analysis");
-        var entropy = ByteUtils.CalculateEntropy(Convert.FromHexString(pkt.RawHexPreview.Replace("-", "")));
-        ImGui.Text($"Entropy: {entropy:F2}");
 
+        double entropy = 0;
+        try
+        {
+            var hexString = pkt.RawHexPreview.Replace("-", "");
+            if (hexString.Length % 2 == 0 && hexString.Length > 0)
+            {
+                var bytes = Convert.FromHexString(hexString);
+                entropy = ByteUtils.CalculateEntropy(bytes);
+            }
+        }
+        catch { }
+
+        ImGui.Text($"Entropy: {entropy:F2}");
         var entropyColor = entropy > 7.8 ? new Vector4(1, 0.3f, 0.3f, 1) :
                           entropy > 7.0 ? new Vector4(1, 0.8f, 0.2f, 1) :
                           new Vector4(0.3f, 1, 0.3f, 1);
-        ImGui.ProgressBar(entropy / 8.0f, new Vector2(-1, 20), entropy > 7.8 ? "High (Encrypted?)" : entropy > 5 ? "Medium" : "Low (Structured)");
-        ImGui.TextColored(entropyColor, entropy > 7.8 ? "Likely encrypted/Random" : "Likely structured data");
+        ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(-1, 20), entropy > 7.8 ? "High" : "Low");
+        ImGui.TextColored(entropyColor, entropy > 7.8 ? "Likely encrypted" : "Likely structured");
 
-        // Parsed Fields
         if (analysis.Fields.Count > 0)
         {
             ImGui.Separator();
@@ -7079,10 +7165,8 @@ public class PacketFeedTab : ITab
             }
         }
 
-        // Hex Preview
         ImGui.Separator();
-        ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Hex Preview (First 48 bytes)");
-
+        ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Hex Preview");
         var hexLines = pkt.RawHexPreview.Split('-');
         for (int i = 0; i < hexLines.Length; i += 8)
         {
@@ -7093,67 +7177,10 @@ public class PacketFeedTab : ITab
             ImGui.Text(line);
         }
 
-        // Actions
         ImGui.Separator();
         if (ImGui.Button("Copy Hex", new Vector2(120, 30)))
         {
             try { TextCopy.ClipboardService.SetText(pkt.RawHexPreview); } catch { }
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Save Packet", new Vector2(120, 30)))
-        {
-            SavePacket(pkt);
-        }
-    }
-
-    private void ShowPatternAnalysis()
-    {
-        var patterns = PacketInspector.DetectPatterns(_state.PacketLog.GetAll());
-
-        ImGui.OpenPopup("Pattern Analysis");
-        if (ImGui.BeginPopupModal("Pattern Analysis", ref _showPatternAnalysis, ImGuiWindowFlags.AlwaysAutoResize))
-        {
-            ImGui.Text("Detected Traffic Patterns");
-            ImGui.Separator();
-
-            foreach (var pattern in patterns.Take(20))
-            {
-                var color = pattern.IsPeriodic ? new Vector4(0.3f, 1, 0.3f, 1) :
-                           pattern.IsBurst ? new Vector4(1, 0.5f, 0.2f, 1) :
-                           new Vector4(1, 1, 1, 1);
-
-                ImGui.TextColored(color, $"{pattern.PacketName}");
-                ImGui.Text($"  Count: {pattern.Count} | Avg Size: {pattern.AvgSize}B");
-
-                if (pattern.IsPeriodic)
-                    ImGui.Text($"  Periodic: {pattern.PeriodMs:F1}ms interval");
-                if (pattern.IsBurst)
-                    ImGui.Text($"  Burst: {pattern.RatePerSecond:F1} packets/sec");
-
-                ImGui.Separator();
-            }
-
-            if (ImGui.Button("Close", new Vector2(120, 30)))
-                _showPatternAnalysis = false;
-
-            ImGui.EndPopup();
-        }
-    }
-
-    private bool _showPatternAnalysis = false;
-
-    private void SavePacket(PacketLogEntry pkt)
-    {
-        try
-        {
-            var filename = Path.Combine(_state.ExportDirectory, $"packet_{pkt.Timestamp:yyyyMMdd_HHmmss}_{pkt.OpcodeDecimal:X4}.bin");
-            var bytes = Convert.FromHexString(pkt.RawHexPreview.Replace("-", ""));
-            File.WriteAllBytes(filename, bytes);
-            _state.AddInGameLog($"[SUCCESS] Packet saved to {filename}");
-        }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[ERROR] Failed to save packet: {ex.Message}");
         }
     }
 }
@@ -7161,10 +7188,10 @@ public class PacketFeedTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\PacketInspectorTab.cs =====
 
-// FILE: Tabs/PacketInspectorTab.cs
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
+using HyForce.Protocol;
 using HyForce.Utils;
 using ImGuiNET;
 using System.Numerics;
@@ -7208,10 +7235,10 @@ public class PacketInspectorTab : ITab
             Row("Timestamp", pkt.Timestamp.ToString("O"));
             Row("Direction", pkt.DirStr);
             Row("Protocol", pkt.ProtoStr);
-            Row("Opcode", $"0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeDecimal})");
+            Row("Opcode", $"0x{pkt.OpcodeDecimal:X4}");
             Row("Name", pkt.OpcodeName);
             Row("Size", $"{pkt.ByteLength} bytes");
-            Row("Compressed", pkt.IsCompressed ? $"{pkt.CompressionMethod} ({pkt.CompressedSize} ? {pkt.DecompressedSize})" : "No");
+            Row("Compressed", pkt.IsCompressed ? "Yes" : "No");
             Row("Encrypted", pkt.EncryptionHint);
             Row("Injected", pkt.Injected ? "YES" : "No");
 
@@ -7222,31 +7249,15 @@ public class PacketInspectorTab : ITab
         {
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.4f, 0.6f, 1, 1), "QUIC Header Information");
-
-            if (ImGui.BeginTable("QuicInfo", 2, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
-            {
-                ImGui.TableSetupColumn("Property", ImGuiTableColumnFlags.WidthFixed, 150);
-                ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthStretch);
-                ImGui.TableHeadersRow();
-
-                Row("Header Type", pkt.QuicInfo.HeaderType.ToString());
-                Row("Version", pkt.QuicInfo.Version.ToString());
-                Row("Packet Number", pkt.QuicInfo.PacketNumber.ToString());
-
-                if (pkt.QuicInfo.DestinationConnectionId != null)
-                    Row("Destination CID", BitConverter.ToString(pkt.QuicInfo.DestinationConnectionId));
-
-                if (pkt.QuicInfo.SourceConnectionId != null)
-                    Row("Source CID", BitConverter.ToString(pkt.QuicInfo.SourceConnectionId));
-
-                ImGui.EndTable();
-            }
+            ImGui.Text($"Header Type: {pkt.QuicInfo.HeaderType}");
+            ImGui.Text($"Version: {pkt.QuicInfo.Version}");
+            ImGui.Text($"Packet Number: {pkt.QuicInfo.PacketNumber}");
         }
 
         ImGui.Spacing();
         ImGui.TextColored(new Vector4(1, 0.8f, 0.2f, 1), "Raw Data");
 
-        string hexData = ByteUtils.ToHex(pkt.RawHexPreview.Replace("-", "").HexToBytes() ?? Array.Empty<byte>(), 32);
+        string hexData = pkt.RawHexPreview;
 
         ImGui.InputTextMultiline("##raw", ref hexData, 100000, new Vector2(-1, 200),
             ImGuiInputTextFlags.ReadOnly);
@@ -7254,10 +7265,14 @@ public class PacketInspectorTab : ITab
         ImGui.Spacing();
         if (ImGui.Button("Analyze Entropy"))
         {
-            byte[] data = pkt.RawHexPreview.Replace("-", "").HexToBytes() ?? Array.Empty<byte>();
-            double entropy = ByteUtils.CalculateEntropy(data);
-            ImGui.Text($"Shannon Entropy: {entropy:F2} bits/byte");
-            ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(300, 20), $"{entropy:F2}/8.0");
+            try
+            {
+                byte[] data = Convert.FromHexString(pkt.RawHexPreview.Replace("-", ""));
+                double entropy = ByteUtils.CalculateEntropy(data);
+                ImGui.Text($"Shannon Entropy: {entropy:F2} bits/byte");
+                ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(300, 20));
+            }
+            catch { }
         }
 
         ImGui.EndChild();
@@ -7275,23 +7290,6 @@ public class PacketInspectorTab : ITab
     public void SelectPacket(PacketLogEntry packet)
     {
         _selectedPacket = packet;
-    }
-}
-
-public static class PacketInspectorExtensions
-{
-    public static byte[]? HexToBytes(this string hex)
-    {
-        if (string.IsNullOrEmpty(hex)) return null;
-        try
-        {
-            hex = hex.Replace("-", "").Replace(" ", "");
-            byte[] bytes = new byte[hex.Length / 2];
-            for (int i = 0; i < hex.Length; i += 2)
-                bytes[i / 2] = Convert.ToByte(hex.Substring(i, 2), 16);
-            return bytes;
-        }
-        catch { return null; }
     }
 }
 
@@ -7326,7 +7324,7 @@ public class RegistryTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  REGISTRY ANALYSIS  —  Item IDs & Player Names");
+        ImGui.Text("  REGISTRY ANALYSIS  ?  Item IDs & Player Names");
         ImGui.Separator();
         ImGui.Spacing();
 
@@ -7386,7 +7384,7 @@ public class RegistryTab : ITab
 
             bool selected = _selectedOpcode == opcode;
 
-            string label = $"0x{opcode:X2}  ×{count}";
+            string label = $"0x{opcode:X2}  ?{count}";
             if (hasEntries && entries > 0)
                 label += $"  [{entries} items]";
 
@@ -7407,7 +7405,7 @@ public class RegistryTab : ITab
 
         ImGui.Text($"Opcode: 0x{opcode:X2}");
         ImGui.Text($"Name: {OpcodeRegistry.Label(opcode, Networking.PacketDirection.ServerToClient)}");
-        ImGui.Text($"Protocol: {(OpcodeRegistry.IsTcpOpcode(opcode) ? "TCP" : "UDP")}");
+        ImGui.Text($"Protocol: TCP");  // Registry sync is always TCP
         ImGui.Separator();
 
         if (RegistrySyncParser.ParseLog.TryGetValue(opcode, out var log))

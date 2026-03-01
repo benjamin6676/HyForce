@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/PacketFeedTab.cs
+﻿// FILE: Tabs/PacketFeedTab.cs - FIXED UI OVERFLOW
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
@@ -29,25 +29,35 @@ public class PacketFeedTab : ITab
     public void Render()
     {
         var windowSize = ImGui.GetContentRegionAvail();
+
+        // FIXED: Ensure we don't exceed parent bounds
+        float toolbarHeight = 35;
+        float remainingHeight = Math.Max(0, windowSize.Y - toolbarHeight - 10);
+
         RenderToolbar();
         ImGui.Separator();
 
-        var listWidth = windowSize.X * 0.6f;
-        var detailsWidth = windowSize.X - listWidth - 20;
+        // FIXED: Use proper sizing to prevent overflow
+        var listWidth = Math.Min(windowSize.X * 0.6f, windowSize.X - 320); // Min 320px for details
+        var detailsWidth = Math.Max(0, windowSize.X - listWidth - 20);
 
-        ImGui.BeginChild("PacketList", new Vector2(listWidth, 0), ImGuiChildFlags.Borders);
+        // FIXED: Constrain child windows to available space
+        ImGui.BeginChild("PacketList", new Vector2(listWidth, remainingHeight), ImGuiChildFlags.Borders);
         RenderPacketList();
         ImGui.EndChild();
 
         ImGui.SameLine();
 
-        ImGui.BeginChild("PacketDetails", new Vector2(detailsWidth, 0), ImGuiChildFlags.Borders);
+        ImGui.BeginChild("PacketDetails", new Vector2(detailsWidth, remainingHeight), ImGuiChildFlags.Borders);
         RenderPacketDetails();
         ImGui.EndChild();
     }
 
     private void RenderToolbar()
     {
+        // FIXED: Use consistent button heights and prevent overflow
+        float buttonHeight = 25;
+
         ImGui.PushItemWidth(100);
         ImGui.InputText("Filter Opcode", ref _filterOpcode, 10);
         ImGui.SameLine();
@@ -57,36 +67,33 @@ public class PacketFeedTab : ITab
         ImGui.SameLine();
         ImGui.Checkbox("Auto-scroll", ref _autoScroll);
 
-        if (ImGui.Button("Clear"))
+        ImGui.SameLine();
+        if (ImGui.Button("Clear", new Vector2(60, buttonHeight)))
         {
             _state.PacketLog.Clear();
         }
-        ImGui.SameLine();
-        if (ImGui.Button("Analyze Patterns"))
+
+        // FIXED: Prevent button overflow by checking available width
+        float remainingWidth = ImGui.GetContentRegionAvail().X;
+        if (remainingWidth > 120)
         {
-            _showPatternAnalysis = true;
+            ImGui.SameLine();
+            if (ImGui.Button("Analyze Patterns", new Vector2(120, buttonHeight)))
+            {
+                _showPatternAnalysis = true;
+            }
         }
     }
 
     private void RenderPacketList()
     {
-        var packets = _state.PacketLog.GetLast(500);
-        var filtered = packets.Where(p =>
-        {
-            if (!string.IsNullOrEmpty(_filterOpcode) &&
-                !p.OpcodeDecimal.ToString("X4").Contains(_filterOpcode, StringComparison.OrdinalIgnoreCase))
-                return false;
-            if (_showOnlyCritical)
-            {
-                var info = OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction);
-                if (info?.IsCritical != true) return false;
-            }
-            if (_showOnlyUnknown && OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction))
-                return false;
-            return true;
-        }).ToList();
+        var contentAvail = ImGui.GetContentRegionAvail();
 
-        if (ImGui.BeginTable("Packets", 6, ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg))
+        // FIXED: Ensure table fits within child window
+        var tableFlags = ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg |
+                        ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.ScrollY;
+
+        if (ImGui.BeginTable("Packets", 6, tableFlags, contentAvail))
         {
             ImGui.TableSetupColumn("Time", ImGuiTableColumnFlags.WidthFixed, 80);
             ImGui.TableSetupColumn("Dir", ImGuiTableColumnFlags.WidthFixed, 40);
@@ -96,7 +103,9 @@ public class PacketFeedTab : ITab
             ImGui.TableSetupColumn("Info", ImGuiTableColumnFlags.WidthFixed, 80);
             ImGui.TableHeadersRow();
 
-            foreach (var pkt in filtered)
+            var packets = GetFilteredPackets();
+
+            foreach (var pkt in packets)
             {
                 ImGui.TableNextRow();
                 if (_selectedPacket == pkt)
@@ -119,14 +128,25 @@ public class PacketFeedTab : ITab
                 ImGui.TableSetColumnIndex(3);
                 var info = OpcodeRegistry.GetInfo(pkt.OpcodeDecimal, pkt.Direction);
                 var name = info?.Name ?? pkt.OpcodeName;
+
+                // FIXED: Truncate long names to prevent overflow
+                if (name.Length > 30)
+                    name = name[..27] + "...";
                 ImGui.Text(name);
 
                 ImGui.TableSetColumnIndex(4);
                 ImGui.Text($"{pkt.ByteLength}B");
 
                 ImGui.TableSetColumnIndex(5);
-                if (pkt.IsCompressed) ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), "[C]");
-                if (pkt.EncryptionHint == "encrypted") ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "[E]");
+                if (pkt.IsCompressed)
+                {
+                    ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), "[C]");
+                    ImGui.SameLine();
+                }
+                if (pkt.EncryptionHint == "encrypted")
+                {
+                    ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "[E]");
+                }
 
                 if (ImGui.IsItemClicked())
                     _selectedPacket = pkt;
@@ -134,8 +154,27 @@ public class PacketFeedTab : ITab
             ImGui.EndTable();
         }
 
-        if (_autoScroll && filtered.Count > 0)
+        if (_autoScroll && ImGui.GetScrollY() < ImGui.GetScrollMaxY())
             ImGui.SetScrollHereY(1.0f);
+    }
+
+    private List<PacketLogEntry> GetFilteredPackets()
+    {
+        var packets = _state.PacketLog.GetLast(500);
+        return packets.Where(p =>
+        {
+            if (!string.IsNullOrEmpty(_filterOpcode) &&
+                !p.OpcodeDecimal.ToString("X4").Contains(_filterOpcode, StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (_showOnlyCritical)
+            {
+                var info = OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction);
+                if (info?.IsCritical != true) return false;
+            }
+            if (_showOnlyUnknown && OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction))
+                return false;
+            return true;
+        }).ToList();
     }
 
     private void RenderPacketDetails()
@@ -147,7 +186,6 @@ public class PacketFeedTab : ITab
         }
 
         var pkt = _selectedPacket;
-        // Use fully qualified name to avoid ambiguity
         var analysis = HyForce.Protocol.PacketInspector.Analyze(new CapturedPacket
         {
             RawBytes = Array.Empty<byte>(),
@@ -156,6 +194,11 @@ public class PacketFeedTab : ITab
             Timestamp = pkt.Timestamp,
             Opcode = pkt.OpcodeDecimal
         });
+
+        // FIXED: Use BeginChild with proper sizing to prevent overflow
+        var contentAvail = ImGui.GetContentRegionAvail();
+
+        ImGui.BeginChild("DetailsScroll", contentAvail, ImGuiChildFlags.None);
 
         ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), analysis.PacketName);
         ImGui.SameLine();
@@ -176,9 +219,11 @@ public class PacketFeedTab : ITab
         ImGui.TextColored(dirColor, pkt.Direction.ToString());
 
         ImGui.Text($"Category: {analysis.Category}");
-        ImGui.Text($"Description: {analysis.Description}");
+
+        // FIXED: Word wrap for long descriptions
+        ImGui.TextWrapped($"Description: {analysis.Description}");
         ImGui.Text($"Size: {pkt.ByteLength} bytes");
-        ImGui.Text($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
+        ImGui.Text($"Protocol: UDP/QUIC");
 
         ImGui.Separator();
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Processing Info");
@@ -216,7 +261,10 @@ public class PacketFeedTab : ITab
         var entropyColor = entropy > 7.8 ? new Vector4(1, 0.3f, 0.3f, 1) :
                           entropy > 7.0 ? new Vector4(1, 0.8f, 0.2f, 1) :
                           new Vector4(0.3f, 1, 0.3f, 1);
-        ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(-1, 20), entropy > 7.8 ? "High" : "Low");
+
+        // FIXED: Constrain progress bar width
+        ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(Math.Min(300, ImGui.GetContentRegionAvail().X - 20), 20),
+            entropy > 7.8 ? "High" : "Low");
         ImGui.TextColored(entropyColor, entropy > 7.8 ? "Likely encrypted" : "Likely structured");
 
         if (analysis.Fields.Count > 0)
@@ -227,14 +275,17 @@ public class PacketFeedTab : ITab
             {
                 ImGui.TextColored(new Vector4(0.6f, 0.8f, 1, 1), $"{field.Key}:");
                 ImGui.SameLine();
-                ImGui.Text(field.Value);
+                // FIXED: Word wrap for field values
+                ImGui.TextWrapped(field.Value);
             }
         }
 
         ImGui.Separator();
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Hex Preview");
+
+        // FIXED: Constrain hex display to prevent overflow
         var hexLines = pkt.RawHexPreview.Split('-');
-        for (int i = 0; i < hexLines.Length; i += 8)
+        for (int i = 0; i < hexLines.Length && i < 32; i += 8) // Limit to 32 bytes displayed
         {
             var line = string.Join(" ", hexLines.Skip(i).Take(8));
             var addr = (i * 3).ToString("X3");
@@ -248,5 +299,7 @@ public class PacketFeedTab : ITab
         {
             try { TextCopy.ClipboardService.SetText(pkt.RawHexPreview); } catch { }
         }
+
+        ImGui.EndChild(); // End DetailsScroll
     }
 }

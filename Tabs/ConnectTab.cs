@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/ConnectTab.cs
+﻿// FILE: Tabs/ConnectTab.cs - UDP-ONLY MODE WITH AUTO-COPY CONFIRMATION
 using HyForce.Core;
 using HyForce.UI;
 using ImGuiNET;
@@ -13,17 +13,14 @@ public class ConnectTab : ITab
     private readonly AppState _state;
     private readonly byte[] _bufServerIp = new byte[64];
     private readonly byte[] _bufServerPort = new byte[8];
-    private readonly byte[] _bufUnifiedPort = new byte[8];
     private bool _showAdvanced = false;
-
-    private int _selectedPresetIndex = 3; // Default to "Blank"
+    private double _copyFeedbackTime = 0;
 
     public ConnectTab(AppState state)
     {
         _state = state;
         System.Text.Encoding.ASCII.GetBytes(state.TargetHost).CopyTo(_bufServerIp, 0);
         System.Text.Encoding.ASCII.GetBytes(state.TargetPort.ToString()).CopyTo(_bufServerPort, 0);
-        System.Text.Encoding.ASCII.GetBytes(state.UnifiedPort.ToString()).CopyTo(_bufUnifiedPort, 0);
     }
 
     public void Render()
@@ -31,21 +28,28 @@ public class ConnectTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  PROXY CONTROL  —  V22-Enhanced");
+        ImGui.Text("  PROXY CONTROL  -  V22-Enhanced (UDP-ONLY MODE)");
         ImGui.Separator();
         ImGui.Spacing();
 
         if (!_state.IsRunning)
         {
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.95f, 0.28f, 0.22f, 1));
-            ImGui.TextWrapped("⚠  START PROXY FIRST: Then connect Hytale to 127.0.0.1:5521");
+            ImGui.TextWrapped("⚠  START PROXY FIRST: Then connect Hytale to 127.0.0.1:5521 (auto-copied to clipboard)");
             ImGui.PopStyleColor();
         }
         else
         {
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.2f, 0.8f, 0.3f, 1));
-            ImGui.TextWrapped("✓ Proxy is RUNNING - Connect Hytale to 127.0.0.1:5521 now!");
+            ImGui.TextWrapped("✓ Proxy is RUNNING - Connect Hytale to 127.0.0.1:5521 (copied to clipboard!)");
             ImGui.PopStyleColor();
+
+            // Show copy feedback
+            if (ImGui.GetTime() - _copyFeedbackTime < 3.0)
+            {
+                ImGui.TextColored(new Vector4(0.2f, 0.9f, 0.2f, 1),
+                    "✓ 127.0.0.1:5521 copied to clipboard!");
+            }
         }
 
         float leftW = avail.X * 0.45f - 8;
@@ -69,54 +73,7 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // SERVER PRESET SELECTOR - FIXED AND VISIBLE
-        ImGui.TextColored(Theme.ColAccent, "Server Preset:");
-
-        var presets = _state.Config.GetAllPresets();
-        string[] presetNames = presets.Select(p => p.Name).ToArray();
-
-        ImGui.SetNextItemWidth(leftW - 32);
-        if (ImGui.Combo("##presetSelector", ref _selectedPresetIndex, presetNames, presetNames.Length))
-        {
-            var selected = presets[_selectedPresetIndex];
-
-            if (selected.Name != "Blank" && !string.IsNullOrEmpty(selected.IpAddress))
-            {
-                System.Text.Encoding.ASCII.GetBytes(selected.IpAddress).CopyTo(_bufServerIp, 0);
-                System.Text.Encoding.ASCII.GetBytes(selected.Port.ToString()).CopyTo(_bufServerPort, 0);
-                _state.TargetHost = selected.IpAddress;
-                _state.TargetPort = selected.Port;
-
-                _state.AddInGameLog($"[PRESET] Loaded {selected.Name}: {selected.IpAddress}:{selected.Port}");
-            }
-            else
-            {
-                Array.Clear(_bufServerIp, 0, _bufServerIp.Length);
-                Array.Clear(_bufServerPort, 0, _bufServerPort.Length);
-                System.Text.Encoding.ASCII.GetBytes("5520").CopyTo(_bufServerPort, 0);
-                _state.TargetHost = "";
-                _state.TargetPort = 5520;
-            }
-        }
-
-        if (_selectedPresetIndex < presets.Count)
-        {
-            var current = presets[_selectedPresetIndex];
-            if (!string.IsNullOrEmpty(current.Description))
-            {
-                ImGui.TextColored(Theme.ColTextMuted, $"  {current.Description}");
-            }
-            if (!string.IsNullOrEmpty(current.IpAddress))
-            {
-                ImGui.TextColored(Theme.ColTextMuted, $"  {current.IpAddress}:{current.Port}");
-            }
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        // MANUAL SERVER CONFIGURATION WITH COPY-PASTE
+        // REMOVED: Server preset selector - simplified for UDP
 
         ImGui.Text("Target Server IP:");
         RenderInputWithPaste("##srvIp", _bufServerIp, (val) => _state.TargetHost = val, leftW - 32);
@@ -124,63 +81,39 @@ public class ConnectTab : ITab
         ImGui.Spacing();
 
         ImGui.Text("Server Port:");
-        RenderPortInputWithPaste("##srvPort", _bufServerPort, (val) => { if (int.TryParse(val, out int p)) _state.TargetPort = p; }, 120);
+        RenderPortInputWithPaste("##srvPort", _bufServerPort, (val) => {
+            if (int.TryParse(val, out int p)) _state.TargetPort = p;
+        }, 120);
 
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
 
-        ImGui.Text("Proxy Mode:");
-        bool unified = _state.UseUnifiedPort;
-
-        if (ImGui.Button("  UNIFIED PORT  ", new Vector2(140, 28)))
-            _state.UseUnifiedPort = true;
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("TCP + UDP on same port (like real Hytale server)");
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("  SEPARATE PORTS  ", new Vector2(140, 28)))
-            _state.UseUnifiedPort = false;
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("TCP and UDP on different ports");
-
-        ImGui.Spacing();
-        ImGui.Separator();
+        // UDP-ONLY INFO
+        ImGui.TextColored(Theme.ColAccent, "Mode: UDP-ONLY");
+        ImGui.TextWrapped("Hytale uses QUIC over UDP. No TCP needed.");
         ImGui.Spacing();
 
-        if (_state.UseUnifiedPort)
-        {
-            ImGui.Text("Unified Port (TCP + UDP):");
-            RenderPortInputWithPaste("##unifiedPort", _bufUnifiedPort, (val) => { if (int.TryParse(val, out int p)) _state.UnifiedPort = p; }, 120);
-
-            ImGui.Spacing();
-            ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1),
-                $"Connect to: 127.0.0.1:{_state.UnifiedPort}");
-            ImGui.TextWrapped("Both registry (TCP) and gameplay (UDP) on this single port");
-        }
-        else
-        {
-            ImGui.Text("TCP Port (Registry):");
-            ImGui.TextColored(Theme.ColAccent, $"127.0.0.1:{_state.TcpListenPort}");
-            ImGui.Spacing();
-            ImGui.Text("UDP Port (Gameplay):");
-            ImGui.TextColored(Theme.ColAccent, $"127.0.0.1:{_state.UdpListenPort}");
-        }
+        ImGui.Text("Listen Port (UDP):");
+        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1), $"127.0.0.1:{_state.ListenPort}");
+        ImGui.TextWrapped("Connect Hytale to this address (auto-copied when starting)");
 
         ImGui.Spacing();
 
         if (!_state.IsRunning)
         {
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.7f, 0.3f, 1f));
-            if (ImGui.Button("  START PROXIES  ", new Vector2(leftW - 24, 40)))
+            if (ImGui.Button("  START PROXY  ", new Vector2(leftW - 24, 40)))
+            {
                 _state.Start();
+                _copyFeedbackTime = ImGui.GetTime();
+            }
             ImGui.PopStyleColor();
         }
         else
         {
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.9f, 0.3f, 0.2f, 1f));
-            if (ImGui.Button("  STOP PROXIES  ", new Vector2(leftW - 24, 40)))
+            if (ImGui.Button("  STOP PROXY  ", new Vector2(leftW - 24, 40)))
                 _state.Stop();
             ImGui.PopStyleColor();
         }
@@ -196,13 +129,12 @@ public class ConnectTab : ITab
         {
             ImGui.Spacing();
             ImGui.TextColored(Theme.ColWarn, "Advanced Options:");
-            if (ImGui.Button("Force TCP Bind to 127.0.0.1", new Vector2(leftW - 24, 28)))
+
+            if (ImGui.Button("Force Rebind UDP Port", new Vector2(leftW - 24, 28)))
             {
-                _state.TcpListenPort = 5521;
-                _state.AddInGameLog("[DEBUG] Forced TCP to 127.0.0.1:5521");
+                _state.ListenPort = 5521;
+                _state.AddInGameLog("[DEBUG] Forced UDP to 0.0.0.0:5521");
             }
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Some systems require explicit localhost binding");
 
             if (ImGui.Button("Test Local Connection", new Vector2(leftW - 24, 28)))
             {
@@ -212,8 +144,8 @@ public class ConnectTab : ITab
             if (ImGui.Button("Copy Config to Clipboard", new Vector2(leftW - 24, 28)))
             {
                 var configText = $"Server: {_state.TargetHost}:{_state.TargetPort}\n" +
-                               $"Mode: {(_state.UseUnifiedPort ? "Unified" : "Separate")}\n" +
-                               $"Listen: 127.0.0.1:{_state.UnifiedPort}";
+                               $"Mode: UDP-ONLY\n" +
+                               $"Listen: 127.0.0.1:{_state.ListenPort}";
                 CopyToClipboard(configText);
                 _state.AddInGameLog("[DEBUG] Config copied to clipboard");
             }
@@ -310,12 +242,7 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        RenderStatusIndicator("TCP Proxy", _state.TcpProxy.IsRunning,
-            _state.TcpProxy.IsRunning ? $"Port {_state.TcpProxy.ListenPort}" : "Stopped",
-            _state.TcpProxy.ActiveSessions);
-
-        ImGui.Spacing();
-
+        // REMOVED: TCP status - UDP only
         RenderStatusIndicator("UDP Proxy", _state.UdpProxy.IsRunning,
             _state.UdpProxy.IsRunning ? $"Port {_state.UdpProxy.ListenPort}" : "Stopped",
             _state.UdpProxy.ActiveSessions);
@@ -332,12 +259,7 @@ public class ConnectTab : ITab
         ImGui.SameLine();
         ImGui.Text("total packets");
 
-        ImGui.Columns(2, "##traffic", false);
-        ImGui.Text($"TCP: {_state.TcpPackets:N0}");
-        ImGui.NextColumn();
-        ImGui.Text($"UDP: {_state.UdpPackets:N0}");
-        ImGui.NextColumn();
-        ImGui.Columns(1);
+        ImGui.Text($"UDP: {_state.UdpPackets:N0} (Gameplay only)");
 
         ImGui.Spacing();
         ImGui.Text($"Unique Opcodes: {_state.PacketLog.UniqueOpcodes}");
@@ -346,46 +268,10 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        ImGui.Text("Registry Status");
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        bool regRx = Protocol.RegistrySyncParser.RegistrySyncReceived;
-
-        var regColor = regRx ? Theme.ColSuccess : Theme.ColWarn;
-        var drawList = ImGui.GetWindowDrawList();
-        var pos = ImGui.GetCursorScreenPos();
-        drawList.AddRectFilled(pos, pos + new Vector2(20, 20),
-            ImGui.ColorConvertFloat4ToU32(regColor), 4);
-        ImGui.Dummy(new Vector2(25, 20));
-        ImGui.SameLine();
-        ImGui.TextColored(regColor, regRx ? "RegistrySync RECEIVED ✓" : "Waiting for RegistrySync...");
-
-        if (regRx)
-        {
-            ImGui.Text($"Items Parsed: {Protocol.RegistrySyncParser.NumericIdToName.Count:N0}");
-            ImGui.Text($"Players Seen: {Protocol.RegistrySyncParser.PlayerNamesSeen.Count:N0}");
-
-            if (ImGui.Button("Copy Item List", new Vector2(120, 0)))
-            {
-                var items = string.Join("\n", Protocol.RegistrySyncParser.NumericIdToName.Select(x => $"{x.Key:X8}: {x.Value}"));
-                CopyToClipboard(items);
-                _state.AddInGameLog("[COPY] Item list copied to clipboard");
-            }
-        }
-        else
-        {
-            int port = _state.UseUnifiedPort ? _state.UnifiedPort : _state.TcpListenPort;
-            ImGui.TextColored(new Vector4(0.9f, 0.3f, 0.2f, 1),
-                $"Connect Hytale to 127.0.0.1:{port}");
-
-            ImGui.Spacing();
-            ImGui.TextColored(Theme.ColTextMuted, "Troubleshooting:");
-            ImGui.TextWrapped("1. Make sure proxy is STARTED (green button)");
-            ImGui.TextWrapped("2. Close Hytale completely");
-            ImGui.TextWrapped("3. Launch Hytale, connect to 127.0.0.1:" + port);
-            ImGui.TextWrapped("4. Check Windows Firewall isn't blocking");
-        }
+        ImGui.TextColored(Theme.ColAccent, "Auto-Copy Feature");
+        ImGui.TextWrapped("When you click 'START PROXY', the connect address");
+        ImGui.TextColored(new Vector4(0.2f, 0.9f, 0.2f, 1), "127.0.0.1:5521");
+        ImGui.TextWrapped("is automatically copied to your clipboard. Just paste it into Hytale!");
 
         if (_showAdvanced)
         {
@@ -393,14 +279,12 @@ public class ConnectTab : ITab
             ImGui.Separator();
             ImGui.TextColored(Theme.ColWarn, "Debug Info:");
             ImGui.Text($"Target: {_state.TargetHost}:{_state.TargetPort}");
-            ImGui.Text($"Listen: 127.0.0.1:{_state.UnifiedPort}");
-            ImGui.Text($"TCP Status: {_state.TcpProxy.StatusMessage}");
+            ImGui.Text($"Listen: 0.0.0.0:{_state.ListenPort}");
             ImGui.Text($"UDP Status: {_state.UdpProxy.StatusMessage}");
 
             if (ImGui.Button("Copy Debug Info", new Vector2(120, 0)))
             {
                 CopyToClipboard($"Target: {_state.TargetHost}:{_state.TargetPort}\n" +
-                              $"TCP: {_state.TcpProxy.StatusMessage}\n" +
                               $"UDP: {_state.UdpProxy.StatusMessage}");
             }
         }
@@ -431,18 +315,17 @@ public class ConnectTab : ITab
     {
         try
         {
-            using var client = new System.Net.Sockets.TcpClient();
-            client.Connect("127.0.0.1", _state.UnifiedPort);
-            _state.AddInGameLog($"[TEST] Successfully connected to 127.0.0.1:{_state.UnifiedPort}");
+            using var client = new System.Net.Sockets.UdpClient();
+            client.Connect("127.0.0.1", _state.ListenPort);
+            _state.AddInGameLog($"[TEST] UDP port {_state.ListenPort} is reachable");
             client.Close();
         }
         catch (Exception ex)
         {
-            _state.AddInGameLog($"[TEST] Connection failed: {ex.Message}");
+            _state.AddInGameLog($"[TEST] Connection test: {ex.Message}");
         }
     }
 
-    // CROSS-PLATFORM CLIPBOARD HELPERS using TextCopy
     private string? GetClipboardText()
     {
         try
@@ -457,13 +340,6 @@ public class ConnectTab : ITab
 
     private void CopyToClipboard(string text)
     {
-        try
-        {
-            TextCopy.ClipboardService.SetText(text);
-        }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[ERROR] Failed to copy: {ex.Message}");
-        }
+        try { TextCopy.ClipboardService.SetText(text); } catch { }
     }
 }

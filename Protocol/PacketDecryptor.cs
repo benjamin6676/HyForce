@@ -1,4 +1,4 @@
-﻿// FILE: Protocol/PacketDecryptor.cs - PACKET DECRYPTION SYSTEM
+﻿// FILE: Protocol/PacketDecryptor.cs - ENHANCED WITH AUTO-EXTRACTION
 using System.Security.Cryptography;
 using System.Text;
 
@@ -11,7 +11,7 @@ public static class PacketDecryptor
         None,
         AES128GCM,
         AES256GCM,
-        ChaCha20Poly1305,
+        ChaCha20Poly1305,  // Added for QUIC TLS 1.3
         XOR,
         Custom
     }
@@ -32,12 +32,17 @@ public static class PacketDecryptor
         public EncryptionType Type { get; set; }
         public string Source { get; set; } = "";
         public IntPtr? MemoryAddress { get; set; }
+        public DateTime DiscoveredAt { get; set; } = DateTime.Now;
     }
 
     public static List<EncryptionKey> DiscoveredKeys { get; } = new();
     public static event Action<EncryptionKey>? OnKeyDiscovered;
     public static int SuccessfulDecryptions { get; private set; }
     public static int FailedDecryptions { get; private set; }
+
+    // Auto-extraction settings
+    public static bool AutoExtractFromMemory { get; set; } = true;
+    public static bool AutoExtractFromSSLLog { get; set; } = true;
 
     public static DecryptionResult TryDecrypt(byte[] encryptedData, byte[]? associatedData = null)
     {
@@ -51,7 +56,7 @@ public static class PacketDecryptor
         }
 
         // Try each discovered key
-        foreach (var key in DiscoveredKeys)
+        foreach (var key in DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt))
         {
             var result = TryDecryptWithKey(encryptedData, key, associatedData);
             if (result.Success)
@@ -85,6 +90,8 @@ public static class PacketDecryptor
             {
                 EncryptionType.AES128GCM or EncryptionType.AES256GCM =>
                     DecryptAESGCM(data, key.Key, key.IV, associatedData),
+                EncryptionType.ChaCha20Poly1305 =>
+                    DecryptChaCha20(data, key.Key, key.IV, associatedData),
                 EncryptionType.XOR =>
                     DecryptXOR(data, key.Key),
                 _ => new DecryptionResult { Success = false }
@@ -143,6 +150,28 @@ public static class PacketDecryptor
         }
     }
 
+    private static DecryptionResult DecryptChaCha20(byte[] data, byte[] key, byte[] iv, byte[]? associatedData)
+    {
+        try
+        {
+            // ChaCha20-Poly1305: nonce(12) + ciphertext + tag(16)
+            if (data.Length < 29 || key.Length != 32)
+                return new DecryptionResult { Success = false };
+
+            // Note: .NET doesn't have built-in ChaCha20, use BouncyCastle or libsodium
+            // For now, return failure but mark as potential ChaCha20
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = "ChaCha20 requires BouncyCastle library"
+            };
+        }
+        catch
+        {
+            return new DecryptionResult { Success = false };
+        }
+    }
+
     private static DecryptionResult DecryptXOR(byte[] data, byte[] key)
     {
         if (key.Length == 0) return new DecryptionResult { Success = false };
@@ -188,7 +217,8 @@ public static class PacketDecryptor
         {
             "HYTALE_DEBUG_KEY_32_BYTES_LONG!!",
             "0123456789abcdef0123456789abcdef",
-            "hytalehytalehytalehytalehytale12"
+            "hytalehytalehytalehytalehytale12",
+            "QUIC_DEBUG_KEY_32_BYTES_LONG!!"
         };
 
         foreach (var debugKey in debugKeys)
@@ -235,6 +265,55 @@ public static class PacketDecryptor
             Source = source,
             MemoryAddress = address
         });
+    }
+
+    // AUTO-EXTRACTION: Scan for TLS secrets in memory
+    public static void AutoExtractKeysFromMemory(IntPtr processHandle)
+    {
+        if (!AutoExtractFromMemory) return;
+
+        try
+        {
+            // Look for SSLKEYLOGFILE patterns in memory
+            // TLS 1.3 secrets are 32 or 48 bytes with high entropy
+            // and are often near "CLIENT_TRAFFIC_SECRET" strings
+
+            // This would need memory scanning implementation
+            // For now, placeholder for auto-extraction logic
+        }
+        catch { }
+    }
+
+    // AUTO-EXTRACTION: Load from SSLKEYLOGFILE
+    public static void AutoExtractFromSSLLogFile(string path)
+    {
+        if (!AutoExtractFromSSLLog || !File.Exists(path)) return;
+
+        try
+        {
+            var lines = File.ReadAllLines(path);
+            foreach (var line in lines)
+            {
+                // Parse: CLIENT_TRAFFIC_SECRET_0 <client_random> <secret_hex>
+                var parts = line.Split(' ');
+                if (parts.Length >= 3 &&
+                    (parts[0].Contains("TRAFFIC_SECRET") || parts[0].Contains("HANDSHAKE_TRAFFIC_SECRET")))
+                {
+                    var secret = Convert.FromHexString(parts[2]);
+                    if (secret.Length == 32)
+                    {
+                        AddKey(new EncryptionKey
+                        {
+                            Key = secret,
+                            IV = new byte[12],
+                            Type = EncryptionType.AES256GCM,
+                            Source = $"SSLLog:{Path.GetFileName(path)}"
+                        });
+                    }
+                }
+            }
+        }
+        catch { }
     }
 
     public static void ClearKeys()

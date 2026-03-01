@@ -1,4 +1,4 @@
-﻿// FILE: App/HyForceApp.cs - UPDATED WITH PACKET HANDLER AND DECRYPTION TAB
+﻿// FILE: App/HyForceApp.cs - FIXED: PROPER EVENT ACCESS AND MENU
 using HyForce.Core;
 using HyForce.Tabs;
 using HyForce.UI;
@@ -18,7 +18,7 @@ public class HyForceApp
     private readonly CommandList _commandList;
 
     private readonly AppState _state;
-    private readonly Protocol.PacketHandler _packetHandler;  // FIXED: Fully qualified name
+    private readonly Protocol.PacketHandler _packetHandler;
     private readonly List<ITab> _tabs = new();
     private readonly Theme _theme;
     private int _selectedTab = 0;
@@ -40,11 +40,9 @@ public class HyForceApp
         _state = AppState.Instance;
         _theme = new Theme();
 
-        // Initialize packet handler before tabs
         _packetHandler = new Protocol.PacketHandler(_state);
 
-        // Wire up packet handling
-        _state.TcpProxy.OnPacket += _packetHandler.ProcessPacket;
+        // Only UDP handler
         _state.UdpProxy.OnPacket += _packetHandler.ProcessPacket;
 
         InitializeTabs();
@@ -54,13 +52,12 @@ public class HyForceApp
     private void InitializeTabs()
     {
         _tabs.Add(new ConnectTab(_state));
-        _tabs.Add(new RegistryTab(_state));
         _tabs.Add(new ItemsTab(_state));
         _tabs.Add(new PacketFeedTab(_state));
         _tabs.Add(new SecurityAuditTab(_state));
         _tabs.Add(new LogTab(_state));
-        _tabs.Add(new MemoryTab(_state));        // NEW: Memory scanner
-        _tabs.Add(new DecryptionTab(_state));    // NEW: Decryption management
+        _tabs.Add(new MemoryTab(_state));        // Memory scanner
+        _tabs.Add(new DecryptionTab(_state));    // Decryption management
         _tabs.Add(new SettingsTab(_state));
     }
 
@@ -68,7 +65,6 @@ public class HyForceApp
     {
         var io = ImGui.GetIO();
         io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard;
-
         _theme.Apply();
     }
 
@@ -214,13 +210,18 @@ public class HyForceApp
 
                 if (ImGui.MenuItem("Open Export Folder"))
                 {
-                    System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);
+                    try
+                    {
+                        System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);
+                    }
+                    catch { }
                 }
 
-                // NEW: Memory scanning tools
-                if (ImGui.MenuItem("Quick Memory Scan"))
+                // FIXED: Memory Tab now properly accessible from menu
+                ImGui.Separator();
+                if (ImGui.MenuItem("Memory Scanner", "Ctrl+M"))
                 {
-                    // Switch to memory tab and trigger scan
+                    // Switch to Memory tab
                     for (int i = 0; i < _tabs.Count; i++)
                     {
                         if (_tabs[i] is MemoryTab)
@@ -229,6 +230,12 @@ public class HyForceApp
                             break;
                         }
                     }
+                }
+
+                // FIXED: Use public method instead of direct event access
+                if (ImGui.MenuItem("Quick Memory Scan", "Ctrl+Shift+M"))
+                {
+                    _state.TriggerMemoryScan();
                 }
 
                 ImGui.EndMenu();
@@ -323,17 +330,18 @@ public class HyForceApp
             ImGui.Spacing();
 
             ImGui.TextWrapped("HyForce is a network security analysis tool for Hytale. " +
-                "It captures and analyzes TCP (RegistrySync) and UDP (QUIC gameplay) traffic " +
-                "to help identify security vulnerabilities and understand game protocol behavior.");
+                "It captures and analyzes UDP (QUIC gameplay) traffic " +
+                "to help identify security vulnerabilities and understand game protocol behavior. " +
+                "Hytale uses UDP/QUIC only - no TCP required!");
 
             ImGui.Spacing();
             ImGui.Separator();
             ImGui.Spacing();
 
-            // NEW: Show decryption status
             ImGui.TextColored(Theme.ColAccent, "Decryption Status:");
             ImGui.Text($"Keys Available: {PacketDecryptor.DiscoveredKeys.Count}");
             ImGui.Text($"Packets Decrypted: {PacketDecryptor.SuccessfulDecryptions}");
+            ImGui.Text($"Packets Failed: {PacketDecryptor.FailedDecryptions}");
 
             ImGui.Spacing();
             ImGui.Separator();
@@ -395,19 +403,14 @@ public class HyForceApp
             string basePath = Path.Combine(_state.ExportDirectory, $"hyforce_full_export_{timestamp}");
             Directory.CreateDirectory(basePath);
 
-            // Export diagnostics
             File.WriteAllText(Path.Combine(basePath, "diagnostics.txt"), _state.GenerateDiagnostics());
-
-            // Export packet log
             File.WriteAllText(Path.Combine(basePath, "packets.txt"), _state.ExportPacketLog());
 
-            // Export in-game log
             lock (_state.InGameLog)
             {
                 File.WriteAllLines(Path.Combine(basePath, "ingame_log.txt"), _state.InGameLog);
             }
 
-            // Export security events
             var securitySb = new System.Text.StringBuilder();
             securitySb.AppendLine("=== SECURITY EVENTS ===");
             foreach (var evt in _state.SecurityEvents.OrderBy(e => e.Timestamp))
@@ -416,7 +419,6 @@ public class HyForceApp
             }
             File.WriteAllText(Path.Combine(basePath, "security_events.txt"), securitySb.ToString());
 
-            // Export discovered encryption keys
             if (PacketDecryptor.DiscoveredKeys.Count > 0)
             {
                 var keysSb = new System.Text.StringBuilder();
@@ -434,7 +436,11 @@ public class HyForceApp
             }
 
             _state.AddInGameLog($"[SUCCESS] Full export completed to {basePath}");
-            System.Diagnostics.Process.Start("explorer.exe", basePath);
+            try
+            {
+                System.Diagnostics.Process.Start("explorer.exe", basePath);
+            }
+            catch { }
         }
         catch (Exception ex)
         {

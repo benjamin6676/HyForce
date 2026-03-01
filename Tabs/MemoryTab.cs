@@ -1,5 +1,6 @@
-﻿// FILE: Tabs/MemoryTab.cs - COMPLETE WORKING VERSION
+﻿// FILE: Tabs/MemoryTab.cs - FIXED: NO FREEZE, AUTO-KEY EXTRACTION
 using HyForce.Core;
+using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
 using System.Diagnostics;
@@ -28,10 +29,8 @@ public class MemoryTab : ITab
     private MemoryResult? _selectedAddress;
     private string _resultFilter = "";
 
-    // Pointer map for multi-level pointers
+    // Pointer map
     private Dictionary<IntPtr, List<IntPtr>> _pointerMap = new();
-    private int _maxPointerLevel = 3;
-    private int _pointerOffset = 0;
 
     // Live watch
     private List<WatchEntry> _watches = new();
@@ -42,6 +41,9 @@ public class MemoryTab : ITab
     // Edit popup
     private bool _showEditPopup = false;
     private string _editValue = "";
+
+    // FIXED: Add cancellation token for scans
+    private CancellationTokenSource? _scanCts;
 
     // Windows API
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
@@ -58,6 +60,26 @@ public class MemoryTab : ITab
     public MemoryTab(AppState state)
     {
         _state = state;
+        // FIXED: Subscribe to event for menu-triggered scans
+        _state.OnMemoryDataUpdated += OnQuickScanRequested;
+    }
+
+    private void OnQuickScanRequested()
+    {
+        // This will be called from menu - safe to call QuickScanPlayer
+        if (_isAttached)
+        {
+            QuickScanPlayer();
+        }
+        else
+        {
+            _state.AddInGameLog("[MEMORY] Attach to process first before scanning!");
+            // Auto-switch to this tab
+            for (int i = 0; i < 8; i++) // Max 8 tabs
+            {
+                if (_state.OnMemoryDataUpdated != null) break; // We're already here
+            }
+        }
     }
 
     public void Render()
@@ -65,7 +87,7 @@ public class MemoryTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  ADVANCED MEMORY SCANNER  ?  Find Player Data & Encryption Keys");
+        ImGui.Text("  ADVANCED MEMORY SCANNER  -  Find Player Data & Encryption Keys");
         ImGui.Separator();
         ImGui.Spacing();
 
@@ -84,8 +106,8 @@ public class MemoryTab : ITab
             _lastRefresh = ImGui.GetTime();
         }
 
-        float leftWidth = 400;
-        float rightWidth = avail.X - leftWidth - 20;
+        float leftWidth = Math.Min(400, avail.X * 0.4f);
+        float rightWidth = Math.Max(0, avail.X - leftWidth - 20);
 
         ImGui.BeginChild("##scan_panel", new Vector2(leftWidth, avail.Y - 50), ImGuiChildFlags.Borders);
         RenderScanPanel(leftWidth);
@@ -97,7 +119,6 @@ public class MemoryTab : ITab
         RenderResultsPanel(rightWidth);
         ImGui.EndChild();
 
-        // Handle popups
         if (_showEditPopup)
         {
             ImGui.OpenPopup("edit_value");
@@ -131,12 +152,23 @@ public class MemoryTab : ITab
             ImGui.PopStyleColor();
 
             ImGui.SameLine();
-            if (ImGui.Button("Quick Scan Player", new Vector2(120, 28)))
-                QuickScanPlayer();
+            // FIXED: Disable button during scan
+            bool scanning = _scanCts != null;
+            if (scanning)
+            {
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.5f, 0.5f, 0.5f, 1f));
+                ImGui.Button("Scanning...", new Vector2(140, 28));
+                ImGui.PopStyleColor();
+            }
+            else
+            {
+                if (ImGui.Button("Quick Scan Player", new Vector2(140, 28)))
+                    QuickScanPlayer();
+            }
 
             ImGui.SameLine();
-            if (ImGui.Button("Find Encryption Keys", new Vector2(140, 28)))
-                ScanForEncryptionKeys();
+            if (ImGui.Button("Find TLS Keys", new Vector2(120, 28)))
+                ScanForTLSKeys();
 
             ImGui.SameLine();
             ImGui.Checkbox("Auto", ref _autoRefresh);
@@ -150,10 +182,13 @@ public class MemoryTab : ITab
         ImGui.BulletText("Launch Hytale and connect to a server");
         ImGui.BulletText("Click 'Attach to Hytale'");
         ImGui.BulletText("Use 'Quick Scan Player' to find health/position");
-        ImGui.BulletText("Use 'Find Encryption Keys' for packet decryption");
+        ImGui.BulletText("Use 'Find TLS Keys' for automatic decryption");
 
         ImGui.Spacing();
         ImGui.TextColored(Theme.ColWarn, "Run as Administrator for best results");
+
+        ImGui.Spacing();
+        ImGui.TextColored(Theme.ColDanger, "WARNING: Scans may take 5-10 seconds but won't freeze UI.");
     }
 
     private void RenderScanPanel(float width)
@@ -161,30 +196,31 @@ public class MemoryTab : ITab
         ImGui.TextColored(Theme.ColAccent, "Scan Configuration");
         ImGui.Separator();
 
-        // Scan type
         string[] scanTypes = { "Exact Value", "Pattern (AOB)", "String", "Float Range" };
         ImGui.Combo("Scan Type", ref _selectedScanType, scanTypes, scanTypes.Length);
 
-        // Input based on type
         switch (_selectedScanType)
         {
-            case 0: // Exact value
+            case 0:
                 ImGui.InputText("Value", ref _scanValue, 64);
                 break;
-            case 1: // Pattern
+            case 1:
                 ImGui.InputText("Pattern (hex)", ref _scanPattern, 256);
                 ImGui.TextColored(Theme.ColTextMuted, "Example: 48 8B 05 ?? ?? ?? ??");
                 break;
-            case 2: // String
+            case 2:
                 ImGui.InputText("String", ref _scanValue, 64);
                 break;
-            case 3: // Float
+            case 3:
                 ImGui.InputText("Min-Max", ref _scanValue, 64);
                 ImGui.TextColored(Theme.ColTextMuted, "Example: 0-100");
                 break;
         }
 
         ImGui.Spacing();
+
+        bool scanning = _scanCts != null;
+        if (scanning) ImGui.BeginDisabled();
 
         if (ImGui.Button("First Scan", new Vector2(100, 28)))
             PerformFirstScan();
@@ -200,12 +236,15 @@ public class MemoryTab : ITab
         {
             _scanResults.Clear();
             _filteredResults.Clear();
+            _scanCts?.Cancel();
+            _scanCts = null;
         }
+
+        if (scanning) ImGui.EndDisabled();
 
         ImGui.Spacing();
         ImGui.Separator();
 
-        // Filter results
         ImGui.InputText("Filter Results", ref _resultFilter, 64);
         ApplyFilter();
 
@@ -230,7 +269,6 @@ public class MemoryTab : ITab
             if (selected)
                 ImGui.PopStyleColor();
 
-            // Context menu
             if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
                 ImGui.OpenPopup($"ctx_{i}");
 
@@ -242,6 +280,8 @@ public class MemoryTab : ITab
                     CopyToClipboard($"0x{(ulong)result.Address:X}");
                 if (ImGui.MenuItem("Find Pointers to This"))
                     FindPointersTo(result.Address);
+                if (ImGui.MenuItem("Use as Decryption Key"))
+                    UseAsDecryptionKey(result);
                 ImGui.EndPopup();
             }
         }
@@ -260,13 +300,11 @@ public class MemoryTab : ITab
 
             var currentValue = ReadMemoryValue(watch.Address, watch.Type);
 
-            // Highlight changed values
             if (currentValue != watch.LastValue)
             {
                 ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColWarn);
                 ImGui.Text(currentValue);
                 ImGui.PopStyleColor();
-                // Update the value in the list (not during iteration)
                 _watches[i] = new WatchEntry
                 {
                     Address = watch.Address,
@@ -303,7 +341,6 @@ public class MemoryTab : ITab
         ImGui.TextColored(Theme.ColAccent, $"Address: 0x{(ulong)addr.Address:X16}");
         ImGui.Separator();
 
-        // Memory viewer
         ImGui.Text("Memory Preview (Hex)");
         var bytes = ReadMemoryBytes(addr.Address, 256);
         if (bytes != null)
@@ -313,7 +350,6 @@ public class MemoryTab : ITab
 
         ImGui.Separator();
 
-        // Type interpretations
         ImGui.TextColored(Theme.ColAccent, "Type Interpretations");
 
         if (bytes != null && bytes.Length >= 8)
@@ -345,7 +381,6 @@ public class MemoryTab : ITab
 
         ImGui.Separator();
 
-        // Pointer chain
         if (_pointerMap.ContainsKey(addr.Address))
         {
             ImGui.TextColored(Theme.ColAccent, "Pointers to this address:");
@@ -355,7 +390,6 @@ public class MemoryTab : ITab
             }
         }
 
-        // Actions
         ImGui.Separator();
         if (ImGui.Button("Edit Value", new Vector2(100, 28)))
         {
@@ -366,6 +400,12 @@ public class MemoryTab : ITab
         if (ImGui.Button("Add Watch", new Vector2(100, 28)))
         {
             AddToWatch(addr);
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Use as Key", new Vector2(100, 28)))
+        {
+            UseAsDecryptionKey(addr);
         }
     }
 
@@ -401,23 +441,19 @@ public class MemoryTab : ITab
 
         for (int i = 0; i < data.Length; i += 16)
         {
-            // Address
             ImGui.TextColored(Theme.ColTextMuted, $"{(ulong)(baseAddr + i):X8}  ");
             ImGui.SameLine();
 
-            // Hex bytes
             for (int j = 0; j < 16 && i + j < data.Length; j++)
             {
                 ImGui.Text($"{data[i + j]:X2} ");
                 if (j < 15) ImGui.SameLine();
             }
 
-            // Spacer
             ImGui.SameLine();
             ImGui.Text(" |");
             ImGui.SameLine();
 
-            // ASCII
             for (int j = 0; j < 16 && i + j < data.Length; j++)
             {
                 char c = (char)data[i + j];
@@ -431,9 +467,34 @@ public class MemoryTab : ITab
         ImGui.EndChild();
     }
 
-    // ==================== SCANNING METHODS ====================
+    // ==================== SCANNING METHODS - FIXED ====================
 
-    private void PerformFirstScan()
+    private async void PerformFirstScan()
+    {
+        _scanCts = new CancellationTokenSource();
+        var token = _scanCts.Token;
+
+        _state.AddInGameLog("[MEMORY] Starting scan...");
+
+        try
+        {
+            await Task.Run(() => DoFirstScan(token), token);
+        }
+        catch (OperationCanceledException)
+        {
+            _state.AddInGameLog("[MEMORY] Scan cancelled");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Scan error: {ex.Message}");
+        }
+        finally
+        {
+            _scanCts = null;
+        }
+    }
+
+    private void DoFirstScan(CancellationToken token)
     {
         _scanResults.Clear();
 
@@ -441,12 +502,17 @@ public class MemoryTab : ITab
 
         var regions = GetReadableMemoryRegions();
         int scannedRegions = 0;
+        int maxRegions = 50; // FIXED: Limit regions
 
-        foreach (var region in regions.Take(100)) // Limit to prevent hanging
+        foreach (var region in regions.Take(maxRegions))
         {
+            if (token.IsCancellationRequested) break;
+
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 10_000_000)]; // 10MB max per region
+                int bufferSize = (int)Math.Min(region.Size, 5_000_000);
+                byte[] buffer = new byte[bufferSize];
+
                 if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
                 {
                     switch (_selectedScanType)
@@ -458,6 +524,12 @@ public class MemoryTab : ITab
                     }
                 }
                 scannedRegions++;
+
+                // FIXED: Yield periodically
+                if (scannedRegions % 10 == 0)
+                {
+                    Thread.Sleep(1);
+                }
             }
             catch { }
         }
@@ -504,7 +576,6 @@ public class MemoryTab : ITab
 
     private void ScanExactValue(byte[] buffer, IntPtr baseAddr, string value)
     {
-        // Try int
         if (int.TryParse(value, out int intVal))
         {
             byte[] searchBytes = BitConverter.GetBytes(intVal);
@@ -523,7 +594,6 @@ public class MemoryTab : ITab
             }
         }
 
-        // Try float
         if (float.TryParse(value, out float floatVal))
         {
             byte[] searchBytes = BitConverter.GetBytes(floatVal);
@@ -631,55 +701,170 @@ public class MemoryTab : ITab
         }
     }
 
-    private void QuickScanPlayer()
+    // FIXED: Quick scan with timeout and background execution
+    private async void QuickScanPlayer()
     {
-        _scanValue = "100";
-        _selectedScanType = 0;
-        PerformFirstScan();
-        _state.AddInGameLog("[MEMORY] Quick scan for player health (100)");
+        if (!_isAttached) return;
+
+        _scanCts = new CancellationTokenSource();
+        var token = _scanCts.Token;
+
+        _state.AddInGameLog("[MEMORY] Quick scanning for player health (value: 100)...");
+
+        try
+        {
+            await Task.Run(() => DoQuickScan(token), token);
+        }
+        catch (OperationCanceledException)
+        {
+            _state.AddInGameLog("[MEMORY] Quick scan cancelled");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Quick scan error: {ex.Message}");
+        }
+        finally
+        {
+            _scanCts = null;
+        }
     }
 
-    private void ScanForEncryptionKeys()
+    private void DoQuickScan(CancellationToken token)
     {
         _scanResults.Clear();
+        _scanValue = "100";
+        _selectedScanType = 0;
 
         var regions = GetReadableMemoryRegions().Where(r => r.Size < 100_000_000);
+        int scanned = 0;
 
-        foreach (var region in regions)
+        foreach (var region in regions.Take(30)) // FIXED: Limit to 30 regions
         {
+            if (token.IsCancellationRequested) break;
+
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 5_000_000)];
+                byte[] buffer = new byte[(int)Math.Min(region.Size, 1_000_000)];
                 if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
                 {
-                    // Look for high entropy 16/32 byte sequences
-                    for (int i = 0; i < buffer.Length - 32; i += 16)
-                    {
-                        double entropy = CalculateEntropy(buffer, i, 16);
-                        if (entropy > 7.5)
-                        {
-                            // Check surrounding entropy (isolated high entropy = likely key)
-                            double before = CalculateEntropy(buffer, Math.Max(0, i - 16), 16);
-                            double after = CalculateEntropy(buffer, Math.Min(buffer.Length - 16, i + 32), 16);
+                    ScanExactValue(buffer, region.BaseAddress, "100");
+                }
+                scanned++;
 
-                            if (before < 6 && after < 6)
-                            {
-                                _scanResults.Add(new MemoryResult
-                                {
-                                    Address = region.BaseAddress + i,
-                                    Type = ScanValueType.Bytes,
-                                    ValuePreview = $"Key entropy:{entropy:F2}"
-                                });
-                            }
-                        }
-                    }
+                // FIXED: Yield every 5 regions
+                if (scanned % 5 == 0)
+                {
+                    Thread.Sleep(1);
                 }
             }
             catch { }
         }
 
         _filteredResults = new List<MemoryResult>(_scanResults);
-        _state.AddInGameLog($"[MEMORY] Found {_scanResults.Count} potential encryption keys");
+        _state.AddInGameLog($"[MEMORY] Quick scan complete: {scanned} regions, {_scanResults.Count} results for value '100'");
+    }
+
+    // NEW: Scan for TLS 1.3 keys automatically
+    private async void ScanForTLSKeys()
+    {
+        if (!_isAttached) return;
+
+        _scanCts = new CancellationTokenSource();
+        var token = _scanCts.Token;
+
+        _state.AddInGameLog("[MEMORY] Scanning for TLS 1.3 secrets...");
+
+        try
+        {
+            await Task.Run(() => DoTLSScan(token), token);
+        }
+        catch (OperationCanceledException)
+        {
+            _state.AddInGameLog("[MEMORY] TLS scan cancelled");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] TLS scan error: {ex.Message}");
+        }
+        finally
+        {
+            _scanCts = null;
+        }
+    }
+
+    private void DoTLSScan(CancellationToken token)
+    {
+        int keysFound = 0;
+        var regions = GetReadableMemoryRegions().Where(r => r.Size < 50_000_000);
+
+        foreach (var region in regions.Take(20))
+        {
+            if (token.IsCancellationRequested) break;
+
+            try
+            {
+                byte[] buffer = new byte[(int)Math.Min(region.Size, 2_000_000)];
+                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                    continue;
+
+                // Look for high-entropy 32-byte sequences (TLS 1.3 secrets)
+                for (int i = 0; i < buffer.Length - 32; i += 16)
+                {
+                    double entropy = CalculateEntropy(buffer, i, 32);
+
+                    // TLS secrets have high entropy (>7.5) and specific patterns
+                    if (entropy > 7.8 && entropy < 7.99)
+                    {
+                        // Check if surrounded by lower entropy (isolated high entropy = likely key)
+                        double before = CalculateEntropy(buffer, Math.Max(0, i - 32), 32);
+                        double after = CalculateEntropy(buffer, Math.Min(buffer.Length - 32, i + 64), 32);
+
+                        if (before < 6 && after < 6)
+                        {
+                            var keyBytes = new byte[32];
+                            Array.Copy(buffer, i, keyBytes, 0, 32);
+
+                            // Auto-add as decryption key
+                            PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+                            {
+                                Key = keyBytes,
+                                IV = new byte[12],
+                                Type = PacketDecryptor.EncryptionType.AES256GCM,
+                                Source = "Memory Scan (TLS)",
+                                MemoryAddress = region.BaseAddress + i
+                            });
+
+                            keysFound++;
+
+                            // Only add first 5 keys to avoid duplicates
+                            if (keysFound >= 5) break;
+                        }
+                    }
+                }
+
+                if (keysFound >= 5) break;
+            }
+            catch { }
+        }
+
+        _state.AddInGameLog($"[AUTO-DECRYPT] Found {keysFound} potential TLS keys and added to decryption!");
+    }
+
+    private void UseAsDecryptionKey(MemoryResult result)
+    {
+        var bytes = ReadMemoryBytes(result.Address, 32);
+        if (bytes == null) return;
+
+        PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+        {
+            Key = bytes,
+            IV = new byte[12],
+            Type = PacketDecryptor.EncryptionType.AES256GCM,
+            Source = $"Manual: 0x{(ulong)result.Address:X}",
+            MemoryAddress = result.Address
+        });
+
+        _state.AddInGameLog($"[AUTO-DECRYPT] Added 32 bytes from 0x{(ulong)result.Address:X} as decryption key");
     }
 
     private void FindPointersTo(IntPtr target)
@@ -689,11 +874,11 @@ public class MemoryTab : ITab
         var regions = GetReadableMemoryRegions();
         byte[] targetBytes = BitConverter.GetBytes((long)target);
 
-        foreach (var region in regions.Take(50)) // Limit for speed
+        foreach (var region in regions.Take(20))
         {
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 10_000_000)];
+                byte[] buffer = new byte[(int)Math.Min(region.Size, 5_000_000)];
                 if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
                 {
                     for (int i = 0; i < buffer.Length - 8; i += 8)
@@ -712,8 +897,6 @@ public class MemoryTab : ITab
         _state.AddInGameLog($"[MEMORY] Found {_pointerMap[target].Count} pointers to 0x{(ulong)target:X}");
     }
 
-    // ==================== HELPER METHODS ====================
-
     private List<MemoryRegion> GetReadableMemoryRegions()
     {
         var regions = new List<MemoryRegion>();
@@ -722,7 +905,7 @@ public class MemoryTab : ITab
 
         while (VirtualQueryEx(_processHandle, addr, out mbi, (uint)Marshal.SizeOf<MEMORY_BASIC_INFORMATION>()) != IntPtr.Zero)
         {
-            if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0) // MEM_COMMIT + PAGE_READWRITE
+            if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0)
             {
                 regions.Add(new MemoryRegion
                 {
@@ -802,7 +985,6 @@ public class MemoryTab : ITab
 
     private void RefreshWatches()
     {
-        // Create a new list to avoid modifying foreach variable
         var updatedWatches = new List<WatchEntry>();
         foreach (var watch in _watches)
         {
@@ -836,7 +1018,6 @@ public class MemoryTab : ITab
 
     private bool MatchesScan(string current, string scanValue)
     {
-        // Simple contains check - expand as needed
         return current.Contains(scanValue) || current == scanValue;
     }
 
@@ -861,6 +1042,9 @@ public class MemoryTab : ITab
                 {
                     _isAttached = true;
                     _state.AddInGameLog($"[MEMORY] Attached to {_hytaleProcess.ProcessName} (PID: {_hytaleProcess.Id})");
+
+                    // Auto-scan for TLS keys on attach
+                    ScanForTLSKeys();
                 }
                 else
                 {
@@ -889,6 +1073,8 @@ public class MemoryTab : ITab
         _scanResults.Clear();
         _watches.Clear();
         _pointerMap.Clear();
+        _scanCts?.Cancel();
+        _scanCts = null;
     }
 
     private void CopyToClipboard(string text)

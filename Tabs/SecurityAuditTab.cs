@@ -1,4 +1,5 @@
-﻿using HyForce.Core;
+﻿// FILE: Tabs/SecurityAuditTab.cs - FIXED: REMOVED TcpPackets
+using HyForce.Core;
 using HyForce.Data;
 using HyForce.UI;
 using ImGuiNET;
@@ -23,7 +24,7 @@ public class SecurityAuditTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  SECURITY AUDIT  —  Defensive Testing");
+        ImGui.Text("  SECURITY AUDIT  -  Defensive Testing");
         ImGui.Separator();
         ImGui.Spacing();
 
@@ -89,11 +90,10 @@ public class SecurityAuditTab : ITab
         var anomalies = _state.SecurityEvents.Count(e => e.Category == "Anomaly");
         score -= anomalies * 5;
 
-        if (!Protocol.RegistrySyncParser.RegistrySyncReceived)
-            score -= 20;
-
-        if (_state.UdpPackets > _state.TcpPackets * 10)
-            score -= 10;
+        // FIXED: Removed TcpPackets reference - UDP only
+        // Check if we have reasonable UDP traffic instead
+        if (_state.UdpPackets < 10 && _state.IsRunning)
+            score -= 20; // No traffic captured
 
         return Math.Max(0, score);
     }

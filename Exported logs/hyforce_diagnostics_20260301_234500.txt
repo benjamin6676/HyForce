@@ -1,0 +1,155 @@
++------------------------------------------------------------------------------+
+                    HYFORCE V22-ENHANCED - FULL DIAGNOSTICS REPORT            
++------------------------------------------------------------------------------+
+
+Generated: 2026-03-01 23:45:00
+Session Duration: 2m 9s
+
+-------------------------------------------------------------------------------
+                              SYSTEM INFORMATION                               
+-------------------------------------------------------------------------------
+OS: Microsoft Windows NT 10.0.19045.0
+.NET Version: 10.0.3
+Machine: DESKTOP-640UJ9D
+Processor Count: 12
+
+-------------------------------------------------------------------------------
+                                CONFIGURATION                                  
+-------------------------------------------------------------------------------
+Mode: Unified Port
+Target: 66.70.180.128:5520
+Listen: 127.0.0.1:5521
+Export Path: C:\Users\benja\source\repos\HyForce\Exported logs
+
+-------------------------------------------------------------------------------
+                                PROXY STATUS                                   
+-------------------------------------------------------------------------------
+TCP Proxy: RUNNING 
+  - Status: Listening 127.0.0.1:5521 ? 66.70.180.128:5520
+  - Active Sessions: 0
+  - Total Connections: 0
+
+UDP Proxy: RUNNING 
+  - Status: Active: 1 sessions
+  - Active Sessions: 1
+  - Total Clients: 1
+
+-------------------------------------------------------------------------------
+                              TRAFFIC STATISTICS                               
+-------------------------------------------------------------------------------
+Total Packets: 3 162
+  TCP: 0 (0,00 B bytes) - Registry/Login
+  UDP: 3 162 (1,64 MB bytes) - Gameplay
+
+Bytes Total: 1,64 MB
+  Server?Client: 1,39 MB
+  Client?Server: 259,48 KB
+
+Unique Opcodes: 1525
+
+-------------------------------------------------------------------------------
+                                TOP 20 OPCODES                                 
+-------------------------------------------------------------------------------
+  0x73B8 (MOD_73B8            ):     66 packets (2,1%)
+  0x70B8 (MOD_70B8            ):     58 packets (1,8%)
+  0x74B8 (MOD_74B8            ):     58 packets (1,8%)
+  0x7BB8 (MOD_7BB8            ):     57 packets (1,8%)
+  0x77B8 (MOD_77B8            ):     56 packets (1,8%)
+  0x7AB8 (MOD_7AB8            ):     55 packets (1,7%)
+  0x6FB8 (MOD_6FB8            ):     51 packets (1,6%)
+  0x71B8 (MOD_71B8            ):     51 packets (1,6%)
+  0x63B8 (MOD_63B8            ):     51 packets (1,6%)
+  0x67B8 (MOD_67B8            ):     51 packets (1,6%)
+  0x7DB8 (MOD_7DB8            ):     51 packets (1,6%)
+  0x7EB8 (MOD_7EB8            ):     49 packets (1,5%)
+  0x7FB8 (S2C_0x7FB8          ):     48 packets (1,5%)
+  0x78B8 (MOD_78B8            ):     48 packets (1,5%)
+  0x6AB8 (MOD_6AB8            ):     48 packets (1,5%)
+  0x61B8 (MOD_61B8            ):     47 packets (1,5%)
+  0x62B8 (MOD_62B8            ):     47 packets (1,5%)
+  0x69B8 (MOD_69B8            ):     47 packets (1,5%)
+  0x6BB8 (MOD_6BB8            ):     47 packets (1,5%)
+  0x6DB8 (MOD_6DB8            ):     47 packets (1,5%)
+
+-------------------------------------------------------------------------------
+                                REGISTRY DATA                                  
+-------------------------------------------------------------------------------
+RegistrySync Received: False
+Found at Opcode: 0xFFFF
+
+Items Parsed: 0
+String IDs: 0
+Player Names: 0
+Total Entries: 0
+
+-------------------------------------------------------------------------------
+                               PLAYER DATABASE                                 
+-------------------------------------------------------------------------------
+Unique Items: 0
+Unique Players: 2 934
+
+-------------------------------------------------------------------------------
+                               SECURITY EVENTS                                 
+-------------------------------------------------------------------------------
+Total Events: 0
+By Category: 
+
+--- Recent Events (Last 20) ---
+
+-------------------------------------------------------------------------------
+                                IN-GAME LOG                                    
+-------------------------------------------------------------------------------
+[23:44:27] [006F] MouseInteraction (50 bytes)
+[23:44:28] [INTERACTION] Mouse click/attack
+[23:44:28] [006F] MouseInteraction (58 bytes)
+[23:44:28] [0070] DamageInfo (48 bytes)
+[23:44:30] [INTERACTION] Mouse click/attack
+[23:44:30] [006F] MouseInteraction (48 bytes)
+[23:44:32] [0070] DamageInfo (60 bytes)
+[23:44:32] [INTERACTION] Mouse click/attack
+[23:44:32] [006F] MouseInteraction (50 bytes)
+[23:44:32] [0070] DamageInfo (50 bytes)
+[23:44:33] [0070] DamageInfo (58 bytes)
+[23:44:33] [006C] ClientMovement (48 bytes)
+[23:44:35] [006C] ClientMovement (48 bytes)
+[23:44:35] [0070] DamageInfo (60 bytes)
+[23:44:35] [0070] DamageInfo (50 bytes)
+[23:44:36] [0070] DamageInfo (48 bytes)
+[23:44:36] [006C] ClientMovement (48 bytes)
+[23:44:37] [0070] DamageInfo (48 bytes)
+[23:44:38] [INTERACTION] Mouse click/attack
+[23:44:38] [006F] MouseInteraction (48 bytes)
+[23:44:39] [INTERACTION] Mouse click/attack
+[23:44:39] [006F] MouseInteraction (48 bytes)
+[23:44:39] [INTERACTION] Mouse click/attack
+[23:44:39] [006F] MouseInteraction (48 bytes)
+[23:44:40] [0070] DamageInfo (50 bytes)
+[23:44:40] [INTERACTION] Mouse click/attack
+[23:44:40] [006F] MouseInteraction (48 bytes)
+[23:44:41] [006C] ClientMovement (48 bytes)
+[23:44:41] [INTERACTION] Mouse click/attack
+[23:44:41] [006F] MouseInteraction (48 bytes)
+[23:44:42] [0070] DamageInfo (50 bytes)
+[23:44:42] [0070] DamageInfo (50 bytes)
+[23:44:43] [INTERACTION] Mouse click/attack
+[23:44:43] [006F] MouseInteraction (48 bytes)
+[23:44:45] [INTERACTION] Mouse click/attack
+[23:44:45] [006F] MouseInteraction (50 bytes)
+[23:44:46] [006C] ClientMovement (48 bytes)
+[23:44:46] [006C] ClientMovement (48 bytes)
+[23:44:47] [006C] ClientMovement (1472 bytes)
+[23:44:47] [0070] DamageInfo (1472 bytes)
+[23:44:47] [006C] ClientMovement (1472 bytes)
+[23:44:48] [006C] ClientMovement (1472 bytes)
+[23:44:48] [006C] ClientMovement (1472 bytes)
+[23:44:51] [006C] ClientMovement (1472 bytes)
+[23:44:52] [006C] ClientMovement (1472 bytes)
+[23:44:52] [0070] DamageInfo (1472 bytes)
+[23:44:52] [INTERACTION] Mouse click/attack
+[23:44:52] [006F] MouseInteraction (1472 bytes)
+[23:44:53] [0070] DamageInfo (1472 bytes)
+[23:44:58] Diagnostics report generated
+
+-------------------------------------------------------------------------------
+                           END OF DIAGNOSTICS REPORT                           
+-------------------------------------------------------------------------------
