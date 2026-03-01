@@ -1,8 +1,8 @@
 ﻿// FILE: Data/PacketLog.cs
 using System.Collections.Concurrent;
-using HyForce.Networking;  // ADD THIS
-using HyForce.Protocol;    // ADD THIS
-using HyForce.Utils;       // ADD THIS
+using HyForce.Networking;
+using HyForce.Protocol;
+using HyForce.Utils;
 
 namespace HyForce.Data;
 
@@ -97,7 +97,7 @@ public class PacketLog
             Interlocked.Increment(ref _countUdp);
         }
 
-        // FIXED: Registry parsing with proper checks
+        // Registry parsing with proper checks
         if (pkt.IsTcp && pkt.Direction == PacketDirection.ServerToClient)
         {
             RegistrySyncParser.TryParse(opcode, raw);
@@ -143,7 +143,7 @@ public class PacketLog
         return null;
     }
 
-    // ADD THESE METHODS - Fixed to be static and use proper references
+    // Force registry parse - uses reflection to access private setters
     private static void ForceRegistryParse(ushort opcode, byte[] raw)
     {
         try
@@ -167,12 +167,23 @@ public class PacketLog
             if (itemCount > 0)
             {
                 RegistrySyncParser.OpcodeEntryCount[opcode] = itemCount;
-                // Use reflection or add a method to RegistrySyncParser to update TotalParsed
-                // For now, just mark as received
-                typeof(RegistrySyncParser).GetField("TotalParsed", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)?.SetValue(null, itemCount);
 
-                RegistrySyncParser.RegistrySyncReceived = true;
-                RegistrySyncParser.FoundAtOpcode = opcode;
+                // Use reflection to set private properties
+                var type = typeof(RegistrySyncParser);
+
+                var registryReceivedField = type.GetField("<RegistrySyncReceived>k__BackingField",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                registryReceivedField?.SetValue(null, true);
+
+                var foundAtOpcodeField = type.GetField("<FoundAtOpcode>k__BackingField",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                foundAtOpcodeField?.SetValue(null, opcode);
+
+                var totalParsedField = type.GetField("<TotalParsed>k__BackingField",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                var currentTotal = (int?)totalParsedField?.GetValue(null) ?? 0;
+                totalParsedField?.SetValue(null, currentTotal + itemCount);
+
                 RegistrySyncParser.ParseLog[opcode] = $"Force-parsed {itemCount} entries";
             }
         }

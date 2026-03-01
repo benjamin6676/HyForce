@@ -27,6 +27,15 @@ public class ImGuiController : IDisposable
     // Static clipboard buffer for callbacks
     private static string _clipboardBuffer = "";
 
+    // Use standard delegate types that match ImGui's expected signatures
+    // SetClipboardTextFn: void(void* user_data, const char* text)
+    // GetClipboardTextFn: const char*(void* user_data)
+    private delegate void SetClipboardTextDelegate(IntPtr userData, IntPtr text);
+    private delegate IntPtr GetClipboardTextDelegate(IntPtr userData);
+
+    private SetClipboardTextDelegate _setClipboardDelegate;
+    private GetClipboardTextDelegate _getClipboardDelegate;
+
     public ImGuiController(GraphicsDevice gd, OutputDescription outputDescription, int width, int height)
     {
         _gd = gd;
@@ -42,46 +51,56 @@ public class ImGuiController : IDisposable
         io.BackendFlags |= ImGuiBackendFlags.HasMouseCursors;
         io.BackendFlags |= ImGuiBackendFlags.HasSetMousePos;
 
-        // Setup clipboard via PlatformIO (ImGui 1.91+ method)
+        // Setup clipboard via PlatformIO
         var platformIO = ImGui.GetPlatformIO();
-        platformIO.Platform_SetClipboardTextFn = (ctx, text) =>
-        {
-            if (text != IntPtr.Zero)
-            {
-                var str = Marshal.PtrToStringUTF8(text);
-                if (str != null)
-                {
-                    _clipboardBuffer = str;
-                    try { TextCopy.ClipboardService.SetText(str); } catch { }
-                }
-            }
-        };
 
-        platformIO.Platform_GetClipboardTextFn = (ctx) =>
-        {
-            try
-            {
-                var text = TextCopy.ClipboardService.GetText();
-                if (!string.IsNullOrEmpty(text))
-                    _clipboardBuffer = text;
-            }
-            catch { }
+        // Create delegate instances and store them in fields to prevent GC
+        _setClipboardDelegate = new SetClipboardTextDelegate(SetClipboardTextCallback);
+        _getClipboardDelegate = new GetClipboardTextDelegate(GetClipboardTextCallback);
 
-            if (string.IsNullOrEmpty(_clipboardBuffer))
-                return IntPtr.Zero;
-
-            // Allocate unmanaged memory - ImGui will NOT free this, so we leak a bit
-            // For production, use a fixed buffer or proper memory management
-            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
-            var ptr = Marshal.AllocHGlobal(bytes.Length);
-            Marshal.Copy(bytes, 0, ptr, bytes.Length);
-            return ptr;
-        };
+        // Assign to function pointers in PlatformIO
+        // In ImGui.NET 1.91+, these are IntPtr fields that point to native function pointers
+        platformIO.Platform_SetClipboardTextFn = Marshal.GetFunctionPointerForDelegate(_setClipboardDelegate);
+        platformIO.Platform_GetClipboardTextFn = Marshal.GetFunctionPointerForDelegate(_getClipboardDelegate);
 
         CreateDeviceResources(gd, outputDescription);
         SetPerFrameImGuiData(1f / 60f);
         ImGui.NewFrame();
         _frameBegun = true;
+    }
+
+    // Clipboard callback methods
+    private static void SetClipboardTextCallback(IntPtr userData, IntPtr text)
+    {
+        if (text != IntPtr.Zero)
+        {
+            var str = Marshal.PtrToStringUTF8(text);
+            if (str != null)
+            {
+                _clipboardBuffer = str;
+                try { TextCopy.ClipboardService.SetText(str); } catch { }
+            }
+        }
+    }
+
+    private static IntPtr GetClipboardTextCallback(IntPtr userData)
+    {
+        try
+        {
+            var text = TextCopy.ClipboardService.GetText();
+            if (!string.IsNullOrEmpty(text))
+                _clipboardBuffer = text;
+        }
+        catch { }
+
+        if (string.IsNullOrEmpty(_clipboardBuffer))
+            return IntPtr.Zero;
+
+        // Allocate unmanaged memory - this will leak but ImGui expects it to persist
+        var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
+        var ptr = Marshal.AllocHGlobal(bytes.Length);
+        Marshal.Copy(bytes, 0, ptr, bytes.Length);
+        return ptr;
     }
 
     public void WindowResized(int width, int height)
