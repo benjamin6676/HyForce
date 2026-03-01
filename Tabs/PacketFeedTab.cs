@@ -1,7 +1,10 @@
-﻿// FILE: Tabs/PacketFeedTab.cs
+﻿// FILE: Tabs/PacketFeedTab.cs (ENHANCED)
 using HyForce.Core;
 using HyForce.Data;
+using HyForce.Networking;
+using HyForce.Protocol;
 using HyForce.UI;
+using HyForce.Utils;
 using ImGuiNET;
 using System.Numerics;
 
@@ -10,17 +13,15 @@ namespace HyForce.Tabs;
 public class PacketFeedTab : ITab
 {
     public string Name => "Packet Feed";
-
     private readonly AppState _state;
+    private readonly List<PacketLogEntry> _displayPackets = new();
+    private PacketLogEntry? _selectedPacket;
+    private string _filterOpcode = "";
+    private string _filterCategory = "";
+    private bool _showOnlyCritical;
+    private bool _showOnlyUnknown;
     private bool _autoScroll = true;
-    private bool _filterTcp = true;
-    private bool _filterUdp = true;
-    private bool _pauseCapture = false;
-    private ushort? _filterOpcode = null;
-    private int _selectedEntry = -1;
-    private PacketLogEntry? _selectedPacket = null;
-    private string _searchText = "";
-    private List<PacketLogEntry> _displayedPackets = new();
+    private int _lastPacketCount;
 
     public PacketFeedTab(AppState state)
     {
@@ -29,473 +30,318 @@ public class PacketFeedTab : ITab
 
     public void Render()
     {
-        var avail = ImGui.GetContentRegionAvail();
+        var windowSize = ImGui.GetContentRegionAvail();
 
-        ImGui.Spacing();
-        ImGui.Text("  PACKET FEED  —  Real-time Traffic Monitor");
+        // Top toolbar
+        RenderToolbar();
+
         ImGui.Separator();
-        ImGui.Spacing();
 
-        // Main layout: Left = packet list, Right = details panel
-        float detailsWidth = 380;
-        float listWidth = avail.X - detailsWidth - 16;
+        // Main content: Packet list on left, details on right
+        var listWidth = windowSize.X * 0.6f;
+        var detailsWidth = windowSize.X - listWidth - 20;
 
-        // Two columns
-        ImGui.BeginChild("##packet_list_container", new Vector2(listWidth, avail.Y - 20), ImGuiChildFlags.None);
-        RenderPacketListSection(listWidth);
-        ImGui.EndChild();
-
-        ImGui.SameLine();
-
-        ImGui.BeginChild("##packet_details_panel", new Vector2(detailsWidth, avail.Y - 20), ImGuiChildFlags.Borders);
-        RenderDetailsPanel(detailsWidth);
-        ImGui.EndChild();
-    }
-
-    private void RenderPacketListSection(float width)
-    {
-        // Toolbar
-        RenderToolbar(width);
-        ImGui.Spacing();
-
-        // Packet list
-        float listHeight = ImGui.GetContentRegionAvail().Y - 10;
-        ImGui.BeginChild("##packet_list", new Vector2(0, listHeight), ImGuiChildFlags.Borders);
+        ImGui.BeginChild("PacketList", new Vector2(listWidth, 0), ImGuiChildFlags.Borders);
         RenderPacketList();
         ImGui.EndChild();
+
+        ImGui.SameLine();
+
+        ImGui.BeginChild("PacketDetails", new Vector2(detailsWidth, 0), ImGuiChildFlags.Borders);
+        RenderPacketDetails();
+        ImGui.EndChild();
     }
 
-    private void RenderToolbar(float width)
+    private void RenderToolbar()
     {
-        // Row 1: Protocol filters and controls
-        ImGui.Checkbox("TCP", ref _filterTcp);
+        ImGui.PushItemWidth(100);
+        ImGui.InputText("Filter Opcode", ref _filterOpcode, 10);
         ImGui.SameLine();
-        ImGui.Checkbox("UDP", ref _filterUdp);
+
+        ImGui.InputText("Filter Category", ref _filterCategory, 20);
         ImGui.SameLine();
+
+        ImGui.Checkbox("Critical Only", ref _showOnlyCritical);
+        ImGui.SameLine();
+
+        ImGui.Checkbox("Unknown Only", ref _showOnlyUnknown);
+        ImGui.SameLine();
+
         ImGui.Checkbox("Auto-scroll", ref _autoScroll);
-        ImGui.SameLine();
-        ImGui.Checkbox("Pause", ref _pauseCapture);
 
-        ImGui.SameLine(width - 320);
-
-        if (_filterOpcode.HasValue)
-        {
-            ImGui.TextColored(Theme.ColWarn, $"Filter: 0x{_filterOpcode.Value:X2}");
-            ImGui.SameLine();
-            if (ImGui.Button("Clear Filter", new Vector2(80, 0)))
-            {
-                _filterOpcode = null;
-            }
-            ImGui.SameLine();
-        }
-
-        if (ImGui.Button("Clear All", new Vector2(80, 0)))
+        if (ImGui.Button("Clear"))
         {
             _state.PacketLog.Clear();
-            _selectedEntry = -1;
-            _selectedPacket = null;
+            _displayPackets.Clear();
         }
 
-        // Row 2: Search
-        ImGui.SetNextItemWidth(300);
-        ImGui.InputText("Search", ref _searchText, 256);
-
         ImGui.SameLine();
-        ImGui.Text($"Total: {_state.TotalPackets:N0} | Showing: {_displayedPackets.Count}");
 
-        ImGui.SameLine(width - 150);
-        if (ImGui.Button("Export Visible", new Vector2(120, 0)))
+        if (ImGui.Button("Analyze Patterns"))
         {
-            ExportVisiblePackets();
+            ShowPatternAnalysis();
         }
     }
 
     private void RenderPacketList()
     {
-        if (!_pauseCapture)
-        {
-            _displayedPackets = _state.PacketLog.GetLast(1000)
-                .Where(p => (_filterTcp && p.IsTcp) || (_filterUdp && !p.IsTcp))
-                .Where(p => _filterOpcode == null || p.OpcodeDecimal == _filterOpcode)
-                .Where(p => string.IsNullOrEmpty(_searchText) ||
-                    p.OpcodeName.Contains(_searchText, StringComparison.OrdinalIgnoreCase) ||
-                    p.RawHexPreview.Contains(_searchText, StringComparison.OrdinalIgnoreCase))
-                .ToList();
-        }
+        var packets = _state.PacketLog.GetLast(500);
 
-        if (ImGui.BeginTable("##packets", 6,
-            ImGuiTableFlags.Resizable |
-            ImGuiTableFlags.RowBg |
-            ImGuiTableFlags.ScrollY |
-            ImGuiTableFlags.BordersInnerH |
-            ImGuiTableFlags.Reorderable |
-            ImGuiTableFlags.Hideable))
+        // Apply filters
+        var filtered = packets.Where(p =>
         {
-            ImGui.TableSetupColumn("Time", ImGuiTableColumnFlags.WidthFixed, 70);
+            if (!string.IsNullOrEmpty(_filterOpcode) &&
+                !p.OpcodeDecimal.ToString("X4").Contains(_filterOpcode, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (_showOnlyCritical)
+            {
+                var info = OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction);
+                if (info?.IsCritical != true) return false;
+            }
+
+            if (_showOnlyUnknown && OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction))
+                return false;
+
+            return true;
+        }).ToList();
+
+        // Table header
+        if (ImGui.BeginTable("Packets", 6, ImGuiTableFlags.Resizable | ImGuiTableFlags.Reorderable | ImGuiTableFlags.RowBg))
+        {
+            ImGui.TableSetupColumn("Time", ImGuiTableColumnFlags.WidthFixed, 80);
             ImGui.TableSetupColumn("Dir", ImGuiTableColumnFlags.WidthFixed, 40);
-            ImGui.TableSetupColumn("Proto", ImGuiTableColumnFlags.WidthFixed, 45);
-            ImGui.TableSetupColumn("Opcode", ImGuiTableColumnFlags.WidthFixed, 80);
-            ImGui.TableSetupColumn("Size", ImGuiTableColumnFlags.WidthFixed, 55);
-            ImGui.TableSetupColumn("Name/Info", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("Opcode", ImGuiTableColumnFlags.WidthFixed, 60);
+            ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("Size", ImGuiTableColumnFlags.WidthFixed, 60);
+            ImGui.TableSetupColumn("Info", ImGuiTableColumnFlags.WidthFixed, 80);
             ImGui.TableHeadersRow();
 
-            for (int i = 0; i < _displayedPackets.Count; i++)
+            foreach (var pkt in filtered)
             {
-                var pkt = _displayedPackets[i];
                 ImGui.TableNextRow();
 
-                bool isSelected = i == _selectedEntry;
-                if (isSelected)
-                {
-                    ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0,
-                        ImGui.ColorConvertFloat4ToU32(new Vector4(0.2f, 0.5f, 0.8f, 0.4f)));
-                }
+                // Highlight selected
+                if (_selectedPacket == pkt)
+                    ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.GetColorU32(new Vector4(0.2f, 0.4f, 0.6f, 0.5f)));
 
                 // Time
                 ImGui.TableSetColumnIndex(0);
-                ImGui.Text(pkt.Timestamp.ToString("HH:mm:ss.ff"));
+                ImGui.Text(pkt.Timestamp.ToString("HH:mm:ss.fff"));
 
                 // Direction with color
                 ImGui.TableSetColumnIndex(1);
-                var dirColor = pkt.Direction == Networking.PacketDirection.ServerToClient
-                    ? Theme.ColSuccess
-                    : new Vector4(0.6f, 0.6f, 0.9f, 1f);
+                var dirColor = pkt.Direction == PacketDirection.ClientToServer
+                    ? new Vector4(0.3f, 0.8f, 0.3f, 1) // Green for C2S
+                    : new Vector4(0.8f, 0.5f, 0.2f, 1); // Orange for S2C
                 ImGui.TextColored(dirColor, pkt.DirStr);
 
-                // Protocol
+                // Opcode
                 ImGui.TableSetColumnIndex(2);
-                var protoColor = pkt.IsTcp
-                    ? new Vector4(0.8f, 0.6f, 0.4f, 1f)
-                    : new Vector4(0.4f, 0.6f, 0.8f, 1f);
-                ImGui.TextColored(protoColor, pkt.ProtoStr);
+                var isKnown = OpcodeRegistry.IsKnownOpcode(pkt.OpcodeDecimal, pkt.Direction);
+                var opcodeColor = isKnown ? new Vector4(1, 1, 1, 1) : new Vector4(1, 0.3f, 0.3f, 1);
+                ImGui.TextColored(opcodeColor, $"0x{pkt.OpcodeDecimal:X4}");
 
-                // Opcode (clickable)
+                // Name
                 ImGui.TableSetColumnIndex(3);
-                ImGui.PushID(i);
-                string opcodeStr = $"0x{pkt.OpcodeDecimal:X4}";
-                if (ImGui.Selectable(opcodeStr, isSelected, ImGuiSelectableFlags.SpanAllColumns))
-                {
-                    _selectedEntry = i;
-                    _selectedPacket = pkt;
-                }
-
-                // Context menu
-                if (ImGui.IsItemHovered() && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
-                {
-                    ImGui.OpenPopup($"context_{i}");
-                }
-
-                if (ImGui.BeginPopup($"context_{i}"))
-                {
-                    if (ImGui.MenuItem("🔍 View Details"))
-                    {
-                        _selectedPacket = pkt;
-                    }
-                    if (ImGui.MenuItem("📋 Copy Hex"))
-                    {
-                        CopyToClipboard(pkt.RawHexPreview);
-                    }
-                    if (ImGui.MenuItem("🔎 Filter This Opcode"))
-                    {
-                        _filterOpcode = pkt.OpcodeDecimal;
-                    }
-                    if (ImGui.MenuItem("🚫 Block This Opcode"))
-                    {
-                        _state.AddInGameLog($"[SECURITY] Blocked opcode 0x{pkt.OpcodeDecimal:X4} requested");
-                    }
-                    ImGui.EndPopup();
-                }
-                ImGui.PopID();
+                var info = OpcodeRegistry.GetInfo(pkt.OpcodeDecimal, pkt.Direction);
+                var name = info?.Name ?? pkt.OpcodeName;
+                if (info?.IsCritical == true)
+                    ImGui.TextColored(new Vector4(1, 0.8f, 0.2f, 1), $"★ {name}");
+                else
+                    ImGui.Text(name);
 
                 // Size
                 ImGui.TableSetColumnIndex(4);
-                string sizeStr = pkt.ByteLength < 1024
-                    ? $"{pkt.ByteLength}B"
-                    : $"{pkt.ByteLength / 1024.0:F1}KB";
-                ImGui.Text(sizeStr);
+                ImGui.Text($"{pkt.ByteLength}B");
 
-                // Name/Info
+                // Info icons
                 ImGui.TableSetColumnIndex(5);
-                ImGui.Text(pkt.OpcodeName);
+                if (pkt.IsCompressed) ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), "[C]");
+                if (pkt.EncryptionHint == "encrypted") ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "[E]");
 
-                // Encryption/Compression indicators inline
-                ImGui.SameLine();
-                if (pkt.IsCompressed)
-                {
-                    ImGui.TextColored(Theme.ColWarn, $"  📦 {pkt.CompressionMethod}");
-                }
-                else if (pkt.EncryptionHint == "encrypted")
-                {
-                    ImGui.TextColored(Theme.ColDanger, "  🔒 encrypted");
-                }
+                // Selection
+                if (ImGui.IsItemClicked())
+                    _selectedPacket = pkt;
             }
 
             ImGui.EndTable();
+        }
 
-            if (_autoScroll && !_pauseCapture && ImGui.GetScrollY() < ImGui.GetScrollMaxY())
-                ImGui.SetScrollHereY(1.0f);
+        if (_autoScroll && filtered.Count > 0)
+        {
+            ImGui.SetScrollHereY(1.0f);
         }
     }
 
-    private void RenderDetailsPanel(float width)
+    private void RenderPacketDetails()
     {
         if (_selectedPacket == null)
         {
             ImGui.TextColored(Theme.ColTextMuted, "Select a packet to view details");
-            ImGui.Spacing();
-            ImGui.TextWrapped("Click on any packet in the list to see detailed information here.");
             return;
         }
 
         var pkt = _selectedPacket;
-        float halfWidth = (width - 20) / 2;
+        var analysis = PacketInspector.Analyze(new CapturedPacket
+        {
+            RawBytes = new byte[0], // Convert from entry
+            Direction = pkt.Direction,
+            IsTcp = pkt.IsTcp,
+            Timestamp = pkt.Timestamp
+        });
 
-        // Header with big opcode
-        ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColAccent);
-        ImGui.SetWindowFontScale(1.5f);
-        ImGui.Text($"0x{pkt.OpcodeDecimal:X4}");
-        ImGui.SetWindowFontScale(1.0f);
-        ImGui.PopStyleColor();
+        // Header
+        ImGui.PushFont(ImGui.GetIO().FontDefault);
+        ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), analysis.PacketName);
+        ImGui.PopFont();
 
         ImGui.SameLine();
-        ImGui.TextColored(Theme.ColTextMuted, pkt.OpcodeName);
+        ImGui.TextColored(Theme.ColTextMuted, $"0x{pkt.OpcodeDecimal:X4}");
 
-        ImGui.Separator();
-
-        // Quick stats in 2 columns
-        ImGui.Columns(2, "##quick_stats", false);
-
-        ImGui.TextColored(Theme.ColTextMuted, "Time");
-        ImGui.Text(pkt.Timestamp.ToString("HH:mm:ss.fff"));
-        ImGui.NextColumn();
-
-        ImGui.TextColored(Theme.ColTextMuted, "Direction");
-        var dirColor = pkt.Direction == Networking.PacketDirection.ServerToClient ? Theme.ColSuccess : Theme.ColBlue;
-        ImGui.TextColored(dirColor, pkt.DirStr);
-        ImGui.NextColumn();
-
-        ImGui.TextColored(Theme.ColTextMuted, "Protocol");
-        ImGui.Text(pkt.ProtoStr);
-        ImGui.NextColumn();
-
-        ImGui.TextColored(Theme.ColTextMuted, "Size");
-        ImGui.Text($"{pkt.ByteLength} bytes ({pkt.ByteLength * 8} bits)");
-        ImGui.NextColumn();
-
-        ImGui.Columns(1);
-        ImGui.Separator();
-
-        // Processing info
-        ImGui.TextColored(Theme.ColAccent, "Processing Info");
-        ImGui.Text($"Compression: {pkt.CompressionMethod}");
-        ImGui.Text($"Encryption: {(pkt.EncryptionHint == "encrypted" ? "Yes 🔒" : "No")}");
-        ImGui.Text($"Injected: {(pkt.Injected ? "Yes" : "No")}");
-
-        if (pkt.QuicInfo != null)
+        if (analysis.IsCritical)
         {
-            ImGui.Text($"QUIC: {(pkt.QuicInfo.IsLongHeader ? "Long Header" : "Short Header")}");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1, 0.8f, 0.2f, 1), " ★ CRITICAL");
         }
 
         ImGui.Separator();
 
-        // Hex preview
-        ImGui.TextColored(Theme.ColAccent, "Hex Preview (first 48 bytes)");
-        ImGui.BeginChild("##hex_preview", new Vector2(0, 120), ImGuiChildFlags.Borders);
-        RenderHexDump(pkt.RawHexPreview, 48);
-        ImGui.EndChild();
+        // Basic Info
+        ImGui.Text("Direction: "); ImGui.SameLine();
+        var dirColor = pkt.Direction == PacketDirection.ClientToServer
+            ? new Vector4(0.3f, 0.8f, 0.3f, 1)
+            : new Vector4(0.8f, 0.5f, 0.2f, 1);
+        ImGui.TextColored(dirColor, pkt.Direction.ToString());
 
-        // Action buttons
-        ImGui.Spacing();
-        if (ImGui.Button("📋 Copy Hex", new Vector2((width - 20) / 2, 28)))
-        {
-            CopyToClipboard(pkt.RawHexPreview);
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("💾 Save Packet", new Vector2((width - 20) / 2, 28)))
-        {
-            SavePacketToFile(pkt);
-        }
+        ImGui.Text($"Category: {analysis.Category}");
+        ImGui.Text($"Description: {analysis.Description}");
+        ImGui.Text($"Size: {pkt.ByteLength} bytes ({pkt.ByteLength * 8} bits)");
+        ImGui.Text($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
+        ImGui.Text($"Timestamp: {pkt.Timestamp:yyyy-MM-dd HH:mm:ss.fff}");
 
-        // Full details section
-        ImGui.Spacing();
+        // Compression/Encryption
         ImGui.Separator();
-        ImGui.TextColored(Theme.ColAccent, "Full Analysis");
+        ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Processing Info");
+
+        if (pkt.IsCompressed)
+        {
+            ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), $"Compression: {pkt.CompressionMethod}");
+            ImGui.Text($"  Compressed: {pkt.CompressedSize}B → Decompressed: {pkt.DecompressedSize}B");
+        }
+        else
+        {
+            ImGui.Text("Compression: none");
+        }
+
+        var encColor = pkt.EncryptionHint == "encrypted"
+            ? new Vector4(1, 0.3f, 0.3f, 1)
+            : new Vector4(0.3f, 1, 0.3f, 1);
+        ImGui.TextColored(encColor, $"Encryption: {pkt.EncryptionHint}");
+
+        if (!string.IsNullOrEmpty(analysis.CompressionHint))
+            ImGui.TextColored(new Vector4(1, 0.8f, 0.4f, 1), $"Note: {analysis.CompressionHint}");
 
         // Entropy analysis
-        var entropy = CalculateEntropy(pkt.RawHexPreview);
+        ImGui.Separator();
+        ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Entropy Analysis");
+        var entropy = ByteUtils.CalculateEntropy(Convert.FromHexString(pkt.RawHexPreview.Replace("-", "")));
         ImGui.Text($"Entropy: {entropy:F2}");
-        ImGui.ProgressBar((float)entropy / 8.0f, new Vector2(width - 20, 16),
-            entropy > 7.5 ? "High (Encrypted)" : entropy > 5 ? "Medium" : "Low (Structured)");
 
-        // String extraction
-        var strings = ExtractStrings(pkt.RawHexPreview);
-        if (strings.Any())
+        var entropyColor = entropy > 7.8 ? new Vector4(1, 0.3f, 0.3f, 1) :
+                          entropy > 7.0 ? new Vector4(1, 0.8f, 0.2f, 1) :
+                          new Vector4(0.3f, 1, 0.3f, 1);
+        ImGui.ProgressBar(entropy / 8.0f, new Vector2(-1, 20), entropy > 7.8 ? "High (Encrypted?)" : entropy > 5 ? "Medium" : "Low (Structured)");
+        ImGui.TextColored(entropyColor, entropy > 7.8 ? "Likely encrypted/Random" : "Likely structured data");
+
+        // Parsed Fields
+        if (analysis.Fields.Count > 0)
         {
-            ImGui.TextColored(Theme.ColSuccess, "Found Strings:");
-            foreach (var s in strings.Take(10))
+            ImGui.Separator();
+            ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Parsed Fields");
+            foreach (var field in analysis.Fields)
             {
-                ImGui.Text($"  \"{s}\"");
+                ImGui.TextColored(new Vector4(0.6f, 0.8f, 1, 1), $"{field.Key}:");
+                ImGui.SameLine();
+                ImGui.Text(field.Value);
             }
         }
 
-        // Decompressed data if available
-        if (pkt.IsCompressed && !string.IsNullOrEmpty(pkt.DecompHexPreview))
+        // Hex Preview
+        ImGui.Separator();
+        ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Hex Preview (First 48 bytes)");
+
+        var hexLines = pkt.RawHexPreview.Split('-');
+        for (int i = 0; i < hexLines.Length; i += 8)
         {
-            ImGui.Spacing();
-            ImGui.TextColored(Theme.ColAccent, $"Decompressed ({pkt.DecompressedSize} bytes)");
-            ImGui.BeginChild("##decomp_preview", new Vector2(0, 100), ImGuiChildFlags.Borders);
-            RenderHexDump(pkt.DecompHexPreview!, 32);
-            ImGui.EndChild();
-        }
-    }
-
-    private void RenderHexDump(string hex, int maxBytes)
-    {
-        if (string.IsNullOrEmpty(hex)) return;
-
-        var parts = hex.Split('-', StringSplitOptions.RemoveEmptyEntries);
-        int count = Math.Min(parts.Length, maxBytes);
-
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(4, 2));
-
-        for (int i = 0; i < count; i += 8)
-        {
-            // Offset
-            ImGui.TextColored(Theme.ColTextMuted, $"{i:X3}: ");
+            var line = string.Join(" ", hexLines.Skip(i).Take(8));
+            var addr = (i * 3).ToString("X3");
+            ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1), $"{addr}:");
             ImGui.SameLine();
-
-            // Hex bytes
-            for (int j = 0; j < 8 && (i + j) < count; j++)
-            {
-                if (j == 4) { ImGui.Text(" "); ImGui.SameLine(); }
-
-                var b = parts[i + j];
-                // Color non-printable differently
-                if (byte.TryParse(b, System.Globalization.NumberStyles.HexNumber, null, out var val) && val >= 0x20 && val <= 0x7E)
-                    ImGui.Text(b);
-                else
-                    ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1), b);
-
-                if (j < 7 && (i + j + 1) < count)
-                {
-                    ImGui.SameLine();
-                    ImGui.Text(" ");
-                    ImGui.SameLine();
-                }
-            }
+            ImGui.Text(line);
         }
 
-        ImGui.PopStyleVar();
-    }
-
-    private double CalculateEntropy(string hex)
-    {
-        if (string.IsNullOrEmpty(hex)) return 0;
-        var bytes = hex.Split('-', StringSplitOptions.RemoveEmptyEntries);
-        if (bytes.Length == 0) return 0;
-
-        var freq = new Dictionary<string, int>();
-        foreach (var b in bytes)
+        // Actions
+        ImGui.Separator();
+        if (ImGui.Button("Copy Hex", new Vector2(120, 30)))
         {
-            if (freq.ContainsKey(b)) freq[b]++;
-            else freq[b] = 1;
+            try { TextCopy.ClipboardService.SetText(pkt.RawHexPreview); } catch { }
         }
-
-        double entropy = 0;
-        int len = bytes.Length;
-        foreach (var count in freq.Values)
+        ImGui.SameLine();
+        if (ImGui.Button("Save Packet", new Vector2(120, 30)))
         {
-            double p = (double)count / len;
-            entropy -= p * Math.Log2(p);
+            SavePacket(pkt);
         }
-        return entropy;
     }
 
-    private List<string> ExtractStrings(string hex)
+    private void ShowPatternAnalysis()
     {
-        var result = new List<string>();
-        if (string.IsNullOrEmpty(hex)) return result;
+        var patterns = PacketInspector.DetectPatterns(_state.PacketLog.GetAll());
 
-        var bytes = hex.Split('-', StringSplitOptions.RemoveEmptyEntries);
-        var sb = new System.Text.StringBuilder();
-
-        foreach (var b in bytes)
+        ImGui.OpenPopup("Pattern Analysis");
+        if (ImGui.BeginPopupModal("Pattern Analysis", ref _showPatternAnalysis, ImGuiWindowFlags.AlwaysAutoResize))
         {
-            if (byte.TryParse(b, System.Globalization.NumberStyles.HexNumber, null, out var val) && val >= 0x20 && val <= 0x7E)
+            ImGui.Text("Detected Traffic Patterns");
+            ImGui.Separator();
+
+            foreach (var pattern in patterns.Take(20))
             {
-                sb.Append((char)val);
+                var color = pattern.IsPeriodic ? new Vector4(0.3f, 1, 0.3f, 1) :
+                           pattern.IsBurst ? new Vector4(1, 0.5f, 0.2f, 1) :
+                           new Vector4(1, 1, 1, 1);
+
+                ImGui.TextColored(color, $"{pattern.PacketName}");
+                ImGui.Text($"  Count: {pattern.Count} | Avg Size: {pattern.AvgSize}B");
+
+                if (pattern.IsPeriodic)
+                    ImGui.Text($"  Periodic: {pattern.PeriodMs:F1}ms interval");
+                if (pattern.IsBurst)
+                    ImGui.Text($"  Burst: {pattern.RatePerSecond:F1} packets/sec");
+
+                ImGui.Separator();
             }
-            else
-            {
-                if (sb.Length >= 4) result.Add(sb.ToString());
-                sb.Clear();
-            }
+
+            if (ImGui.Button("Close", new Vector2(120, 30)))
+                _showPatternAnalysis = false;
+
+            ImGui.EndPopup();
         }
-        if (sb.Length >= 4) result.Add(sb.ToString());
-
-        return result;
     }
 
-    private void CopyToClipboard(string text)
-    {
-        try { TextCopy.ClipboardService.SetText(text); } catch { }
-    }
+    private bool _showPatternAnalysis = false;
 
-    private void SavePacketToFile(PacketLogEntry pkt)
+    private void SavePacket(PacketLogEntry pkt)
     {
         try
         {
-            Directory.CreateDirectory(_state.ExportDirectory);
-            string filename = Path.Combine(_state.ExportDirectory,
-                $"packet_{pkt.Timestamp:yyyyMMdd_HHmmss}_{pkt.OpcodeDecimal:X4}.txt");
-
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine("=== HYFORCE PACKET EXPORT ===");
-            sb.AppendLine($"Exported: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            sb.AppendLine();
-            sb.AppendLine($"Timestamp: {pkt.Timestamp:yyyy-MM-dd HH:mm:ss.fff}");
-            sb.AppendLine($"Direction: {pkt.DirStr}");
-            sb.AppendLine($"Protocol: {pkt.ProtoStr}");
-            sb.AppendLine($"Opcode: 0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeName})");
-            sb.AppendLine($"Size: {pkt.ByteLength} bytes");
-            sb.AppendLine($"Compression: {pkt.CompressionMethod}");
-            sb.AppendLine($"Encryption: {pkt.EncryptionHint}");
-            sb.AppendLine();
-            sb.AppendLine("=== RAW HEX ===");
-            sb.AppendLine(pkt.RawHexPreview);
-
-            File.WriteAllText(filename, sb.ToString());
+            var filename = Path.Combine(_state.ExportDirectory, $"packet_{pkt.Timestamp:yyyyMMdd_HHmmss}_{pkt.OpcodeDecimal:X4}.bin");
+            var bytes = Convert.FromHexString(pkt.RawHexPreview.Replace("-", ""));
+            File.WriteAllBytes(filename, bytes);
             _state.AddInGameLog($"[SUCCESS] Packet saved to {filename}");
         }
         catch (Exception ex)
         {
             _state.AddInGameLog($"[ERROR] Failed to save packet: {ex.Message}");
-        }
-    }
-
-    private void ExportVisiblePackets()
-    {
-        try
-        {
-            Directory.CreateDirectory(_state.ExportDirectory);
-            string filename = Path.Combine(_state.ExportDirectory,
-                $"packet_export_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
-
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine("Timestamp,Direction,Protocol,Opcode,Name,Size,Compression,Encryption");
-
-            foreach (var pkt in _displayedPackets)
-            {
-                sb.AppendLine($"{pkt.Timestamp:yyyy-MM-dd HH:mm:ss},{pkt.DirStr},{pkt.ProtoStr}," +
-                    $"0x{pkt.OpcodeDecimal:X4},{pkt.OpcodeName},{pkt.ByteLength},{pkt.CompressionMethod},{pkt.EncryptionHint}");
-            }
-
-            File.WriteAllText(filename, sb.ToString());
-            _state.AddInGameLog($"[SUCCESS] Exported {_displayedPackets.Count} packets to {filename}");
-        }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[ERROR] Export failed: {ex.Message}");
         }
     }
 }

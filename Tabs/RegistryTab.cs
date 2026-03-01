@@ -1,5 +1,6 @@
 ﻿using HyForce.Core;
 using HyForce.Data;
+using HyForce.Networking;
 using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;

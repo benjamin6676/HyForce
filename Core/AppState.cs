@@ -1,7 +1,6 @@
 ﻿// FILE: Core/AppState.cs
 using HyForce.Data;
 using HyForce.Networking;
-using HyForce.Protocol;
 using System.Collections.Concurrent;
 
 namespace HyForce.Core;
@@ -139,7 +138,7 @@ public class AppState : IDisposable
 
         if (packet.IsTcp && packet.Direction == PacketDirection.ServerToClient)
         {
-            if (packet.Opcode == Protocol.OpcodeRegistry.RegistryOpcode ||
+            if (packet.Opcode == OpcodeRegistry.RegistryOpcode ||
                 (packet.Opcode >= 0x28 && packet.Opcode <= 0x3F))
             {
                 LogSecurityEvent("Registry", $"RegistrySync detected: 0x{packet.Opcode:X2}", new Dictionary<string, object>
