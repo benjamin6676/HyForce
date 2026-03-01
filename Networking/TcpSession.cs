@@ -6,59 +6,71 @@ namespace HyForce.Networking;
 
 public class TcpSession
 {
-    private readonly TcpClient _client;
-    private TcpClient? _server;
-    private NetworkStream? _clientStream;
-    private NetworkStream? _serverStream;
+    public TcpClient Client { get; }      // ADDED public getter
+    public TcpClient? Server { get; }     // ADDED public getter
+    private readonly NetworkStream? _clientStream;
+    private readonly NetworkStream? _serverStream;
     private readonly CancellationTokenSource _cts = new();
-    private readonly Action<byte[], PacketDirection> _onData;
-    private Task? _clientToServerTask;
-    private Task? _serverToClientTask;
+    private readonly string _targetHost;
+    private readonly int _targetPort;
+    private readonly Data.TestLog _log;
 
-    public IPEndPoint? RemoteEndPoint => _client.Client.RemoteEndPoint as IPEndPoint;
-    public bool IsConnected => _client.Connected && (_server?.Connected ?? false);
+    public IPEndPoint? RemoteEndPoint => Client.Client.RemoteEndPoint as IPEndPoint;
+    public bool IsConnected => Client.Connected && (Server?.Connected ?? false);
 
-    public TcpSession(TcpClient client, string targetHost, int targetPort, Action<byte[], PacketDirection> onData)
+    public TcpSession(TcpClient client, string targetHost, int targetPort, Data.TestLog log)
     {
-        _client = client;
-        _onData = onData;
+        Client = client;
+        _targetHost = targetHost;
+        _targetPort = targetPort;
+        _log = log;
 
         try
         {
-            _server = new TcpClient();
-            _server.Connect(targetHost, targetPort);
-            _clientStream = _client.GetStream();
-            _serverStream = _server.GetStream();
+            var server = new TcpClient();
+            server.Connect(targetHost, targetPort);
+            Server = server;
+            _clientStream = client.GetStream();
+            _serverStream = server.GetStream();
         }
         catch (Exception ex)
         {
-            _client.Close();
+            client.Close();
             throw;
         }
     }
 
-    public void Start()
+    // ADDED: New Run method with callback
+    public async Task Run(Func<byte[], PacketDirection, Task> onPacket, CancellationToken ct)
     {
-        _clientToServerTask = RelayAsync(_clientStream!, _serverStream!, PacketDirection.ClientToServer);
-        _serverToClientTask = RelayAsync(_serverStream!, _clientStream!, PacketDirection.ServerToClient);
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, ct);
+
+        var clientToServer = RelayAsync(_clientStream!, _serverStream!, PacketDirection.ClientToServer, onPacket, cts.Token);
+        var serverToClient = RelayAsync(_serverStream!, _clientStream!, PacketDirection.ServerToClient, onPacket, cts.Token);
+
+        await Task.WhenAny(clientToServer, serverToClient);
+
+        _cts.Cancel();
+        try { await Task.WhenAll(clientToServer, serverToClient); } catch { }
     }
 
-    private async Task RelayAsync(NetworkStream source, NetworkStream dest, PacketDirection direction)
+    private async Task RelayAsync(NetworkStream source, NetworkStream dest, PacketDirection direction, Func<byte[], PacketDirection, Task> onPacket, CancellationToken ct)
     {
         byte[] buffer = new byte[65536];
         try
         {
-            while (!_cts.Token.IsCancellationRequested)
+            while (!ct.IsCancellationRequested)
             {
-                int read = await source.ReadAsync(buffer, 0, buffer.Length, _cts.Token);
+                int read = await source.ReadAsync(buffer, 0, buffer.Length, ct);
                 if (read == 0) break;
 
                 byte[] data = new byte[read];
                 Buffer.BlockCopy(buffer, 0, data, 0, read);
 
-                _onData(data, direction);
+                // Call the packet callback
+                await onPacket(data, direction);
 
-                await dest.WriteAsync(data, 0, read, _cts.Token);
+                await dest.WriteAsync(data, 0, read, ct);
             }
         }
         catch (OperationCanceledException) { }
@@ -70,7 +82,7 @@ public class TcpSession
         _cts.Cancel();
         _clientStream?.Close();
         _serverStream?.Close();
-        _client?.Close();
-        _server?.Close();
+        Client?.Close();
+        Server?.Close();
     }
 }

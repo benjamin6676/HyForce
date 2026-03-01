@@ -1,158 +1,124 @@
-﻿// FILE: Tabs/PacketAnalyticsTab.cs
-using HyForce.Core;
+﻿using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
-using HyForce.Protocol;
 using ImGuiNET;
+using System.Linq;
 using System.Numerics;
 
 namespace HyForce.Tabs;
 
 public class PacketAnalyticsTab : ITab
 {
-    private readonly AppState _state;
-    private List<PacketPattern> _patterns = new();
-    private Dictionary<string, int> _patternMatches = new();
-
     public string Name => "Analytics";
+    private readonly AppState _state;
+    private Dictionary<PacketCategory, int> _categoryStats = new();
+    private List<PacketPattern> _patterns = new();
 
     public PacketAnalyticsTab(AppState state)
     {
         _state = state;
-        InitializePatterns();
-    }
-
-    private void InitializePatterns()
-    {
-        _patterns = new List<PacketPattern>
-        {
-            new PacketPattern
-            {
-                Name = "Registry Sync",
-                Description = "Registry synchronization packets",
-                Opcode = 0x0018,
-                IsTcp = true,
-                Direction = PacketDirection.ServerToClient
-            },
-            new PacketPattern
-            {
-                Name = "Player Movement",
-                Description = "Player position updates",
-                Opcode = 0x60B4,
-                IsTcp = false,
-                Direction = PacketDirection.ClientToServer
-            },
-            new PacketPattern
-            {
-                Name = "Large Packet",
-                Description = "Packets larger than 1KB",
-                MinSize = 1024,
-                IsTcp = false
-            }
-        };
     }
 
     public void Render()
     {
-        ImGui.BeginChild("Analytics", new Vector2(0, 0), ImGuiChildFlags.None);
+        UpdateStats();
 
-        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.4f, 1), "Packet Analytics");
+        ImGui.Text("Packet Analytics Dashboard");
         ImGui.Separator();
 
-        var packets = _state.PacketLog.GetAll();
-
-        ImGui.Text($"Total Packets Analyzed: {packets.Count}");
-        ImGui.Text($"Unique Opcodes: {_state.PacketLog.UniqueOpcodes}");
-        ImGui.Text($"TCP Packets: {packets.Count(p => p.IsTcp)}");
-        ImGui.Text($"UDP Packets: {packets.Count(p => !p.IsTcp)}");
-
+        RenderOverviewCards();
         ImGui.Separator();
 
-        if (ImGui.Button("Detect Patterns"))
-        {
-            DetectPatterns(packets);
-        }
+        ImGui.BeginChild("Categories", new Vector2(300, 0), ImGuiChildFlags.Borders);
+        RenderCategoryBreakdown();
+        ImGui.EndChild();
 
         ImGui.SameLine();
-        if (ImGui.Button("Clear Results"))
-        {
-            _patternMatches.Clear();
-        }
 
-        if (_patternMatches.Count > 0)
-        {
-            ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), "Pattern Matches:");
-
-            if (ImGui.BeginTable("PatternMatches", 2, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
-            {
-                ImGui.TableSetupColumn("Pattern", ImGuiTableColumnFlags.WidthStretch);
-                ImGui.TableSetupColumn("Count", ImGuiTableColumnFlags.WidthFixed, 100);
-                ImGui.TableHeadersRow();
-
-                foreach (var match in _patternMatches.OrderByDescending(m => m.Value))
-                {
-                    ImGui.TableNextRow();
-                    ImGui.TableNextColumn();
-                    ImGui.Text(match.Key);
-                    ImGui.TableNextColumn();
-                    ImGui.Text(match.Value.ToString());
-                }
-
-                ImGui.EndTable();
-            }
-        }
-
-        ImGui.Separator();
-        ImGui.TextColored(new Vector4(1, 0.8f, 0.4f, 1), "Top Opcodes:");
-
-        var topOpcodes = _state.PacketLog.GetOpcodeCounts().OrderByDescending(x => x.Value).Take(10);
-
-        if (ImGui.BeginTable("TopOpcodes", 3, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
-        {
-            ImGui.TableSetupColumn("Opcode", ImGuiTableColumnFlags.WidthFixed, 80);
-            ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch);
-            ImGui.TableSetupColumn("Count", ImGuiTableColumnFlags.WidthFixed, 80);
-            ImGui.TableHeadersRow();
-
-            foreach (var kv in topOpcodes)
-            {
-                ImGui.TableNextRow();
-                ImGui.TableNextColumn();
-                ImGui.Text($"0x{kv.Key:X4}");
-                ImGui.TableNextColumn();
-                var name = OpcodeRegistry.Label(kv.Key, PacketDirection.ServerToClient);
-                ImGui.Text(name);
-                ImGui.TableNextColumn();
-                ImGui.Text(kv.Value.ToString());
-            }
-
-            ImGui.EndTable();
-        }
-
+        ImGui.BeginChild("Patterns", new Vector2(0, 0), ImGuiChildFlags.Borders);
+        RenderPatternAnalysis();
         ImGui.EndChild();
     }
 
-    private void DetectPatterns(List<PacketLogEntry> packets)
+    private void RenderOverviewCards()
     {
-        _patternMatches.Clear();
+        var packets = _state.PacketLog.GetAll();
 
-        foreach (var pattern in _patterns)
+        ImGui.BeginChild("Card1", new Vector2(150, 80), ImGuiChildFlags.Borders);
+        ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), "TOTAL");
+        ImGui.Text($"{packets.Count:N0}");
+        ImGui.EndChild();
+
+        ImGui.SameLine();
+
+        var c2s = packets.Count(p => p.Direction == PacketDirection.ClientToServer);
+        ImGui.BeginChild("Card2", new Vector2(150, 80), ImGuiChildFlags.Borders);
+        ImGui.TextColored(new Vector4(0.3f, 0.8f, 0.3f, 1), "C2S");
+        ImGui.Text($"{c2s:N0}");
+        ImGui.EndChild();
+
+        ImGui.SameLine();
+
+        var s2c = packets.Count(p => p.Direction == PacketDirection.ServerToClient);
+        ImGui.BeginChild("Card3", new Vector2(150, 80), ImGuiChildFlags.Borders);
+        ImGui.TextColored(new Vector4(0.8f, 0.5f, 0.2f, 1), "S2C");
+        ImGui.Text($"{s2c:N0}");
+        ImGui.EndChild();
+
+        ImGui.SameLine();
+
+        var unknown = packets.Count(p => !Protocol.OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction));
+        ImGui.BeginChild("Card4", new Vector2(150, 80), ImGuiChildFlags.Borders);
+        ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "UNKNOWN");
+        ImGui.Text($"{unknown:N0}");
+        ImGui.EndChild();
+    }
+
+    private void RenderCategoryBreakdown()
+    {
+        ImGui.Text("Traffic by Category");
+        ImGui.Separator();
+
+        foreach (var cat in _categoryStats.OrderByDescending(x => x.Value))
         {
-            int count = 0;
-            foreach (var packet in packets)
-            {
-                byte[] rawData = new byte[0];
-
-                if (pattern.Matches(packet, rawData))
-                {
-                    count++;
-                }
-            }
-
-            if (count > 0)
-            {
-                _patternMatches[pattern.Name] = count;
-            }
+            var pct = (float)cat.Value / _categoryStats.Values.Sum();
+            ImGui.Text($"{cat.Key}: {cat.Value}");
+            ImGui.ProgressBar(pct, new Vector2(-1, 15));
         }
+    }
+
+    private void RenderPatternAnalysis()
+    {
+        ImGui.Text("Traffic Patterns");
+        ImGui.Separator();
+
+        foreach (var pattern in _patterns.Take(15))
+        {
+            var color = pattern.IsPeriodic ? new Vector4(0.2f, 1, 0.2f, 1) :
+                       pattern.IsBurst ? new Vector4(1, 0.6f, 0.2f, 1) :
+                       new Vector4(1, 1, 1, 1);
+
+            ImGui.TextColored(color, pattern.PacketName);
+            ImGui.Text($"  Opcode: 0x{pattern.Opcode:X4} | Count: {pattern.Count}");
+
+            if (pattern.IsPeriodic)
+                ImGui.Text($"  Periodic every {pattern.PeriodMs:F0}ms");
+            if (pattern.IsBurst)
+                ImGui.Text($"  Burst rate: {pattern.RatePerSecond:F0}/sec");
+
+            ImGui.Separator();
+        }
+    }
+
+    private void UpdateStats()
+    {
+        var packets = _state.PacketLog.GetAll();
+
+        _categoryStats = packets
+            .Select(p => Protocol.OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction)?.Category ?? PacketCategory.Unknown)
+            .GroupBy(c => c)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        _patterns = PacketPatternDetector.DetectPatterns(packets);
     }
 }

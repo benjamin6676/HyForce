@@ -1,3 +1,6 @@
 <Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="ExportCode.ps1" />
+  </Folder>
   <Project Path="HyForce.csproj" />
 </Solution>

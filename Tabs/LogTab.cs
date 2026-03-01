@@ -18,7 +18,7 @@ public class LogTab : ITab
     public LogTab(AppState state)
     {
         _state = state;
-        _state.OnPacketReceived += () => _logVersion++;
+        _state.OnPacketReceived += (packet) => _logVersion++;  // FIXED - accept the packet parameter
         _state.OnSecurityEvent += () => _logVersion++;
     }
 

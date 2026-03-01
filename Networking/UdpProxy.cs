@@ -16,7 +16,7 @@ public class UdpProxy : IDisposable
     public int ServerPort { get; private set; }
     public int ListenPort { get; private set; }
 
-    public event PacketHandler? OnPacket;
+    public event PacketReceivedHandler? OnPacket;  // CHANGED from PacketHandler
 
     private readonly Data.TestLog _log;
     private UdpClient? _listener;
@@ -50,7 +50,7 @@ public class UdpProxy : IDisposable
             ServerPort = serverPort;
             ListenPort = listenPort;
             IsRunning = true;
-            StatusMessage = $"Listening 0.0.0.0:{listenPort} → {serverIp}:{serverPort}";
+            StatusMessage = $"Listening 0.0.0.0:{listenPort} ? {serverIp}:{serverPort}";
 
             _log.Info($"[UDP] Started on 0.0.0.0:{listenPort}", "UDP");
             _log.Info($"[UDP] QUIC-aware with CID translation", "UDP");
@@ -201,7 +201,7 @@ public class UdpProxy : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    _log.Error($"[UDP] S→C error: {ex.Message}", "UDP");
+                    _log.Error($"[UDP] S?C error: {ex.Message}", "UDP");
                 }
             }
         }

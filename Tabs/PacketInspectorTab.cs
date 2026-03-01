@@ -1,7 +1,7 @@
-﻿// FILE: Tabs/PacketInspectorTab.cs
-using HyForce.Core;
+﻿using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
+using HyForce.Protocol;
 using HyForce.Utils;
 using ImGuiNET;
 using System.Numerics;
@@ -45,10 +45,10 @@ public class PacketInspectorTab : ITab
             Row("Timestamp", pkt.Timestamp.ToString("O"));
             Row("Direction", pkt.DirStr);
             Row("Protocol", pkt.ProtoStr);
-            Row("Opcode", $"0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeDecimal})");
+            Row("Opcode", $"0x{pkt.OpcodeDecimal:X4}");
             Row("Name", pkt.OpcodeName);
             Row("Size", $"{pkt.ByteLength} bytes");
-            Row("Compressed", pkt.IsCompressed ? $"{pkt.CompressionMethod} ({pkt.CompressedSize} → {pkt.DecompressedSize})" : "No");
+            Row("Compressed", pkt.IsCompressed ? "Yes" : "No");
             Row("Encrypted", pkt.EncryptionHint);
             Row("Injected", pkt.Injected ? "YES" : "No");
 
@@ -59,31 +59,15 @@ public class PacketInspectorTab : ITab
         {
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.4f, 0.6f, 1, 1), "QUIC Header Information");
-
-            if (ImGui.BeginTable("QuicInfo", 2, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
-            {
-                ImGui.TableSetupColumn("Property", ImGuiTableColumnFlags.WidthFixed, 150);
-                ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthStretch);
-                ImGui.TableHeadersRow();
-
-                Row("Header Type", pkt.QuicInfo.HeaderType);
-                Row("Version", pkt.QuicInfo.Version.ToString());
-                Row("Packet Number", pkt.QuicInfo.PacketNumber.ToString());
-
-                if (pkt.QuicInfo.DestinationConnectionId != null)
-                    Row("Destination CID", BitConverter.ToString(pkt.QuicInfo.DestinationConnectionId));
-
-                if (pkt.QuicInfo.SourceConnectionId != null)
-                    Row("Source CID", BitConverter.ToString(pkt.QuicInfo.SourceConnectionId));
-
-                ImGui.EndTable();
-            }
+            ImGui.Text($"Header Type: {pkt.QuicInfo.HeaderType}");
+            ImGui.Text($"Version: {pkt.QuicInfo.Version}");
+            ImGui.Text($"Packet Number: {pkt.QuicInfo.PacketNumber}");
         }
 
         ImGui.Spacing();
         ImGui.TextColored(new Vector4(1, 0.8f, 0.2f, 1), "Raw Data");
 
-        string hexData = ByteUtils.ToHex(pkt.RawHexPreview.Replace("-", "").HexToBytes() ?? Array.Empty<byte>(), 32);
+        string hexData = pkt.RawHexPreview;
 
         ImGui.InputTextMultiline("##raw", ref hexData, 100000, new Vector2(-1, 200),
             ImGuiInputTextFlags.ReadOnly);
@@ -91,10 +75,14 @@ public class PacketInspectorTab : ITab
         ImGui.Spacing();
         if (ImGui.Button("Analyze Entropy"))
         {
-            byte[] data = pkt.RawHexPreview.Replace("-", "").HexToBytes() ?? Array.Empty<byte>();
-            double entropy = ByteUtils.CalculateEntropy(data);
-            ImGui.Text($"Shannon Entropy: {entropy:F2} bits/byte");
-            ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(300, 20), $"{entropy:F2}/8.0");
+            try
+            {
+                byte[] data = Convert.FromHexString(pkt.RawHexPreview.Replace("-", ""));
+                double entropy = ByteUtils.CalculateEntropy(data);
+                ImGui.Text($"Shannon Entropy: {entropy:F2} bits/byte");
+                ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(300, 20));
+            }
+            catch { }
         }
 
         ImGui.EndChild();
@@ -112,22 +100,5 @@ public class PacketInspectorTab : ITab
     public void SelectPacket(PacketLogEntry packet)
     {
         _selectedPacket = packet;
-    }
-}
-
-public static class PacketInspectorExtensions
-{
-    public static byte[]? HexToBytes(this string hex)
-    {
-        if (string.IsNullOrEmpty(hex)) return null;
-        try
-        {
-            hex = hex.Replace("-", "").Replace(" ", "");
-            byte[] bytes = new byte[hex.Length / 2];
-            for (int i = 0; i < hex.Length; i += 2)
-                bytes[i / 2] = Convert.ToByte(hex.Substring(i, 2), 16);
-            return bytes;
-        }
-        catch { return null; }
     }
 }

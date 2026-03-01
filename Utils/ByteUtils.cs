@@ -1,29 +1,54 @@
-﻿// FILE: Utils/ByteUtils.cs
-namespace HyForce.Utils;
+﻿namespace HyForce.Utils;
 
 public static class ByteUtils
 {
-    public static string ToHex(byte[] data, int maxBytes = -1)
+    public static ushort ReadUInt16BE(byte[] data, int offset)
     {
-        if (data == null || data.Length == 0) return "";
-
-        int length = maxBytes > 0 ? Math.Min(maxBytes, data.Length) : data.Length;
-        return BitConverter.ToString(data, 0, length);
+        if (data.Length < offset + 2) return 0;
+        return (ushort)((data[offset] << 8) | data[offset + 1]);
     }
 
-    public static List<string> ExtractStrings(byte[] data, int minLength = 3)
+    public static uint ReadUInt32BE(byte[] data, int offset)
+    {
+        if (data.Length < offset + 4) return 0;
+        return (uint)((data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3]);
+    }
+
+    public static string ToHex(byte[] data, int maxLen = -1)
+    {
+        if (data == null || data.Length == 0) return "";
+        int len = maxLen > 0 ? Math.Min(data.Length, maxLen) : data.Length;
+        return BitConverter.ToString(data, 0, len);
+    }
+
+    public static double CalculateEntropy(byte[] data)
+    {
+        if (data.Length == 0) return 0;
+
+        var frequencies = new int[256];
+        foreach (byte b in data) frequencies[b]++;
+
+        double entropy = 0;
+        int length = data.Length;
+        for (int i = 0; i < 256; i++)
+        {
+            if (frequencies[i] == 0) continue;
+            double p = (double)frequencies[i] / length;
+            entropy -= p * Math.Log2(p);
+        }
+        return entropy;
+    }
+
+    public static List<string> ExtractStrings(byte[] data, int minLength = 4)
     {
         var result = new List<string>();
-        if (data == null || data.Length == 0) return result;
-
         var sb = new System.Text.StringBuilder();
 
         for (int i = 0; i < data.Length; i++)
         {
-            byte b = data[i];
-            if (b >= 32 && b <= 126)
+            if (data[i] >= 32 && data[i] <= 126)
             {
-                sb.Append((char)b);
+                sb.Append((char)data[i]);
             }
             else
             {
@@ -37,28 +62,5 @@ public static class ByteUtils
             result.Add(sb.ToString());
 
         return result;
-    }
-
-    public static double CalculateEntropy(byte[] data)
-    {
-        if (data == null || data.Length == 0) return 0;
-
-        int[] frequencies = new int[256];
-        foreach (byte b in data)
-            frequencies[b]++;
-
-        double entropy = 0;
-        int length = data.Length;
-
-        for (int i = 0; i < 256; i++)
-        {
-            if (frequencies[i] > 0)
-            {
-                double probability = (double)frequencies[i] / length;
-                entropy -= probability * Math.Log(probability, 2);
-            }
-        }
-
-        return entropy;
     }
 }

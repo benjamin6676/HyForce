@@ -1,11 +1,15 @@
 ﻿// FILE: Protocol/OpcodeRegistry.cs (ENHANCED VERSION)
 using HyForce.Networking;
+using HyForce.Data;
 using System.Collections.Generic;
 
 namespace HyForce.Protocol;
 
 public static class OpcodeRegistry
 {
+    // ADDED: Missing constant
+    public const ushort RegistryOpcode = 0x18;
+
     // C2S Packets (Client-to-Server) - Player Input
     public static readonly Dictionary<ushort, PacketInfo> C2S_Opcodes = new()
     {
@@ -227,26 +231,12 @@ public static class OpcodeRegistry
         var dict = direction == PacketDirection.ClientToServer ? C2S_Opcodes : S2C_Opcodes;
         return dict.TryGetValue(opcode, out var info) ? info : null;
     }
-    
-    public static bool IsTcpOpcode(ushort opcode)
-    {
-        // TCP opcodes are typically in range 0x0000-0x00FF (registry/login)
-        // UDP opcodes are typically 0x4000+ (gameplay)
-        return opcode < 0x4000;
-    }
 
     public static bool IsKnownOpcode(ushort opcode, PacketDirection direction)
     {
         var dict = direction == PacketDirection.ClientToServer ? C2S_Opcodes : S2C_Opcodes;
         return dict.ContainsKey(opcode);
     }
-}
-
-public enum PacketCategory
-{
-    Connection, Authentication, Setup, Assets, Player, Movement, Input,
-    Combat, Blocks, World, Entities, Inventory, Interface, WorldMap,
-    Network, Debug, Interaction, Machinima, Camera, BuilderTools, Unknown, ClientSetup
 }
 
 public record PacketInfo(string Name, string Description, PacketCategory Category, bool IsCritical = false);

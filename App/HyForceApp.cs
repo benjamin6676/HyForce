@@ -1,7 +1,8 @@
-﻿using HyForce.Core;
+﻿// FILE: App/HyForceApp.cs - UPDATED WITH PACKET HANDLER AND DECRYPTION TAB
+using HyForce.Core;
 using HyForce.Tabs;
-using HyForce.Networking;
 using HyForce.UI;
+using HyForce.Protocol;
 using ImGuiNET;
 using Veldrid;
 using Veldrid.Sdl2;
@@ -17,6 +18,7 @@ public class HyForceApp
     private readonly CommandList _commandList;
 
     private readonly AppState _state;
+    private readonly Protocol.PacketHandler _packetHandler;  // FIXED: Fully qualified name
     private readonly List<ITab> _tabs = new();
     private readonly Theme _theme;
     private int _selectedTab = 0;
@@ -38,6 +40,13 @@ public class HyForceApp
         _state = AppState.Instance;
         _theme = new Theme();
 
+        // Initialize packet handler before tabs
+        _packetHandler = new Protocol.PacketHandler(_state);
+
+        // Wire up packet handling
+        _state.TcpProxy.OnPacket += _packetHandler.ProcessPacket;
+        _state.UdpProxy.OnPacket += _packetHandler.ProcessPacket;
+
         InitializeTabs();
         SetupImGuiStyle();
     }
@@ -46,12 +55,12 @@ public class HyForceApp
     {
         _tabs.Add(new ConnectTab(_state));
         _tabs.Add(new RegistryTab(_state));
-        _tabs.Add(new ItemsTab(_state));      // ADD THIS
+        _tabs.Add(new ItemsTab(_state));
         _tabs.Add(new PacketFeedTab(_state));
         _tabs.Add(new SecurityAuditTab(_state));
-        _tabs.Add(new PacketAnalyticsTab(_state));
         _tabs.Add(new LogTab(_state));
-        _tabs.Add(new MemoryTab(_state));
+        _tabs.Add(new MemoryTab(_state));        // NEW: Memory scanner
+        _tabs.Add(new DecryptionTab(_state));    // NEW: Decryption management
         _tabs.Add(new SettingsTab(_state));
     }
 
@@ -182,7 +191,7 @@ public class HyForceApp
                 bool darkTheme = _state.Config.DarkTheme;
                 if (ImGui.MenuItem("Dark Theme", "", darkTheme))
                 {
-                    _state.Config.DarkTheme = !_state.Config.DarkTheme;
+                    _state.Config.DarkTheme = !darkTheme;
                     _theme.Apply();
                 }
 
@@ -206,6 +215,20 @@ public class HyForceApp
                 if (ImGui.MenuItem("Open Export Folder"))
                 {
                     System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);
+                }
+
+                // NEW: Memory scanning tools
+                if (ImGui.MenuItem("Quick Memory Scan"))
+                {
+                    // Switch to memory tab and trigger scan
+                    for (int i = 0; i < _tabs.Count; i++)
+                    {
+                        if (_tabs[i] is MemoryTab)
+                        {
+                            _selectedTab = i;
+                            break;
+                        }
+                    }
                 }
 
                 ImGui.EndMenu();
@@ -307,6 +330,15 @@ public class HyForceApp
             ImGui.Separator();
             ImGui.Spacing();
 
+            // NEW: Show decryption status
+            ImGui.TextColored(Theme.ColAccent, "Decryption Status:");
+            ImGui.Text($"Keys Available: {PacketDecryptor.DiscoveredKeys.Count}");
+            ImGui.Text($"Packets Decrypted: {PacketDecryptor.SuccessfulDecryptions}");
+
+            ImGui.Spacing();
+            ImGui.Separator();
+            ImGui.Spacing();
+
             var buttonWidth = 100f;
             ImGui.SetCursorPosX((windowWidth - buttonWidth) * 0.5f);
             if (ImGui.Button("Close", new Vector2(buttonWidth, 30)))
@@ -383,6 +415,23 @@ public class HyForceApp
                 securitySb.AppendLine($"[{evt.Timestamp:yyyy-MM-dd HH:mm:ss}] [{evt.Category}] {evt.Message}");
             }
             File.WriteAllText(Path.Combine(basePath, "security_events.txt"), securitySb.ToString());
+
+            // Export discovered encryption keys
+            if (PacketDecryptor.DiscoveredKeys.Count > 0)
+            {
+                var keysSb = new System.Text.StringBuilder();
+                keysSb.AppendLine("=== ENCRYPTION KEYS ===");
+                foreach (var key in PacketDecryptor.DiscoveredKeys)
+                {
+                    keysSb.AppendLine($"Type: {key.Type}");
+                    keysSb.AppendLine($"Source: {key.Source}");
+                    keysSb.AppendLine($"Key: {Convert.ToHexString(key.Key)}");
+                    if (key.MemoryAddress.HasValue)
+                        keysSb.AppendLine($"Address: 0x{(ulong)key.MemoryAddress.Value:X}");
+                    keysSb.AppendLine();
+                }
+                File.WriteAllText(Path.Combine(basePath, "encryption_keys.txt"), keysSb.ToString());
+            }
 
             _state.AddInGameLog($"[SUCCESS] Full export completed to {basePath}");
             System.Diagnostics.Process.Start("explorer.exe", basePath);
