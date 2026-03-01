@@ -45,10 +45,12 @@ public class HyForceApp
     {
         _tabs.Add(new ConnectTab(_state));
         _tabs.Add(new RegistryTab(_state));
+        _tabs.Add(new ItemsTab(_state));      // ADD THIS
         _tabs.Add(new PacketFeedTab(_state));
         _tabs.Add(new SecurityAuditTab(_state));
         _tabs.Add(new AnalyticsTab(_state));
-        _tabs.Add(new LogTab(_state));        // NEW: In-game log tab
+        _tabs.Add(new LogTab(_state));
+        _tabs.Add(new MemoryTab(_state));
         _tabs.Add(new SettingsTab(_state));
     }
 

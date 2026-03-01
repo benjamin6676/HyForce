@@ -112,6 +112,67 @@ public static class RegistrySyncParser
                 str.StartsWith("Utility_"));
     }
 
+    // FILE: Protocol/RegistrySyncParser.cs - Enhanced for Hytale
+    // Add this method to your existing RegistrySyncParser
+
+    public static void ForceParseHytaleRegistry(byte[] data)
+    {
+        // Hytale registry format:
+        // - May be compressed (Zstd)
+        // - Contains item IDs in format: "category_name"
+        // - Examples: "Block_Stone", "Item_Sword", "Armor_IronHelmet"
+
+        // Try multiple offsets since packet structure may vary
+        for (int offset = 0; offset < Math.Min(data.Length, 16); offset++)
+        {
+            var slice = data.Skip(offset).ToArray();
+            var strings = ExtractStrings(slice, 4);
+
+            foreach (var str in strings)
+            {
+                // Hytale item patterns
+                if (IsHytaleItemId(str))
+                {
+                    StringIdToName[str] = str;
+                    uint hash = ComputeHash(str);
+                    NumericIdToName[hash] = str;
+
+                    if (!RegistrySyncReceived)
+                    {
+                        RegistrySyncReceived = true;
+                        FoundAtOpcode = 0x18; // Assume standard registry opcode
+                    }
+                }
+            }
+        }
+    }
+
+    private static bool IsHytaleItemId(string str)
+    {
+        // Hytale naming conventions based on documentation
+        return str.Contains('_') && (
+            str.StartsWith("Block_") ||      // Blocks
+            str.StartsWith("Item_") ||       // Items
+            str.StartsWith("Armor_") ||      // Armor pieces
+            str.StartsWith("Weapon_") ||     // Weapons
+            str.StartsWith("Tool_") ||       // Tools
+            str.StartsWith("Ingredient_") || // Crafting ingredients
+            str.StartsWith("Ore_") ||        // Ores
+            str.StartsWith("Wood_") ||       // Wood types
+            str.StartsWith("Plant_") ||      // Plants
+            str.StartsWith("Creature_") ||   // Creatures
+            str.StartsWith("Effect_") ||     // Status effects
+            str.StartsWith("Particle_") ||   // Particles
+            str.StartsWith("Sound_") ||      // Sounds
+            str.StartsWith("Music_") ||      // Music
+            str.StartsWith("Biome_") ||      // Biomes
+            str.StartsWith("Structure_") ||  // Structures
+            str.StartsWith("Dungeon_") ||    // Dungeons
+            str.StartsWith("Npc_") ||        // NPCs
+            str.StartsWith("Quest_")         // Quests
+        );
+    }
+
     private static bool IsPlayerNamePattern(string str)
     {
         return str.Length >= 3 && str.Length <= 16 &&

@@ -83,7 +83,10 @@ public class AppState : IDisposable
         int udpPort = UseUnifiedPort ? UnifiedPort : UdpListenPort;
 
         TcpProxy.Start("127.0.0.1", tcpPort, TargetHost, TargetPort);
-        UdpProxy.Start("0.0.0.0", udpPort, TargetHost, TargetPort);
+
+        Thread.Sleep(200); // Small delay to ensure TCP proxy is up before starting UDP
+
+        UdpProxy.Start("127.0.0.1", udpPort, TargetHost, TargetPort);
 
         StartTime = DateTime.Now;
 
