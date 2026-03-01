@@ -55,6 +55,7 @@ public class PacketLog
             OpcodeDecimal = opcode,
             OpcodeName = name,
             IsTcp = pkt.IsTcp,
+            RawBytes = raw,
             CompressionMethod = compr,
             CompressedSize = raw.Length,
             DecompressedSize = compressed ? decompressed!.Length : raw.Length,

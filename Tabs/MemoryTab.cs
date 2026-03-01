@@ -75,10 +75,7 @@ public class MemoryTab : ITab
         {
             _state.AddInGameLog("[MEMORY] Attach to process first before scanning!");
             // Auto-switch to this tab
-            for (int i = 0; i < 8; i++) // Max 8 tabs
-            {
-                if (_state.OnMemoryDataUpdated != null) break; // We're already here
-            }
+            
         }
     }
 

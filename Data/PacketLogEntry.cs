@@ -8,6 +8,7 @@ public class PacketLogEntry
     public ushort OpcodeDecimal { get; set; }
     public string OpcodeName { get; set; } = "";
     public bool IsTcp { get; set; }
+    public byte[] RawBytes { get; set; } = Array.Empty<byte>();
 
     // UI compatibility properties
     public string DirStr => Direction == Networking.PacketDirection.ServerToClient ? "S→C" : "C→S";

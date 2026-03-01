@@ -15,7 +15,7 @@ public class ConnectTab : ITab
     private readonly byte[] _bufServerPort = new byte[8];
     private bool _showAdvanced = false;
     private double _copyFeedbackTime = 0;
-
+    private int _selectedPresetIndex = -1;
     public ConnectTab(AppState state)
     {
         _state = state;
@@ -73,7 +73,45 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // REMOVED: Server preset selector - simplified for UDP
+        // Server preset selector - ADD THIS SECTION
+        var presets = _state.Config.GetAllPresets();
+        string[] displayNames = presets.Select(p =>
+            string.IsNullOrEmpty(p.IpAddress) ? $"{p.Name} (Custom)" : $"{p.Name} ({p.IpAddress})"
+        ).ToArray();
+
+        ImGui.Text("Server Preset:");
+        ImGui.SetNextItemWidth(leftW - 24);
+
+        if (ImGui.Combo("##preset", ref _selectedPresetIndex, displayNames, displayNames.Length))
+        {
+            if (_selectedPresetIndex >= 0 && _selectedPresetIndex < presets.Count)
+            {
+                var selected = presets[_selectedPresetIndex];
+                _state.TargetHost = selected.IpAddress;
+                _state.TargetPort = selected.Port;
+
+                // Update the input buffers
+                Array.Clear(_bufServerIp, 0, _bufServerIp.Length);
+                Array.Clear(_bufServerPort, 0, _bufServerPort.Length);
+                System.Text.Encoding.ASCII.GetBytes(selected.IpAddress).CopyTo(_bufServerIp, 0);
+                System.Text.Encoding.ASCII.GetBytes(selected.Port.ToString()).CopyTo(_bufServerPort, 0);
+
+                _state.AddInGameLog($"[CONFIG] Selected preset: {selected.Name} ({selected.IpAddress}:{selected.Port})");
+            }
+        }
+
+        // Show current selection info
+        if (_selectedPresetIndex >= 0 && _selectedPresetIndex < presets.Count)
+        {
+            var current = presets[_selectedPresetIndex];
+            ImGui.TextColored(Theme.ColTextMuted, $"Selected: {current.Name}");
+            if (!string.IsNullOrEmpty(current.Description))
+            {
+                ImGui.TextColored(Theme.ColTextMuted, current.Description);
+            }
+        }
+
+        ImGui.Spacing();
 
         ImGui.Text("Target Server IP:");
         RenderInputWithPaste("##srvIp", _bufServerIp, (val) => _state.TargetHost = val, leftW - 32);

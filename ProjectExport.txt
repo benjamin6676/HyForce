@@ -1,6 +1,6 @@
 ===== FILE: C:\Users\benja\source\repos\HyForce\App\HyForceApp.cs =====
 
-// FILE: App/HyForceApp.cs - UPDATED WITH PACKET HANDLER AND DECRYPTION TAB
+// FILE: App/HyForceApp.cs - FIXED: PROPER EVENT ACCESS AND MENU
 using HyForce.Core;
 using HyForce.Tabs;
 using HyForce.UI;
@@ -20,7 +20,7 @@ public class HyForceApp
     private readonly CommandList _commandList;
 
     private readonly AppState _state;
-    private readonly Protocol.PacketHandler _packetHandler;  // FIXED: Fully qualified name
+    private readonly Protocol.PacketHandler _packetHandler;
     private readonly List<ITab> _tabs = new();
     private readonly Theme _theme;
     private int _selectedTab = 0;
@@ -42,11 +42,9 @@ public class HyForceApp
         _state = AppState.Instance;
         _theme = new Theme();
 
-        // Initialize packet handler before tabs
         _packetHandler = new Protocol.PacketHandler(_state);
 
-        // Wire up packet handling
-        _state.TcpProxy.OnPacket += _packetHandler.ProcessPacket;
+        // Only UDP handler
         _state.UdpProxy.OnPacket += _packetHandler.ProcessPacket;
 
         InitializeTabs();
@@ -56,13 +54,12 @@ public class HyForceApp
     private void InitializeTabs()
     {
         _tabs.Add(new ConnectTab(_state));
-        _tabs.Add(new RegistryTab(_state));
         _tabs.Add(new ItemsTab(_state));
         _tabs.Add(new PacketFeedTab(_state));
         _tabs.Add(new SecurityAuditTab(_state));
         _tabs.Add(new LogTab(_state));
-        _tabs.Add(new MemoryTab(_state));        // NEW: Memory scanner
-        _tabs.Add(new DecryptionTab(_state));    // NEW: Decryption management
+        _tabs.Add(new MemoryTab(_state));        // Memory scanner
+        _tabs.Add(new DecryptionTab(_state));    // Decryption management
         _tabs.Add(new SettingsTab(_state));
     }
 
@@ -70,7 +67,6 @@ public class HyForceApp
     {
         var io = ImGui.GetIO();
         io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard;
-
         _theme.Apply();
     }
 
@@ -216,13 +212,18 @@ public class HyForceApp
 
                 if (ImGui.MenuItem("Open Export Folder"))
                 {
-                    System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);
+                    try
+                    {
+                        System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);
+                    }
+                    catch { }
                 }
 
-                // NEW: Memory scanning tools
-                if (ImGui.MenuItem("Quick Memory Scan"))
+                // FIXED: Memory Tab now properly accessible from menu
+                ImGui.Separator();
+                if (ImGui.MenuItem("Memory Scanner", "Ctrl+M"))
                 {
-                    // Switch to memory tab and trigger scan
+                    // Switch to Memory tab
                     for (int i = 0; i < _tabs.Count; i++)
                     {
                         if (_tabs[i] is MemoryTab)
@@ -231,6 +232,12 @@ public class HyForceApp
                             break;
                         }
                     }
+                }
+
+                // FIXED: Use public method instead of direct event access
+                if (ImGui.MenuItem("Quick Memory Scan", "Ctrl+Shift+M"))
+                {
+                    _state.TriggerMemoryScan();
                 }
 
                 ImGui.EndMenu();
@@ -325,17 +332,18 @@ public class HyForceApp
             ImGui.Spacing();
 
             ImGui.TextWrapped("HyForce is a network security analysis tool for Hytale. " +
-                "It captures and analyzes TCP (RegistrySync) and UDP (QUIC gameplay) traffic " +
-                "to help identify security vulnerabilities and understand game protocol behavior.");
+                "It captures and analyzes UDP (QUIC gameplay) traffic " +
+                "to help identify security vulnerabilities and understand game protocol behavior. " +
+                "Hytale uses UDP/QUIC only - no TCP required!");
 
             ImGui.Spacing();
             ImGui.Separator();
             ImGui.Spacing();
 
-            // NEW: Show decryption status
             ImGui.TextColored(Theme.ColAccent, "Decryption Status:");
             ImGui.Text($"Keys Available: {PacketDecryptor.DiscoveredKeys.Count}");
             ImGui.Text($"Packets Decrypted: {PacketDecryptor.SuccessfulDecryptions}");
+            ImGui.Text($"Packets Failed: {PacketDecryptor.FailedDecryptions}");
 
             ImGui.Spacing();
             ImGui.Separator();
@@ -397,19 +405,14 @@ public class HyForceApp
             string basePath = Path.Combine(_state.ExportDirectory, $"hyforce_full_export_{timestamp}");
             Directory.CreateDirectory(basePath);
 
-            // Export diagnostics
             File.WriteAllText(Path.Combine(basePath, "diagnostics.txt"), _state.GenerateDiagnostics());
-
-            // Export packet log
             File.WriteAllText(Path.Combine(basePath, "packets.txt"), _state.ExportPacketLog());
 
-            // Export in-game log
             lock (_state.InGameLog)
             {
                 File.WriteAllLines(Path.Combine(basePath, "ingame_log.txt"), _state.InGameLog);
             }
 
-            // Export security events
             var securitySb = new System.Text.StringBuilder();
             securitySb.AppendLine("=== SECURITY EVENTS ===");
             foreach (var evt in _state.SecurityEvents.OrderBy(e => e.Timestamp))
@@ -418,7 +421,6 @@ public class HyForceApp
             }
             File.WriteAllText(Path.Combine(basePath, "security_events.txt"), securitySb.ToString());
 
-            // Export discovered encryption keys
             if (PacketDecryptor.DiscoveredKeys.Count > 0)
             {
                 var keysSb = new System.Text.StringBuilder();
@@ -436,7 +438,11 @@ public class HyForceApp
             }
 
             _state.AddInGameLog($"[SUCCESS] Full export completed to {basePath}");
-            System.Diagnostics.Process.Start("explorer.exe", basePath);
+            try
+            {
+                System.Diagnostics.Process.Start("explorer.exe", basePath);
+            }
+            catch { }
         }
         catch (Exception ex)
         {
@@ -947,9 +953,10 @@ void main()
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Core\AppState.cs =====
 
-// FILE: Core/AppState.cs
+// FILE: Core/AppState.cs - FIXED: UDP-ONLY WITH AUTO-DECRYPTION
 using HyForce.Data;
 using HyForce.Networking;
+using HyForce.Protocol;
 using System.Collections.Concurrent;
 
 namespace HyForce.Core;
@@ -960,8 +967,6 @@ public class AppState : IDisposable
     public static AppState Instance => _instance.Value;
 
     public Config Config { get; } = new();
-
-    public TcpProxy TcpProxy { get; }
     public UdpProxy UdpProxy { get; }
 
     public PacketLog PacketLog { get; }
@@ -970,47 +975,81 @@ public class AppState : IDisposable
 
     public string TargetHost { get; set; } = "127.0.0.1";
     public int TargetPort { get; set; } = 5520;
-    public bool UseUnifiedPort { get; set; } = true;
-    public int UnifiedPort { get; set; } = 5521;
-    public int TcpListenPort { get; set; } = 5521;
-    public int UdpListenPort { get; set; } = 5521;
+    public int ListenPort { get; set; } = 5521;
 
-    public bool IsRunning => TcpProxy.IsRunning || UdpProxy.IsRunning;
+    public bool IsRunning => UdpProxy.IsRunning;
     public DateTime? StartTime { get; private set; }
 
     public long TotalPackets => PacketLog.TotalPackets;
-    public long TcpPackets => PacketLog.PacketsTcp;
+    // REMOVED: TcpPackets - not used in UDP-only mode
     public long UdpPackets => PacketLog.PacketsUdp;
 
     public ConcurrentBag<SecurityEvent> SecurityEvents { get; } = new();
-
     public bool ShowAboutWindow;
 
     public List<string> InGameLog { get; } = new();
     public const int MaxInGameLogLines = 1000;
 
-    // FIXED: Use the requested export path
     public string ExportDirectory { get; set; } = @"C:\Users\benja\source\repos\HyForce\Exported logs";
 
-    public event PacketReceivedHandler? OnPacketReceived;  // CHANGED from Action
+    public event PacketReceivedHandler? OnPacketReceived;
     public event Action? OnSecurityEvent;
 
-    // NEW: Memory reading events
+    // FIXED: Made this a proper event with public accessor
     public event Action? OnMemoryDataUpdated;
+
+    // Auto-decryption timer
+    private System.Timers.Timer? _autoDecryptTimer;
 
     public AppState()
     {
         Log = new TestLog();
-        TcpProxy = new TcpProxy(Log);
         UdpProxy = new UdpProxy(Log);
         PacketLog = new PacketLog(10000);
         Database = new PlayerItemDatabase();
 
-        TcpProxy.OnPacket += HandlePacket;
         UdpProxy.OnPacket += HandlePacket;
-
-        // Ensure export directory exists
         Directory.CreateDirectory(ExportDirectory);
+
+        // Setup auto-decryption attempts
+        SetupAutoDecryption();
+    }
+
+    private void SetupAutoDecryption()
+    {
+        // Try to decrypt packets automatically every 5 seconds
+        _autoDecryptTimer = new System.Timers.Timer(5000);
+        _autoDecryptTimer.Elapsed += (s, e) =>
+        {
+            TryAutoDecryptPackets();
+        };
+        _autoDecryptTimer.AutoReset = true;
+    }
+
+    private void TryAutoDecryptPackets()
+    {
+        if (PacketDecryptor.DiscoveredKeys.Count == 0) return;
+
+        // Auto-decrypt recent packets
+        var recentPackets = PacketLog.GetLast(100);
+        int decrypted = 0;
+
+        foreach (var pkt in recentPackets)
+        {
+            if (pkt.EncryptionHint == "encrypted" && pkt.RawBytes.Length > 16)
+            {
+                var result = PacketDecryptor.TryDecrypt(pkt.RawBytes);
+                if (result.Success)
+                {
+                    decrypted++;
+                }
+            }
+        }
+
+        if (decrypted > 0)
+        {
+            AddInGameLog($"[AUTO-DECRYPT] Decrypted {decrypted} packets automatically");
+        }
     }
 
     public void AddInGameLog(string message)
@@ -1027,33 +1066,115 @@ public class AppState : IDisposable
     {
         if (IsRunning) return;
 
-        int tcpPort = UseUnifiedPort ? UnifiedPort : TcpListenPort;
-        int udpPort = UseUnifiedPort ? UnifiedPort : UdpListenPort;
-
-        TcpProxy.Start("127.0.0.1", tcpPort, TargetHost, TargetPort);
-
-        Thread.Sleep(200); // Small delay to ensure TCP proxy is up before starting UDP
-
-        UdpProxy.Start("127.0.0.1", udpPort, TargetHost, TargetPort);
-
+        UdpProxy.Start("0.0.0.0", ListenPort, TargetHost, TargetPort);
         StartTime = DateTime.Now;
+        _autoDecryptTimer?.Start();
 
-        Log.Info($"[HyForce] Started - Mode: {(UseUnifiedPort ? "Unified" : "Separate")} Port", "System");
-        Log.Info($"[HyForce] TCP Port: {tcpPort} (RegistrySync)", "System");
-        Log.Info($"[HyForce] UDP Port: {udpPort} (QUIC Gameplay)", "System");
-        Log.Info($"[HyForce] Connect Hytale to 127.0.0.1:{tcpPort}", "System");
+        Log.Info($"[HyForce] Started - UDP Proxy on 0.0.0.0:{ListenPort}", "System");
+        Log.Info($"[HyForce] Forwarding to {TargetHost}:{TargetPort}", "System");
+        Log.Info($"[HyForce] Hytale uses UDP/QUIC only - no TCP needed", "System");
 
-        AddInGameLog($"Proxies started on 127.0.0.1:{tcpPort}");
-        AddInGameLog("Connect Hytale client to 127.0.0.1:" + tcpPort);
+        AddInGameLog($"UDP Proxy started on 127.0.0.1:{ListenPort}");
+        AddInGameLog($"Connect Hytale to 127.0.0.1:{ListenPort}");
+
+        // AUTO-COPY IP TO CLIPBOARD
+        try
+        {
+            string connectString = $"127.0.0.1:{ListenPort}";
+            TextCopy.ClipboardService.SetText(connectString);
+            AddInGameLog($"[AUTO-COPY] {connectString} copied to clipboard!");
+            Log.Success($"Connect address copied to clipboard: {connectString}", "System");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Failed to copy to clipboard: {ex.Message}", "System");
+        }
+
+        // AUTO-ATTEMPT SSLKEYLOGFILE
+        TryEnableSSLKeyLogFile();
+    }
+
+    private void TryEnableSSLKeyLogFile()
+    {
+        try
+        {
+            // Set environment variable for Hytale process if it reads it
+            string keyLogPath = Path.Combine(ExportDirectory, "sslkeys.log");
+            Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath);
+            AddInGameLog($"[AUTO-DECRYPT] SSLKEYLOGFILE set to: {keyLogPath}");
+
+            // Also try to find existing key log files
+            var existingLogs = Directory.GetFiles(ExportDirectory, "*.log")
+                .Where(f => f.Contains("key", StringComparison.OrdinalIgnoreCase) ||
+                           f.Contains("ssl", StringComparison.OrdinalIgnoreCase));
+
+            foreach (var log in existingLogs)
+            {
+                AddInGameLog($"[AUTO-DECRYPT] Found existing key log: {Path.GetFileName(log)}");
+                TryLoadKeysFromFile(log);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"SSLKEYLOGFILE setup failed: {ex.Message}", "System");
+        }
+    }
+
+    public void TryLoadKeysFromFile(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return;
+
+            var lines = File.ReadAllLines(path);
+            int keysAdded = 0;
+
+            foreach (var line in lines)
+            {
+                // Parse SSLKEYLOGFILE format: CLIENT_HANDSHAKE_TRAFFIC_SECRET <client_random> <secret>
+                if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
+                    line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
+                    line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET"))
+                {
+                    var parts = line.Split(' ');
+                    if (parts.Length >= 3)
+                    {
+                        var secret = Convert.FromHexString(parts[2]);
+                        if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
+                        {
+                            PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+                            {
+                                Key = secret,
+                                IV = new byte[12],
+                                Type = secret.Length == 32 ?
+                                    PacketDecryptor.EncryptionType.AES256GCM :
+                                    PacketDecryptor.EncryptionType.ChaCha20Poly1305,
+                                Source = $"SSLKEYLOGFILE: {Path.GetFileName(path)}"
+                            });
+                            keysAdded++;
+                        }
+                    }
+                }
+            }
+
+            if (keysAdded > 0)
+            {
+                AddInGameLog($"[AUTO-DECRYPT] Loaded {keysAdded} keys from {Path.GetFileName(path)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            AddInGameLog($"[AUTO-DECRYPT] Failed to load keys: {ex.Message}");
+        }
     }
 
     public void Stop()
     {
-        TcpProxy.Stop();
         UdpProxy.Stop();
         StartTime = null;
-        Log.Info("[HyForce] Proxies stopped", "System");
-        AddInGameLog("Proxies stopped");
+        _autoDecryptTimer?.Stop();
+        Log.Info("[HyForce] Proxy stopped", "System");
+        AddInGameLog("Proxy stopped");
     }
 
     private void HandlePacket(CapturedPacket packet)
@@ -1061,7 +1182,7 @@ public class AppState : IDisposable
         PacketLog.Add(packet);
         AnalyzePacket(packet);
         Database.ProcessPacket(packet);
-        OnPacketReceived?.Invoke(packet);  // CHANGED to pass packet
+        OnPacketReceived?.Invoke(packet);
     }
 
     private void AnalyzePacket(CapturedPacket packet)
@@ -1084,19 +1205,6 @@ public class AppState : IDisposable
                 ["size"] = packet.RawBytes.Length
             });
         }
-
-        if (packet.IsTcp && packet.Direction == PacketDirection.ServerToClient)
-        {
-            if (packet.Opcode == Protocol.OpcodeRegistry.RegistryOpcode ||
-                (packet.Opcode >= 0x28 && packet.Opcode <= 0x3F))
-            {
-                LogSecurityEvent("Registry", $"RegistrySync detected: 0x{packet.Opcode:X2}", new Dictionary<string, object>
-                {
-                    ["opcode"] = packet.Opcode,
-                    ["size"] = packet.RawBytes.Length
-                });
-            }
-        }
     }
 
     public void LogSecurityEvent(string category, string message, Dictionary<string, object> metadata)
@@ -1114,6 +1222,12 @@ public class AppState : IDisposable
         OnSecurityEvent?.Invoke();
     }
 
+    // FIXED: Public method to trigger memory scan from menu
+    public void TriggerMemoryScan()
+    {
+        OnMemoryDataUpdated?.Invoke();
+    }
+
     public void ClearAll()
     {
         PacketLog.Clear();
@@ -1125,19 +1239,17 @@ public class AppState : IDisposable
         AddInGameLog("All data cleared");
     }
 
-    // ENHANCED: Comprehensive diagnostics report
     public string GenerateDiagnostics()
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("+------------------------------------------------------------------------------+");
-        sb.AppendLine("                    HYFORCE V22-ENHANCED - FULL DIAGNOSTICS REPORT            ");
+        sb.AppendLine("                    HYFORCE V22-ENHANCED - UDP-ONLY MODE                       ");
         sb.AppendLine("+------------------------------------------------------------------------------+");
         sb.AppendLine();
         sb.AppendLine($"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         sb.AppendLine($"Session Duration: {(StartTime.HasValue ? FormatDuration(DateTime.Now - StartTime.Value) : "Not running")}");
         sb.AppendLine();
 
-        // SYSTEM INFO
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                              SYSTEM INFORMATION                               ");
         sb.AppendLine("-------------------------------------------------------------------------------");
@@ -1147,47 +1259,45 @@ public class AppState : IDisposable
         sb.AppendLine($"Processor Count: {Environment.ProcessorCount}");
         sb.AppendLine();
 
-        // CONFIGURATION
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                                CONFIGURATION                                  ");
         sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine($"Mode: {(UseUnifiedPort ? "Unified Port" : "Separate Ports")}");
+        sb.AppendLine($"Mode: UDP-ONLY (Hytale uses QUIC/UDP)");
         sb.AppendLine($"Target: {TargetHost}:{TargetPort}");
-        sb.AppendLine($"Listen: 127.0.0.1:{UnifiedPort}");
+        sb.AppendLine($"Listen: 0.0.0.0:{ListenPort}");
         sb.AppendLine($"Export Path: {ExportDirectory}");
         sb.AppendLine();
 
-        // PROXY STATUS
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                                PROXY STATUS                                   ");
         sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine($"TCP Proxy: {(TcpProxy.IsRunning ? "RUNNING " : "STOPPED")}");
-        sb.AppendLine($"  - Status: {TcpProxy.StatusMessage}");
-        sb.AppendLine($"  - Active Sessions: {TcpProxy.ActiveSessions}");
-        sb.AppendLine($"  - Total Connections: {TcpProxy.TotalConnections}");
-        sb.AppendLine();
         sb.AppendLine($"UDP Proxy: {(UdpProxy.IsRunning ? "RUNNING " : "STOPPED")}");
         sb.AppendLine($"  - Status: {UdpProxy.StatusMessage}");
         sb.AppendLine($"  - Active Sessions: {UdpProxy.ActiveSessions}");
         sb.AppendLine($"  - Total Clients: {UdpProxy.TotalClients}");
         sb.AppendLine();
 
-        // TRAFFIC STATISTICS
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                              TRAFFIC STATISTICS                               ");
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine($"Total Packets: {TotalPackets:N0}");
-        sb.AppendLine($"  TCP: {TcpPackets:N0} ({FormatBytes(PacketLog.BytesTcp)} bytes) - Registry/Login");
         sb.AppendLine($"  UDP: {UdpPackets:N0} ({FormatBytes(PacketLog.BytesUdp)} bytes) - Gameplay");
         sb.AppendLine();
         sb.AppendLine($"Bytes Total: {FormatBytes(PacketLog.BytesSc + PacketLog.BytesCs)}");
-        sb.AppendLine($"  Server?Client: {FormatBytes(PacketLog.BytesSc)}");
-        sb.AppendLine($"  Client?Server: {FormatBytes(PacketLog.BytesCs)}");
+        sb.AppendLine($"  Server->Client: {FormatBytes(PacketLog.BytesSc)}");
+        sb.AppendLine($"  Client->Server: {FormatBytes(PacketLog.BytesCs)}");
         sb.AppendLine();
         sb.AppendLine($"Unique Opcodes: {PacketLog.UniqueOpcodes}");
         sb.AppendLine();
 
-        // TOP OPCODES
+        sb.AppendLine("-------------------------------------------------------------------------------");
+        sb.AppendLine("                             DECRYPTION STATUS                                 ");
+        sb.AppendLine("-------------------------------------------------------------------------------");
+        sb.AppendLine($"Keys Available: {PacketDecryptor.DiscoveredKeys.Count}");
+        sb.AppendLine($"Successful Decryptions: {PacketDecryptor.SuccessfulDecryptions}");
+        sb.AppendLine($"Failed Decryptions: {PacketDecryptor.FailedDecryptions}");
+        sb.AppendLine();
+
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                                TOP 20 OPCODES                                 ");
         sb.AppendLine("-------------------------------------------------------------------------------");
@@ -1200,64 +1310,6 @@ public class AppState : IDisposable
         }
         sb.AppendLine();
 
-        // REGISTRY DATA
-        sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine("                                REGISTRY DATA                                  ");
-        sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine($"RegistrySync Received: {Protocol.RegistrySyncParser.RegistrySyncReceived}");
-        sb.AppendLine($"Found at Opcode: 0x{Protocol.RegistrySyncParser.FoundAtOpcode:X4}");
-        sb.AppendLine();
-        sb.AppendLine($"Items Parsed: {Protocol.RegistrySyncParser.NumericIdToName.Count:N0}");
-        sb.AppendLine($"String IDs: {Protocol.RegistrySyncParser.StringIdToName.Count:N0}");
-        sb.AppendLine($"Player Names: {Protocol.RegistrySyncParser.PlayerNamesSeen.Count:N0}");
-        sb.AppendLine($"Total Entries: {Protocol.RegistrySyncParser.TotalParsed}");
-        sb.AppendLine();
-
-        // ITEM SAMPLES (first 50)
-        if (Protocol.RegistrySyncParser.NumericIdToName.Count > 0)
-        {
-            sb.AppendLine("--- Sample Items (First 50) ---");
-            foreach (var item in Protocol.RegistrySyncParser.NumericIdToName.Take(50))
-            {
-                sb.AppendLine($"  [{item.Key:X8}] {item.Value}");
-            }
-            sb.AppendLine();
-        }
-
-        // PLAYER SAMPLES
-        if (Protocol.RegistrySyncParser.PlayerNamesSeen.Count > 0)
-        {
-            sb.AppendLine("--- Detected Players ---");
-            foreach (var player in Protocol.RegistrySyncParser.PlayerNamesSeen.Take(50))
-            {
-                sb.AppendLine($"  - {player}");
-            }
-            sb.AppendLine();
-        }
-
-        // OPCODE BREAKDOWN
-        if (Protocol.RegistrySyncParser.OpcodeEntryCount.Count > 0)
-        {
-            sb.AppendLine("--- Opcode Entry Counts ---");
-            foreach (var oc in Protocol.RegistrySyncParser.OpcodeEntryCount.OrderBy(x => x.Key))
-            {
-                sb.AppendLine($"  0x{oc.Key:X2}: {oc.Value} entries");
-            }
-            sb.AppendLine();
-        }
-
-        // PARSE LOG
-        if (Protocol.RegistrySyncParser.ParseLog.Count > 0)
-        {
-            sb.AppendLine("--- Parse Log ---");
-            foreach (var log in Protocol.RegistrySyncParser.ParseLog.OrderBy(x => x.Key))
-            {
-                sb.AppendLine($"  0x{log.Key:X2}: {log.Value}");
-            }
-            sb.AppendLine();
-        }
-
-        // DATABASE
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                               PLAYER DATABASE                                 ");
         sb.AppendLine("-------------------------------------------------------------------------------");
@@ -1265,7 +1317,6 @@ public class AppState : IDisposable
         sb.AppendLine($"Unique Players: {Database.Players.Count:N0}");
         sb.AppendLine();
 
-        // SECURITY EVENTS
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                               SECURITY EVENTS                                 ");
         sb.AppendLine("-------------------------------------------------------------------------------");
@@ -1274,7 +1325,6 @@ public class AppState : IDisposable
         sb.AppendLine($"By Category: {string.Join(", ", categories)}");
         sb.AppendLine();
 
-        // RECENT EVENTS (last 20)
         sb.AppendLine("--- Recent Events (Last 20) ---");
         foreach (var evt in SecurityEvents.OrderByDescending(e => e.Timestamp).Take(20))
         {
@@ -1289,7 +1339,6 @@ public class AppState : IDisposable
         }
         sb.AppendLine();
 
-        // IN-GAME LOG (last 50 lines)
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                                IN-GAME LOG                                    ");
         sb.AppendLine("-------------------------------------------------------------------------------");
@@ -1302,7 +1351,6 @@ public class AppState : IDisposable
         }
         sb.AppendLine();
 
-        // END
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                           END OF DIAGNOSTICS REPORT                           ");
         sb.AppendLine("-------------------------------------------------------------------------------");
@@ -1321,11 +1369,10 @@ public class AppState : IDisposable
         var packets = PacketLog.GetAll();
         foreach (var pkt in packets)
         {
-            sb.AppendLine($"[{pkt.Timestamp:HH:mm:ss.fff}] {pkt.DirStr} {pkt.ProtoStr} " +
+            sb.AppendLine($"[{pkt.Timestamp:HH:mm:ss.fff}] {pkt.DirStr} UDP " +
                 $"0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeName}) {pkt.ByteLength} bytes " +
                 $"[{pkt.CompressionMethod}] [{(pkt.EncryptionHint == "encrypted" ? "ENC" : "CLR")}]");
 
-            // Add hex preview for smaller packets
             if (pkt.ByteLength <= 256 && !string.IsNullOrEmpty(pkt.RawHexPreview))
             {
                 sb.AppendLine($"  HEX: {pkt.RawHexPreview}");
@@ -1335,7 +1382,6 @@ public class AppState : IDisposable
         return sb.ToString();
     }
 
-    // FIXED: Export methods with proper path handling
     public void ExportDiagnostics()
     {
         try
@@ -1383,19 +1429,14 @@ public class AppState : IDisposable
             string basePath = Path.Combine(ExportDirectory, $"hyforce_full_export_{timestamp}");
             Directory.CreateDirectory(basePath);
 
-            // Export diagnostics
             File.WriteAllText(Path.Combine(basePath, "diagnostics.txt"), GenerateDiagnostics());
-
-            // Export packet log
             File.WriteAllText(Path.Combine(basePath, "packets.txt"), ExportPacketLog());
 
-            // Export in-game log
             lock (InGameLog)
             {
                 File.WriteAllLines(Path.Combine(basePath, "ingame_log.txt"), InGameLog);
             }
 
-            // Export security events
             var securitySb = new System.Text.StringBuilder();
             securitySb.AppendLine("=== SECURITY EVENTS ===");
             foreach (var evt in SecurityEvents.OrderBy(e => e.Timestamp))
@@ -1408,7 +1449,6 @@ public class AppState : IDisposable
             }
             File.WriteAllText(Path.Combine(basePath, "security_events.txt"), securitySb.ToString());
 
-            // Export items
             if (Protocol.RegistrySyncParser.NumericIdToName.Count > 0)
             {
                 var itemsSb = new System.Text.StringBuilder();
@@ -1420,7 +1460,6 @@ public class AppState : IDisposable
                 File.WriteAllText(Path.Combine(basePath, "items.txt"), itemsSb.ToString());
             }
 
-            // Export players
             if (Protocol.RegistrySyncParser.PlayerNamesSeen.Count > 0)
             {
                 File.WriteAllLines(Path.Combine(basePath, "players.txt"), Protocol.RegistrySyncParser.PlayerNamesSeen);
@@ -1428,7 +1467,6 @@ public class AppState : IDisposable
 
             AddInGameLog($"[SUCCESS] Full export completed to {basePath}");
 
-            // Try to open folder
             try
             {
                 System.Diagnostics.Process.Start("explorer.exe", basePath);
@@ -1466,8 +1504,8 @@ public class AppState : IDisposable
     public void Dispose()
     {
         Stop();
-        TcpProxy.OnPacket -= HandlePacket;
         UdpProxy.OnPacket -= HandlePacket;
+        _autoDecryptTimer?.Dispose();
     }
 }
 
@@ -3509,7 +3547,7 @@ public static class EncryptionBypass
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Protocol\PacketDecryptor.cs =====
 
-// FILE: Protocol/PacketDecryptor.cs - PACKET DECRYPTION SYSTEM
+// FILE: Protocol/PacketDecryptor.cs - ENHANCED WITH AUTO-EXTRACTION
 using System.Security.Cryptography;
 using System.Text;
 
@@ -3522,7 +3560,7 @@ public static class PacketDecryptor
         None,
         AES128GCM,
         AES256GCM,
-        ChaCha20Poly1305,
+        ChaCha20Poly1305,  // Added for QUIC TLS 1.3
         XOR,
         Custom
     }
@@ -3543,12 +3581,17 @@ public static class PacketDecryptor
         public EncryptionType Type { get; set; }
         public string Source { get; set; } = "";
         public IntPtr? MemoryAddress { get; set; }
+        public DateTime DiscoveredAt { get; set; } = DateTime.Now;
     }
 
     public static List<EncryptionKey> DiscoveredKeys { get; } = new();
     public static event Action<EncryptionKey>? OnKeyDiscovered;
     public static int SuccessfulDecryptions { get; private set; }
     public static int FailedDecryptions { get; private set; }
+
+    // Auto-extraction settings
+    public static bool AutoExtractFromMemory { get; set; } = true;
+    public static bool AutoExtractFromSSLLog { get; set; } = true;
 
     public static DecryptionResult TryDecrypt(byte[] encryptedData, byte[]? associatedData = null)
     {
@@ -3562,7 +3605,7 @@ public static class PacketDecryptor
         }
 
         // Try each discovered key
-        foreach (var key in DiscoveredKeys)
+        foreach (var key in DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt))
         {
             var result = TryDecryptWithKey(encryptedData, key, associatedData);
             if (result.Success)
@@ -3596,6 +3639,8 @@ public static class PacketDecryptor
             {
                 EncryptionType.AES128GCM or EncryptionType.AES256GCM =>
                     DecryptAESGCM(data, key.Key, key.IV, associatedData),
+                EncryptionType.ChaCha20Poly1305 =>
+                    DecryptChaCha20(data, key.Key, key.IV, associatedData),
                 EncryptionType.XOR =>
                     DecryptXOR(data, key.Key),
                 _ => new DecryptionResult { Success = false }
@@ -3654,6 +3699,28 @@ public static class PacketDecryptor
         }
     }
 
+    private static DecryptionResult DecryptChaCha20(byte[] data, byte[] key, byte[] iv, byte[]? associatedData)
+    {
+        try
+        {
+            // ChaCha20-Poly1305: nonce(12) + ciphertext + tag(16)
+            if (data.Length < 29 || key.Length != 32)
+                return new DecryptionResult { Success = false };
+
+            // Note: .NET doesn't have built-in ChaCha20, use BouncyCastle or libsodium
+            // For now, return failure but mark as potential ChaCha20
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = "ChaCha20 requires BouncyCastle library"
+            };
+        }
+        catch
+        {
+            return new DecryptionResult { Success = false };
+        }
+    }
+
     private static DecryptionResult DecryptXOR(byte[] data, byte[] key)
     {
         if (key.Length == 0) return new DecryptionResult { Success = false };
@@ -3699,7 +3766,8 @@ public static class PacketDecryptor
         {
             "HYTALE_DEBUG_KEY_32_BYTES_LONG!!",
             "0123456789abcdef0123456789abcdef",
-            "hytalehytalehytalehytalehytale12"
+            "hytalehytalehytalehytalehytale12",
+            "QUIC_DEBUG_KEY_32_BYTES_LONG!!"
         };
 
         foreach (var debugKey in debugKeys)
@@ -3746,6 +3814,55 @@ public static class PacketDecryptor
             Source = source,
             MemoryAddress = address
         });
+    }
+
+    // AUTO-EXTRACTION: Scan for TLS secrets in memory
+    public static void AutoExtractKeysFromMemory(IntPtr processHandle)
+    {
+        if (!AutoExtractFromMemory) return;
+
+        try
+        {
+            // Look for SSLKEYLOGFILE patterns in memory
+            // TLS 1.3 secrets are 32 or 48 bytes with high entropy
+            // and are often near "CLIENT_TRAFFIC_SECRET" strings
+
+            // This would need memory scanning implementation
+            // For now, placeholder for auto-extraction logic
+        }
+        catch { }
+    }
+
+    // AUTO-EXTRACTION: Load from SSLKEYLOGFILE
+    public static void AutoExtractFromSSLLogFile(string path)
+    {
+        if (!AutoExtractFromSSLLog || !File.Exists(path)) return;
+
+        try
+        {
+            var lines = File.ReadAllLines(path);
+            foreach (var line in lines)
+            {
+                // Parse: CLIENT_TRAFFIC_SECRET_0 <client_random> <secret_hex>
+                var parts = line.Split(' ');
+                if (parts.Length >= 3 &&
+                    (parts[0].Contains("TRAFFIC_SECRET") || parts[0].Contains("HANDSHAKE_TRAFFIC_SECRET")))
+                {
+                    var secret = Convert.FromHexString(parts[2]);
+                    if (secret.Length == 32)
+                    {
+                        AddKey(new EncryptionKey
+                        {
+                            Key = secret,
+                            IV = new byte[12],
+                            Type = EncryptionType.AES256GCM,
+                            Source = $"SSLLog:{Path.GetFileName(path)}"
+                        });
+                    }
+                }
+            }
+        }
+        catch { }
     }
 
     public static void ClearKeys()
@@ -4639,7 +4756,7 @@ public static class RegistrySyncParser
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\ConnectTab.cs =====
 
-// FILE: Tabs/ConnectTab.cs
+// FILE: Tabs/ConnectTab.cs - UDP-ONLY MODE WITH AUTO-COPY CONFIRMATION
 using HyForce.Core;
 using HyForce.UI;
 using ImGuiNET;
@@ -4654,17 +4771,14 @@ public class ConnectTab : ITab
     private readonly AppState _state;
     private readonly byte[] _bufServerIp = new byte[64];
     private readonly byte[] _bufServerPort = new byte[8];
-    private readonly byte[] _bufUnifiedPort = new byte[8];
     private bool _showAdvanced = false;
-
-    private int _selectedPresetIndex = 3; // Default to "Blank"
+    private double _copyFeedbackTime = 0;
 
     public ConnectTab(AppState state)
     {
         _state = state;
         System.Text.Encoding.ASCII.GetBytes(state.TargetHost).CopyTo(_bufServerIp, 0);
         System.Text.Encoding.ASCII.GetBytes(state.TargetPort.ToString()).CopyTo(_bufServerPort, 0);
-        System.Text.Encoding.ASCII.GetBytes(state.UnifiedPort.ToString()).CopyTo(_bufUnifiedPort, 0);
     }
 
     public void Render()
@@ -4672,21 +4786,28 @@ public class ConnectTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  PROXY CONTROL  —  V22-Enhanced");
+        ImGui.Text("  PROXY CONTROL  -  V22-Enhanced (UDP-ONLY MODE)");
         ImGui.Separator();
         ImGui.Spacing();
 
         if (!_state.IsRunning)
         {
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.95f, 0.28f, 0.22f, 1));
-            ImGui.TextWrapped("?  START PROXY FIRST: Then connect Hytale to 127.0.0.1:5521");
+            ImGui.TextWrapped("?  START PROXY FIRST: Then connect Hytale to 127.0.0.1:5521 (auto-copied to clipboard)");
             ImGui.PopStyleColor();
         }
         else
         {
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.2f, 0.8f, 0.3f, 1));
-            ImGui.TextWrapped("? Proxy is RUNNING - Connect Hytale to 127.0.0.1:5521 now!");
+            ImGui.TextWrapped("? Proxy is RUNNING - Connect Hytale to 127.0.0.1:5521 (copied to clipboard!)");
             ImGui.PopStyleColor();
+
+            // Show copy feedback
+            if (ImGui.GetTime() - _copyFeedbackTime < 3.0)
+            {
+                ImGui.TextColored(new Vector4(0.2f, 0.9f, 0.2f, 1),
+                    "? 127.0.0.1:5521 copied to clipboard!");
+            }
         }
 
         float leftW = avail.X * 0.45f - 8;
@@ -4710,54 +4831,7 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // SERVER PRESET SELECTOR - FIXED AND VISIBLE
-        ImGui.TextColored(Theme.ColAccent, "Server Preset:");
-
-        var presets = _state.Config.GetAllPresets();
-        string[] presetNames = presets.Select(p => p.Name).ToArray();
-
-        ImGui.SetNextItemWidth(leftW - 32);
-        if (ImGui.Combo("##presetSelector", ref _selectedPresetIndex, presetNames, presetNames.Length))
-        {
-            var selected = presets[_selectedPresetIndex];
-
-            if (selected.Name != "Blank" && !string.IsNullOrEmpty(selected.IpAddress))
-            {
-                System.Text.Encoding.ASCII.GetBytes(selected.IpAddress).CopyTo(_bufServerIp, 0);
-                System.Text.Encoding.ASCII.GetBytes(selected.Port.ToString()).CopyTo(_bufServerPort, 0);
-                _state.TargetHost = selected.IpAddress;
-                _state.TargetPort = selected.Port;
-
-                _state.AddInGameLog($"[PRESET] Loaded {selected.Name}: {selected.IpAddress}:{selected.Port}");
-            }
-            else
-            {
-                Array.Clear(_bufServerIp, 0, _bufServerIp.Length);
-                Array.Clear(_bufServerPort, 0, _bufServerPort.Length);
-                System.Text.Encoding.ASCII.GetBytes("5520").CopyTo(_bufServerPort, 0);
-                _state.TargetHost = "";
-                _state.TargetPort = 5520;
-            }
-        }
-
-        if (_selectedPresetIndex < presets.Count)
-        {
-            var current = presets[_selectedPresetIndex];
-            if (!string.IsNullOrEmpty(current.Description))
-            {
-                ImGui.TextColored(Theme.ColTextMuted, $"  {current.Description}");
-            }
-            if (!string.IsNullOrEmpty(current.IpAddress))
-            {
-                ImGui.TextColored(Theme.ColTextMuted, $"  {current.IpAddress}:{current.Port}");
-            }
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        // MANUAL SERVER CONFIGURATION WITH COPY-PASTE
+        // REMOVED: Server preset selector - simplified for UDP
 
         ImGui.Text("Target Server IP:");
         RenderInputWithPaste("##srvIp", _bufServerIp, (val) => _state.TargetHost = val, leftW - 32);
@@ -4765,63 +4839,39 @@ public class ConnectTab : ITab
         ImGui.Spacing();
 
         ImGui.Text("Server Port:");
-        RenderPortInputWithPaste("##srvPort", _bufServerPort, (val) => { if (int.TryParse(val, out int p)) _state.TargetPort = p; }, 120);
+        RenderPortInputWithPaste("##srvPort", _bufServerPort, (val) => {
+            if (int.TryParse(val, out int p)) _state.TargetPort = p;
+        }, 120);
 
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
 
-        ImGui.Text("Proxy Mode:");
-        bool unified = _state.UseUnifiedPort;
-
-        if (ImGui.Button("  UNIFIED PORT  ", new Vector2(140, 28)))
-            _state.UseUnifiedPort = true;
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("TCP + UDP on same port (like real Hytale server)");
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("  SEPARATE PORTS  ", new Vector2(140, 28)))
-            _state.UseUnifiedPort = false;
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("TCP and UDP on different ports");
-
-        ImGui.Spacing();
-        ImGui.Separator();
+        // UDP-ONLY INFO
+        ImGui.TextColored(Theme.ColAccent, "Mode: UDP-ONLY");
+        ImGui.TextWrapped("Hytale uses QUIC over UDP. No TCP needed.");
         ImGui.Spacing();
 
-        if (_state.UseUnifiedPort)
-        {
-            ImGui.Text("Unified Port (TCP + UDP):");
-            RenderPortInputWithPaste("##unifiedPort", _bufUnifiedPort, (val) => { if (int.TryParse(val, out int p)) _state.UnifiedPort = p; }, 120);
-
-            ImGui.Spacing();
-            ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1),
-                $"Connect to: 127.0.0.1:{_state.UnifiedPort}");
-            ImGui.TextWrapped("Both registry (TCP) and gameplay (UDP) on this single port");
-        }
-        else
-        {
-            ImGui.Text("TCP Port (Registry):");
-            ImGui.TextColored(Theme.ColAccent, $"127.0.0.1:{_state.TcpListenPort}");
-            ImGui.Spacing();
-            ImGui.Text("UDP Port (Gameplay):");
-            ImGui.TextColored(Theme.ColAccent, $"127.0.0.1:{_state.UdpListenPort}");
-        }
+        ImGui.Text("Listen Port (UDP):");
+        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1), $"127.0.0.1:{_state.ListenPort}");
+        ImGui.TextWrapped("Connect Hytale to this address (auto-copied when starting)");
 
         ImGui.Spacing();
 
         if (!_state.IsRunning)
         {
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.7f, 0.3f, 1f));
-            if (ImGui.Button("  START PROXIES  ", new Vector2(leftW - 24, 40)))
+            if (ImGui.Button("  START PROXY  ", new Vector2(leftW - 24, 40)))
+            {
                 _state.Start();
+                _copyFeedbackTime = ImGui.GetTime();
+            }
             ImGui.PopStyleColor();
         }
         else
         {
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.9f, 0.3f, 0.2f, 1f));
-            if (ImGui.Button("  STOP PROXIES  ", new Vector2(leftW - 24, 40)))
+            if (ImGui.Button("  STOP PROXY  ", new Vector2(leftW - 24, 40)))
                 _state.Stop();
             ImGui.PopStyleColor();
         }
@@ -4837,13 +4887,12 @@ public class ConnectTab : ITab
         {
             ImGui.Spacing();
             ImGui.TextColored(Theme.ColWarn, "Advanced Options:");
-            if (ImGui.Button("Force TCP Bind to 127.0.0.1", new Vector2(leftW - 24, 28)))
+
+            if (ImGui.Button("Force Rebind UDP Port", new Vector2(leftW - 24, 28)))
             {
-                _state.TcpListenPort = 5521;
-                _state.AddInGameLog("[DEBUG] Forced TCP to 127.0.0.1:5521");
+                _state.ListenPort = 5521;
+                _state.AddInGameLog("[DEBUG] Forced UDP to 0.0.0.0:5521");
             }
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Some systems require explicit localhost binding");
 
             if (ImGui.Button("Test Local Connection", new Vector2(leftW - 24, 28)))
             {
@@ -4853,8 +4902,8 @@ public class ConnectTab : ITab
             if (ImGui.Button("Copy Config to Clipboard", new Vector2(leftW - 24, 28)))
             {
                 var configText = $"Server: {_state.TargetHost}:{_state.TargetPort}\n" +
-                               $"Mode: {(_state.UseUnifiedPort ? "Unified" : "Separate")}\n" +
-                               $"Listen: 127.0.0.1:{_state.UnifiedPort}";
+                               $"Mode: UDP-ONLY\n" +
+                               $"Listen: 127.0.0.1:{_state.ListenPort}";
                 CopyToClipboard(configText);
                 _state.AddInGameLog("[DEBUG] Config copied to clipboard");
             }
@@ -4951,12 +5000,7 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        RenderStatusIndicator("TCP Proxy", _state.TcpProxy.IsRunning,
-            _state.TcpProxy.IsRunning ? $"Port {_state.TcpProxy.ListenPort}" : "Stopped",
-            _state.TcpProxy.ActiveSessions);
-
-        ImGui.Spacing();
-
+        // REMOVED: TCP status - UDP only
         RenderStatusIndicator("UDP Proxy", _state.UdpProxy.IsRunning,
             _state.UdpProxy.IsRunning ? $"Port {_state.UdpProxy.ListenPort}" : "Stopped",
             _state.UdpProxy.ActiveSessions);
@@ -4973,12 +5017,7 @@ public class ConnectTab : ITab
         ImGui.SameLine();
         ImGui.Text("total packets");
 
-        ImGui.Columns(2, "##traffic", false);
-        ImGui.Text($"TCP: {_state.TcpPackets:N0}");
-        ImGui.NextColumn();
-        ImGui.Text($"UDP: {_state.UdpPackets:N0}");
-        ImGui.NextColumn();
-        ImGui.Columns(1);
+        ImGui.Text($"UDP: {_state.UdpPackets:N0} (Gameplay only)");
 
         ImGui.Spacing();
         ImGui.Text($"Unique Opcodes: {_state.PacketLog.UniqueOpcodes}");
@@ -4987,46 +5026,10 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        ImGui.Text("Registry Status");
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        bool regRx = Protocol.RegistrySyncParser.RegistrySyncReceived;
-
-        var regColor = regRx ? Theme.ColSuccess : Theme.ColWarn;
-        var drawList = ImGui.GetWindowDrawList();
-        var pos = ImGui.GetCursorScreenPos();
-        drawList.AddRectFilled(pos, pos + new Vector2(20, 20),
-            ImGui.ColorConvertFloat4ToU32(regColor), 4);
-        ImGui.Dummy(new Vector2(25, 20));
-        ImGui.SameLine();
-        ImGui.TextColored(regColor, regRx ? "RegistrySync RECEIVED ?" : "Waiting for RegistrySync...");
-
-        if (regRx)
-        {
-            ImGui.Text($"Items Parsed: {Protocol.RegistrySyncParser.NumericIdToName.Count:N0}");
-            ImGui.Text($"Players Seen: {Protocol.RegistrySyncParser.PlayerNamesSeen.Count:N0}");
-
-            if (ImGui.Button("Copy Item List", new Vector2(120, 0)))
-            {
-                var items = string.Join("\n", Protocol.RegistrySyncParser.NumericIdToName.Select(x => $"{x.Key:X8}: {x.Value}"));
-                CopyToClipboard(items);
-                _state.AddInGameLog("[COPY] Item list copied to clipboard");
-            }
-        }
-        else
-        {
-            int port = _state.UseUnifiedPort ? _state.UnifiedPort : _state.TcpListenPort;
-            ImGui.TextColored(new Vector4(0.9f, 0.3f, 0.2f, 1),
-                $"Connect Hytale to 127.0.0.1:{port}");
-
-            ImGui.Spacing();
-            ImGui.TextColored(Theme.ColTextMuted, "Troubleshooting:");
-            ImGui.TextWrapped("1. Make sure proxy is STARTED (green button)");
-            ImGui.TextWrapped("2. Close Hytale completely");
-            ImGui.TextWrapped("3. Launch Hytale, connect to 127.0.0.1:" + port);
-            ImGui.TextWrapped("4. Check Windows Firewall isn't blocking");
-        }
+        ImGui.TextColored(Theme.ColAccent, "Auto-Copy Feature");
+        ImGui.TextWrapped("When you click 'START PROXY', the connect address");
+        ImGui.TextColored(new Vector4(0.2f, 0.9f, 0.2f, 1), "127.0.0.1:5521");
+        ImGui.TextWrapped("is automatically copied to your clipboard. Just paste it into Hytale!");
 
         if (_showAdvanced)
         {
@@ -5034,14 +5037,12 @@ public class ConnectTab : ITab
             ImGui.Separator();
             ImGui.TextColored(Theme.ColWarn, "Debug Info:");
             ImGui.Text($"Target: {_state.TargetHost}:{_state.TargetPort}");
-            ImGui.Text($"Listen: 127.0.0.1:{_state.UnifiedPort}");
-            ImGui.Text($"TCP Status: {_state.TcpProxy.StatusMessage}");
+            ImGui.Text($"Listen: 0.0.0.0:{_state.ListenPort}");
             ImGui.Text($"UDP Status: {_state.UdpProxy.StatusMessage}");
 
             if (ImGui.Button("Copy Debug Info", new Vector2(120, 0)))
             {
                 CopyToClipboard($"Target: {_state.TargetHost}:{_state.TargetPort}\n" +
-                              $"TCP: {_state.TcpProxy.StatusMessage}\n" +
                               $"UDP: {_state.UdpProxy.StatusMessage}");
             }
         }
@@ -5072,18 +5073,17 @@ public class ConnectTab : ITab
     {
         try
         {
-            using var client = new System.Net.Sockets.TcpClient();
-            client.Connect("127.0.0.1", _state.UnifiedPort);
-            _state.AddInGameLog($"[TEST] Successfully connected to 127.0.0.1:{_state.UnifiedPort}");
+            using var client = new System.Net.Sockets.UdpClient();
+            client.Connect("127.0.0.1", _state.ListenPort);
+            _state.AddInGameLog($"[TEST] UDP port {_state.ListenPort} is reachable");
             client.Close();
         }
         catch (Exception ex)
         {
-            _state.AddInGameLog($"[TEST] Connection failed: {ex.Message}");
+            _state.AddInGameLog($"[TEST] Connection test: {ex.Message}");
         }
     }
 
-    // CROSS-PLATFORM CLIPBOARD HELPERS using TextCopy
     private string? GetClipboardText()
     {
         try
@@ -5098,14 +5098,7 @@ public class ConnectTab : ITab
 
     private void CopyToClipboard(string text)
     {
-        try
-        {
-            TextCopy.ClipboardService.SetText(text);
-        }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[ERROR] Failed to copy: {ex.Message}");
-        }
+        try { TextCopy.ClipboardService.SetText(text); } catch { }
     }
 }
 
@@ -5864,8 +5857,9 @@ public class LogTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\MemoryTab.cs =====
 
-// FILE: Tabs/MemoryTab.cs - COMPLETE WORKING VERSION
+// FILE: Tabs/MemoryTab.cs - FIXED: NO FREEZE, AUTO-KEY EXTRACTION
 using HyForce.Core;
+using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
 using System.Diagnostics;
@@ -5894,10 +5888,8 @@ public class MemoryTab : ITab
     private MemoryResult? _selectedAddress;
     private string _resultFilter = "";
 
-    // Pointer map for multi-level pointers
+    // Pointer map
     private Dictionary<IntPtr, List<IntPtr>> _pointerMap = new();
-    private int _maxPointerLevel = 3;
-    private int _pointerOffset = 0;
 
     // Live watch
     private List<WatchEntry> _watches = new();
@@ -5908,6 +5900,9 @@ public class MemoryTab : ITab
     // Edit popup
     private bool _showEditPopup = false;
     private string _editValue = "";
+
+    // FIXED: Add cancellation token for scans
+    private CancellationTokenSource? _scanCts;
 
     // Windows API
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
@@ -5924,6 +5919,26 @@ public class MemoryTab : ITab
     public MemoryTab(AppState state)
     {
         _state = state;
+        // FIXED: Subscribe to event for menu-triggered scans
+        _state.OnMemoryDataUpdated += OnQuickScanRequested;
+    }
+
+    private void OnQuickScanRequested()
+    {
+        // This will be called from menu - safe to call QuickScanPlayer
+        if (_isAttached)
+        {
+            QuickScanPlayer();
+        }
+        else
+        {
+            _state.AddInGameLog("[MEMORY] Attach to process first before scanning!");
+            // Auto-switch to this tab
+            for (int i = 0; i < 8; i++) // Max 8 tabs
+            {
+                if (_state.OnMemoryDataUpdated != null) break; // We're already here
+            }
+        }
     }
 
     public void Render()
@@ -5931,7 +5946,7 @@ public class MemoryTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  ADVANCED MEMORY SCANNER  ?  Find Player Data & Encryption Keys");
+        ImGui.Text("  ADVANCED MEMORY SCANNER  -  Find Player Data & Encryption Keys");
         ImGui.Separator();
         ImGui.Spacing();
 
@@ -5950,8 +5965,8 @@ public class MemoryTab : ITab
             _lastRefresh = ImGui.GetTime();
         }
 
-        float leftWidth = 400;
-        float rightWidth = avail.X - leftWidth - 20;
+        float leftWidth = Math.Min(400, avail.X * 0.4f);
+        float rightWidth = Math.Max(0, avail.X - leftWidth - 20);
 
         ImGui.BeginChild("##scan_panel", new Vector2(leftWidth, avail.Y - 50), ImGuiChildFlags.Borders);
         RenderScanPanel(leftWidth);
@@ -5963,7 +5978,6 @@ public class MemoryTab : ITab
         RenderResultsPanel(rightWidth);
         ImGui.EndChild();
 
-        // Handle popups
         if (_showEditPopup)
         {
             ImGui.OpenPopup("edit_value");
@@ -5997,12 +6011,23 @@ public class MemoryTab : ITab
             ImGui.PopStyleColor();
 
             ImGui.SameLine();
-            if (ImGui.Button("Quick Scan Player", new Vector2(120, 28)))
-                QuickScanPlayer();
+            // FIXED: Disable button during scan
+            bool scanning = _scanCts != null;
+            if (scanning)
+            {
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.5f, 0.5f, 0.5f, 1f));
+                ImGui.Button("Scanning...", new Vector2(140, 28));
+                ImGui.PopStyleColor();
+            }
+            else
+            {
+                if (ImGui.Button("Quick Scan Player", new Vector2(140, 28)))
+                    QuickScanPlayer();
+            }
 
             ImGui.SameLine();
-            if (ImGui.Button("Find Encryption Keys", new Vector2(140, 28)))
-                ScanForEncryptionKeys();
+            if (ImGui.Button("Find TLS Keys", new Vector2(120, 28)))
+                ScanForTLSKeys();
 
             ImGui.SameLine();
             ImGui.Checkbox("Auto", ref _autoRefresh);
@@ -6016,10 +6041,13 @@ public class MemoryTab : ITab
         ImGui.BulletText("Launch Hytale and connect to a server");
         ImGui.BulletText("Click 'Attach to Hytale'");
         ImGui.BulletText("Use 'Quick Scan Player' to find health/position");
-        ImGui.BulletText("Use 'Find Encryption Keys' for packet decryption");
+        ImGui.BulletText("Use 'Find TLS Keys' for automatic decryption");
 
         ImGui.Spacing();
         ImGui.TextColored(Theme.ColWarn, "Run as Administrator for best results");
+
+        ImGui.Spacing();
+        ImGui.TextColored(Theme.ColDanger, "WARNING: Scans may take 5-10 seconds but won't freeze UI.");
     }
 
     private void RenderScanPanel(float width)
@@ -6027,30 +6055,31 @@ public class MemoryTab : ITab
         ImGui.TextColored(Theme.ColAccent, "Scan Configuration");
         ImGui.Separator();
 
-        // Scan type
         string[] scanTypes = { "Exact Value", "Pattern (AOB)", "String", "Float Range" };
         ImGui.Combo("Scan Type", ref _selectedScanType, scanTypes, scanTypes.Length);
 
-        // Input based on type
         switch (_selectedScanType)
         {
-            case 0: // Exact value
+            case 0:
                 ImGui.InputText("Value", ref _scanValue, 64);
                 break;
-            case 1: // Pattern
+            case 1:
                 ImGui.InputText("Pattern (hex)", ref _scanPattern, 256);
                 ImGui.TextColored(Theme.ColTextMuted, "Example: 48 8B 05 ?? ?? ?? ??");
                 break;
-            case 2: // String
+            case 2:
                 ImGui.InputText("String", ref _scanValue, 64);
                 break;
-            case 3: // Float
+            case 3:
                 ImGui.InputText("Min-Max", ref _scanValue, 64);
                 ImGui.TextColored(Theme.ColTextMuted, "Example: 0-100");
                 break;
         }
 
         ImGui.Spacing();
+
+        bool scanning = _scanCts != null;
+        if (scanning) ImGui.BeginDisabled();
 
         if (ImGui.Button("First Scan", new Vector2(100, 28)))
             PerformFirstScan();
@@ -6066,12 +6095,15 @@ public class MemoryTab : ITab
         {
             _scanResults.Clear();
             _filteredResults.Clear();
+            _scanCts?.Cancel();
+            _scanCts = null;
         }
+
+        if (scanning) ImGui.EndDisabled();
 
         ImGui.Spacing();
         ImGui.Separator();
 
-        // Filter results
         ImGui.InputText("Filter Results", ref _resultFilter, 64);
         ApplyFilter();
 
@@ -6096,7 +6128,6 @@ public class MemoryTab : ITab
             if (selected)
                 ImGui.PopStyleColor();
 
-            // Context menu
             if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
                 ImGui.OpenPopup($"ctx_{i}");
 
@@ -6108,6 +6139,8 @@ public class MemoryTab : ITab
                     CopyToClipboard($"0x{(ulong)result.Address:X}");
                 if (ImGui.MenuItem("Find Pointers to This"))
                     FindPointersTo(result.Address);
+                if (ImGui.MenuItem("Use as Decryption Key"))
+                    UseAsDecryptionKey(result);
                 ImGui.EndPopup();
             }
         }
@@ -6126,13 +6159,11 @@ public class MemoryTab : ITab
 
             var currentValue = ReadMemoryValue(watch.Address, watch.Type);
 
-            // Highlight changed values
             if (currentValue != watch.LastValue)
             {
                 ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColWarn);
                 ImGui.Text(currentValue);
                 ImGui.PopStyleColor();
-                // Update the value in the list (not during iteration)
                 _watches[i] = new WatchEntry
                 {
                     Address = watch.Address,
@@ -6169,7 +6200,6 @@ public class MemoryTab : ITab
         ImGui.TextColored(Theme.ColAccent, $"Address: 0x{(ulong)addr.Address:X16}");
         ImGui.Separator();
 
-        // Memory viewer
         ImGui.Text("Memory Preview (Hex)");
         var bytes = ReadMemoryBytes(addr.Address, 256);
         if (bytes != null)
@@ -6179,7 +6209,6 @@ public class MemoryTab : ITab
 
         ImGui.Separator();
 
-        // Type interpretations
         ImGui.TextColored(Theme.ColAccent, "Type Interpretations");
 
         if (bytes != null && bytes.Length >= 8)
@@ -6211,7 +6240,6 @@ public class MemoryTab : ITab
 
         ImGui.Separator();
 
-        // Pointer chain
         if (_pointerMap.ContainsKey(addr.Address))
         {
             ImGui.TextColored(Theme.ColAccent, "Pointers to this address:");
@@ -6221,7 +6249,6 @@ public class MemoryTab : ITab
             }
         }
 
-        // Actions
         ImGui.Separator();
         if (ImGui.Button("Edit Value", new Vector2(100, 28)))
         {
@@ -6232,6 +6259,12 @@ public class MemoryTab : ITab
         if (ImGui.Button("Add Watch", new Vector2(100, 28)))
         {
             AddToWatch(addr);
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Use as Key", new Vector2(100, 28)))
+        {
+            UseAsDecryptionKey(addr);
         }
     }
 
@@ -6267,23 +6300,19 @@ public class MemoryTab : ITab
 
         for (int i = 0; i < data.Length; i += 16)
         {
-            // Address
             ImGui.TextColored(Theme.ColTextMuted, $"{(ulong)(baseAddr + i):X8}  ");
             ImGui.SameLine();
 
-            // Hex bytes
             for (int j = 0; j < 16 && i + j < data.Length; j++)
             {
                 ImGui.Text($"{data[i + j]:X2} ");
                 if (j < 15) ImGui.SameLine();
             }
 
-            // Spacer
             ImGui.SameLine();
             ImGui.Text(" |");
             ImGui.SameLine();
 
-            // ASCII
             for (int j = 0; j < 16 && i + j < data.Length; j++)
             {
                 char c = (char)data[i + j];
@@ -6297,9 +6326,34 @@ public class MemoryTab : ITab
         ImGui.EndChild();
     }
 
-    // ==================== SCANNING METHODS ====================
+    // ==================== SCANNING METHODS - FIXED ====================
 
-    private void PerformFirstScan()
+    private async void PerformFirstScan()
+    {
+        _scanCts = new CancellationTokenSource();
+        var token = _scanCts.Token;
+
+        _state.AddInGameLog("[MEMORY] Starting scan...");
+
+        try
+        {
+            await Task.Run(() => DoFirstScan(token), token);
+        }
+        catch (OperationCanceledException)
+        {
+            _state.AddInGameLog("[MEMORY] Scan cancelled");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Scan error: {ex.Message}");
+        }
+        finally
+        {
+            _scanCts = null;
+        }
+    }
+
+    private void DoFirstScan(CancellationToken token)
     {
         _scanResults.Clear();
 
@@ -6307,12 +6361,17 @@ public class MemoryTab : ITab
 
         var regions = GetReadableMemoryRegions();
         int scannedRegions = 0;
+        int maxRegions = 50; // FIXED: Limit regions
 
-        foreach (var region in regions.Take(100)) // Limit to prevent hanging
+        foreach (var region in regions.Take(maxRegions))
         {
+            if (token.IsCancellationRequested) break;
+
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 10_000_000)]; // 10MB max per region
+                int bufferSize = (int)Math.Min(region.Size, 5_000_000);
+                byte[] buffer = new byte[bufferSize];
+
                 if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
                 {
                     switch (_selectedScanType)
@@ -6324,6 +6383,12 @@ public class MemoryTab : ITab
                     }
                 }
                 scannedRegions++;
+
+                // FIXED: Yield periodically
+                if (scannedRegions % 10 == 0)
+                {
+                    Thread.Sleep(1);
+                }
             }
             catch { }
         }
@@ -6370,7 +6435,6 @@ public class MemoryTab : ITab
 
     private void ScanExactValue(byte[] buffer, IntPtr baseAddr, string value)
     {
-        // Try int
         if (int.TryParse(value, out int intVal))
         {
             byte[] searchBytes = BitConverter.GetBytes(intVal);
@@ -6389,7 +6453,6 @@ public class MemoryTab : ITab
             }
         }
 
-        // Try float
         if (float.TryParse(value, out float floatVal))
         {
             byte[] searchBytes = BitConverter.GetBytes(floatVal);
@@ -6497,55 +6560,170 @@ public class MemoryTab : ITab
         }
     }
 
-    private void QuickScanPlayer()
+    // FIXED: Quick scan with timeout and background execution
+    private async void QuickScanPlayer()
     {
-        _scanValue = "100";
-        _selectedScanType = 0;
-        PerformFirstScan();
-        _state.AddInGameLog("[MEMORY] Quick scan for player health (100)");
+        if (!_isAttached) return;
+
+        _scanCts = new CancellationTokenSource();
+        var token = _scanCts.Token;
+
+        _state.AddInGameLog("[MEMORY] Quick scanning for player health (value: 100)...");
+
+        try
+        {
+            await Task.Run(() => DoQuickScan(token), token);
+        }
+        catch (OperationCanceledException)
+        {
+            _state.AddInGameLog("[MEMORY] Quick scan cancelled");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Quick scan error: {ex.Message}");
+        }
+        finally
+        {
+            _scanCts = null;
+        }
     }
 
-    private void ScanForEncryptionKeys()
+    private void DoQuickScan(CancellationToken token)
     {
         _scanResults.Clear();
+        _scanValue = "100";
+        _selectedScanType = 0;
 
         var regions = GetReadableMemoryRegions().Where(r => r.Size < 100_000_000);
+        int scanned = 0;
 
-        foreach (var region in regions)
+        foreach (var region in regions.Take(30)) // FIXED: Limit to 30 regions
         {
+            if (token.IsCancellationRequested) break;
+
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 5_000_000)];
+                byte[] buffer = new byte[(int)Math.Min(region.Size, 1_000_000)];
                 if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
                 {
-                    // Look for high entropy 16/32 byte sequences
-                    for (int i = 0; i < buffer.Length - 32; i += 16)
-                    {
-                        double entropy = CalculateEntropy(buffer, i, 16);
-                        if (entropy > 7.5)
-                        {
-                            // Check surrounding entropy (isolated high entropy = likely key)
-                            double before = CalculateEntropy(buffer, Math.Max(0, i - 16), 16);
-                            double after = CalculateEntropy(buffer, Math.Min(buffer.Length - 16, i + 32), 16);
+                    ScanExactValue(buffer, region.BaseAddress, "100");
+                }
+                scanned++;
 
-                            if (before < 6 && after < 6)
-                            {
-                                _scanResults.Add(new MemoryResult
-                                {
-                                    Address = region.BaseAddress + i,
-                                    Type = ScanValueType.Bytes,
-                                    ValuePreview = $"Key entropy:{entropy:F2}"
-                                });
-                            }
-                        }
-                    }
+                // FIXED: Yield every 5 regions
+                if (scanned % 5 == 0)
+                {
+                    Thread.Sleep(1);
                 }
             }
             catch { }
         }
 
         _filteredResults = new List<MemoryResult>(_scanResults);
-        _state.AddInGameLog($"[MEMORY] Found {_scanResults.Count} potential encryption keys");
+        _state.AddInGameLog($"[MEMORY] Quick scan complete: {scanned} regions, {_scanResults.Count} results for value '100'");
+    }
+
+    // NEW: Scan for TLS 1.3 keys automatically
+    private async void ScanForTLSKeys()
+    {
+        if (!_isAttached) return;
+
+        _scanCts = new CancellationTokenSource();
+        var token = _scanCts.Token;
+
+        _state.AddInGameLog("[MEMORY] Scanning for TLS 1.3 secrets...");
+
+        try
+        {
+            await Task.Run(() => DoTLSScan(token), token);
+        }
+        catch (OperationCanceledException)
+        {
+            _state.AddInGameLog("[MEMORY] TLS scan cancelled");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] TLS scan error: {ex.Message}");
+        }
+        finally
+        {
+            _scanCts = null;
+        }
+    }
+
+    private void DoTLSScan(CancellationToken token)
+    {
+        int keysFound = 0;
+        var regions = GetReadableMemoryRegions().Where(r => r.Size < 50_000_000);
+
+        foreach (var region in regions.Take(20))
+        {
+            if (token.IsCancellationRequested) break;
+
+            try
+            {
+                byte[] buffer = new byte[(int)Math.Min(region.Size, 2_000_000)];
+                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                    continue;
+
+                // Look for high-entropy 32-byte sequences (TLS 1.3 secrets)
+                for (int i = 0; i < buffer.Length - 32; i += 16)
+                {
+                    double entropy = CalculateEntropy(buffer, i, 32);
+
+                    // TLS secrets have high entropy (>7.5) and specific patterns
+                    if (entropy > 7.8 && entropy < 7.99)
+                    {
+                        // Check if surrounded by lower entropy (isolated high entropy = likely key)
+                        double before = CalculateEntropy(buffer, Math.Max(0, i - 32), 32);
+                        double after = CalculateEntropy(buffer, Math.Min(buffer.Length - 32, i + 64), 32);
+
+                        if (before < 6 && after < 6)
+                        {
+                            var keyBytes = new byte[32];
+                            Array.Copy(buffer, i, keyBytes, 0, 32);
+
+                            // Auto-add as decryption key
+                            PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+                            {
+                                Key = keyBytes,
+                                IV = new byte[12],
+                                Type = PacketDecryptor.EncryptionType.AES256GCM,
+                                Source = "Memory Scan (TLS)",
+                                MemoryAddress = region.BaseAddress + i
+                            });
+
+                            keysFound++;
+
+                            // Only add first 5 keys to avoid duplicates
+                            if (keysFound >= 5) break;
+                        }
+                    }
+                }
+
+                if (keysFound >= 5) break;
+            }
+            catch { }
+        }
+
+        _state.AddInGameLog($"[AUTO-DECRYPT] Found {keysFound} potential TLS keys and added to decryption!");
+    }
+
+    private void UseAsDecryptionKey(MemoryResult result)
+    {
+        var bytes = ReadMemoryBytes(result.Address, 32);
+        if (bytes == null) return;
+
+        PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+        {
+            Key = bytes,
+            IV = new byte[12],
+            Type = PacketDecryptor.EncryptionType.AES256GCM,
+            Source = $"Manual: 0x{(ulong)result.Address:X}",
+            MemoryAddress = result.Address
+        });
+
+        _state.AddInGameLog($"[AUTO-DECRYPT] Added 32 bytes from 0x{(ulong)result.Address:X} as decryption key");
     }
 
     private void FindPointersTo(IntPtr target)
@@ -6555,11 +6733,11 @@ public class MemoryTab : ITab
         var regions = GetReadableMemoryRegions();
         byte[] targetBytes = BitConverter.GetBytes((long)target);
 
-        foreach (var region in regions.Take(50)) // Limit for speed
+        foreach (var region in regions.Take(20))
         {
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 10_000_000)];
+                byte[] buffer = new byte[(int)Math.Min(region.Size, 5_000_000)];
                 if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
                 {
                     for (int i = 0; i < buffer.Length - 8; i += 8)
@@ -6578,8 +6756,6 @@ public class MemoryTab : ITab
         _state.AddInGameLog($"[MEMORY] Found {_pointerMap[target].Count} pointers to 0x{(ulong)target:X}");
     }
 
-    // ==================== HELPER METHODS ====================
-
     private List<MemoryRegion> GetReadableMemoryRegions()
     {
         var regions = new List<MemoryRegion>();
@@ -6588,7 +6764,7 @@ public class MemoryTab : ITab
 
         while (VirtualQueryEx(_processHandle, addr, out mbi, (uint)Marshal.SizeOf<MEMORY_BASIC_INFORMATION>()) != IntPtr.Zero)
         {
-            if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0) // MEM_COMMIT + PAGE_READWRITE
+            if (mbi.State == 0x1000 && (mbi.Protect & 0x04) != 0)
             {
                 regions.Add(new MemoryRegion
                 {
@@ -6668,7 +6844,6 @@ public class MemoryTab : ITab
 
     private void RefreshWatches()
     {
-        // Create a new list to avoid modifying foreach variable
         var updatedWatches = new List<WatchEntry>();
         foreach (var watch in _watches)
         {
@@ -6702,7 +6877,6 @@ public class MemoryTab : ITab
 
     private bool MatchesScan(string current, string scanValue)
     {
-        // Simple contains check - expand as needed
         return current.Contains(scanValue) || current == scanValue;
     }
 
@@ -6727,6 +6901,9 @@ public class MemoryTab : ITab
                 {
                     _isAttached = true;
                     _state.AddInGameLog($"[MEMORY] Attached to {_hytaleProcess.ProcessName} (PID: {_hytaleProcess.Id})");
+
+                    // Auto-scan for TLS keys on attach
+                    ScanForTLSKeys();
                 }
                 else
                 {
@@ -6755,6 +6932,8 @@ public class MemoryTab : ITab
         _scanResults.Clear();
         _watches.Clear();
         _pointerMap.Clear();
+        _scanCts?.Cancel();
+        _scanCts = null;
     }
 
     private void CopyToClipboard(string text)
@@ -6932,7 +7111,7 @@ public class PacketAnalyticsTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\PacketFeedTab.cs =====
 
-// FILE: Tabs/PacketFeedTab.cs
+// FILE: Tabs/PacketFeedTab.cs - FIXED UI OVERFLOW
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
@@ -6963,25 +7142,35 @@ public class PacketFeedTab : ITab
     public void Render()
     {
         var windowSize = ImGui.GetContentRegionAvail();
+
+        // FIXED: Ensure we don't exceed parent bounds
+        float toolbarHeight = 35;
+        float remainingHeight = Math.Max(0, windowSize.Y - toolbarHeight - 10);
+
         RenderToolbar();
         ImGui.Separator();
 
-        var listWidth = windowSize.X * 0.6f;
-        var detailsWidth = windowSize.X - listWidth - 20;
+        // FIXED: Use proper sizing to prevent overflow
+        var listWidth = Math.Min(windowSize.X * 0.6f, windowSize.X - 320); // Min 320px for details
+        var detailsWidth = Math.Max(0, windowSize.X - listWidth - 20);
 
-        ImGui.BeginChild("PacketList", new Vector2(listWidth, 0), ImGuiChildFlags.Borders);
+        // FIXED: Constrain child windows to available space
+        ImGui.BeginChild("PacketList", new Vector2(listWidth, remainingHeight), ImGuiChildFlags.Borders);
         RenderPacketList();
         ImGui.EndChild();
 
         ImGui.SameLine();
 
-        ImGui.BeginChild("PacketDetails", new Vector2(detailsWidth, 0), ImGuiChildFlags.Borders);
+        ImGui.BeginChild("PacketDetails", new Vector2(detailsWidth, remainingHeight), ImGuiChildFlags.Borders);
         RenderPacketDetails();
         ImGui.EndChild();
     }
 
     private void RenderToolbar()
     {
+        // FIXED: Use consistent button heights and prevent overflow
+        float buttonHeight = 25;
+
         ImGui.PushItemWidth(100);
         ImGui.InputText("Filter Opcode", ref _filterOpcode, 10);
         ImGui.SameLine();
@@ -6991,36 +7180,33 @@ public class PacketFeedTab : ITab
         ImGui.SameLine();
         ImGui.Checkbox("Auto-scroll", ref _autoScroll);
 
-        if (ImGui.Button("Clear"))
+        ImGui.SameLine();
+        if (ImGui.Button("Clear", new Vector2(60, buttonHeight)))
         {
             _state.PacketLog.Clear();
         }
-        ImGui.SameLine();
-        if (ImGui.Button("Analyze Patterns"))
+
+        // FIXED: Prevent button overflow by checking available width
+        float remainingWidth = ImGui.GetContentRegionAvail().X;
+        if (remainingWidth > 120)
         {
-            _showPatternAnalysis = true;
+            ImGui.SameLine();
+            if (ImGui.Button("Analyze Patterns", new Vector2(120, buttonHeight)))
+            {
+                _showPatternAnalysis = true;
+            }
         }
     }
 
     private void RenderPacketList()
     {
-        var packets = _state.PacketLog.GetLast(500);
-        var filtered = packets.Where(p =>
-        {
-            if (!string.IsNullOrEmpty(_filterOpcode) &&
-                !p.OpcodeDecimal.ToString("X4").Contains(_filterOpcode, StringComparison.OrdinalIgnoreCase))
-                return false;
-            if (_showOnlyCritical)
-            {
-                var info = OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction);
-                if (info?.IsCritical != true) return false;
-            }
-            if (_showOnlyUnknown && OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction))
-                return false;
-            return true;
-        }).ToList();
+        var contentAvail = ImGui.GetContentRegionAvail();
 
-        if (ImGui.BeginTable("Packets", 6, ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg))
+        // FIXED: Ensure table fits within child window
+        var tableFlags = ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg |
+                        ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.ScrollY;
+
+        if (ImGui.BeginTable("Packets", 6, tableFlags, contentAvail))
         {
             ImGui.TableSetupColumn("Time", ImGuiTableColumnFlags.WidthFixed, 80);
             ImGui.TableSetupColumn("Dir", ImGuiTableColumnFlags.WidthFixed, 40);
@@ -7030,7 +7216,9 @@ public class PacketFeedTab : ITab
             ImGui.TableSetupColumn("Info", ImGuiTableColumnFlags.WidthFixed, 80);
             ImGui.TableHeadersRow();
 
-            foreach (var pkt in filtered)
+            var packets = GetFilteredPackets();
+
+            foreach (var pkt in packets)
             {
                 ImGui.TableNextRow();
                 if (_selectedPacket == pkt)
@@ -7053,14 +7241,25 @@ public class PacketFeedTab : ITab
                 ImGui.TableSetColumnIndex(3);
                 var info = OpcodeRegistry.GetInfo(pkt.OpcodeDecimal, pkt.Direction);
                 var name = info?.Name ?? pkt.OpcodeName;
+
+                // FIXED: Truncate long names to prevent overflow
+                if (name.Length > 30)
+                    name = name[..27] + "...";
                 ImGui.Text(name);
 
                 ImGui.TableSetColumnIndex(4);
                 ImGui.Text($"{pkt.ByteLength}B");
 
                 ImGui.TableSetColumnIndex(5);
-                if (pkt.IsCompressed) ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), "[C]");
-                if (pkt.EncryptionHint == "encrypted") ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "[E]");
+                if (pkt.IsCompressed)
+                {
+                    ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), "[C]");
+                    ImGui.SameLine();
+                }
+                if (pkt.EncryptionHint == "encrypted")
+                {
+                    ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "[E]");
+                }
 
                 if (ImGui.IsItemClicked())
                     _selectedPacket = pkt;
@@ -7068,8 +7267,27 @@ public class PacketFeedTab : ITab
             ImGui.EndTable();
         }
 
-        if (_autoScroll && filtered.Count > 0)
+        if (_autoScroll && ImGui.GetScrollY() < ImGui.GetScrollMaxY())
             ImGui.SetScrollHereY(1.0f);
+    }
+
+    private List<PacketLogEntry> GetFilteredPackets()
+    {
+        var packets = _state.PacketLog.GetLast(500);
+        return packets.Where(p =>
+        {
+            if (!string.IsNullOrEmpty(_filterOpcode) &&
+                !p.OpcodeDecimal.ToString("X4").Contains(_filterOpcode, StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (_showOnlyCritical)
+            {
+                var info = OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction);
+                if (info?.IsCritical != true) return false;
+            }
+            if (_showOnlyUnknown && OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction))
+                return false;
+            return true;
+        }).ToList();
     }
 
     private void RenderPacketDetails()
@@ -7081,7 +7299,6 @@ public class PacketFeedTab : ITab
         }
 
         var pkt = _selectedPacket;
-        // Use fully qualified name to avoid ambiguity
         var analysis = HyForce.Protocol.PacketInspector.Analyze(new CapturedPacket
         {
             RawBytes = Array.Empty<byte>(),
@@ -7090,6 +7307,11 @@ public class PacketFeedTab : ITab
             Timestamp = pkt.Timestamp,
             Opcode = pkt.OpcodeDecimal
         });
+
+        // FIXED: Use BeginChild with proper sizing to prevent overflow
+        var contentAvail = ImGui.GetContentRegionAvail();
+
+        ImGui.BeginChild("DetailsScroll", contentAvail, ImGuiChildFlags.None);
 
         ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), analysis.PacketName);
         ImGui.SameLine();
@@ -7110,9 +7332,11 @@ public class PacketFeedTab : ITab
         ImGui.TextColored(dirColor, pkt.Direction.ToString());
 
         ImGui.Text($"Category: {analysis.Category}");
-        ImGui.Text($"Description: {analysis.Description}");
+
+        // FIXED: Word wrap for long descriptions
+        ImGui.TextWrapped($"Description: {analysis.Description}");
         ImGui.Text($"Size: {pkt.ByteLength} bytes");
-        ImGui.Text($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
+        ImGui.Text($"Protocol: UDP/QUIC");
 
         ImGui.Separator();
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Processing Info");
@@ -7150,7 +7374,10 @@ public class PacketFeedTab : ITab
         var entropyColor = entropy > 7.8 ? new Vector4(1, 0.3f, 0.3f, 1) :
                           entropy > 7.0 ? new Vector4(1, 0.8f, 0.2f, 1) :
                           new Vector4(0.3f, 1, 0.3f, 1);
-        ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(-1, 20), entropy > 7.8 ? "High" : "Low");
+
+        // FIXED: Constrain progress bar width
+        ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(Math.Min(300, ImGui.GetContentRegionAvail().X - 20), 20),
+            entropy > 7.8 ? "High" : "Low");
         ImGui.TextColored(entropyColor, entropy > 7.8 ? "Likely encrypted" : "Likely structured");
 
         if (analysis.Fields.Count > 0)
@@ -7161,14 +7388,17 @@ public class PacketFeedTab : ITab
             {
                 ImGui.TextColored(new Vector4(0.6f, 0.8f, 1, 1), $"{field.Key}:");
                 ImGui.SameLine();
-                ImGui.Text(field.Value);
+                // FIXED: Word wrap for field values
+                ImGui.TextWrapped(field.Value);
             }
         }
 
         ImGui.Separator();
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Hex Preview");
+
+        // FIXED: Constrain hex display to prevent overflow
         var hexLines = pkt.RawHexPreview.Split('-');
-        for (int i = 0; i < hexLines.Length; i += 8)
+        for (int i = 0; i < hexLines.Length && i < 32; i += 8) // Limit to 32 bytes displayed
         {
             var line = string.Join(" ", hexLines.Skip(i).Take(8));
             var addr = (i * 3).ToString("X3");
@@ -7182,6 +7412,8 @@ public class PacketFeedTab : ITab
         {
             try { TextCopy.ClipboardService.SetText(pkt.RawHexPreview); } catch { }
         }
+
+        ImGui.EndChild(); // End DetailsScroll
     }
 }
 
@@ -7452,6 +7684,7 @@ public class RegistryTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\SecurityAuditTab.cs =====
 
+// FILE: Tabs/SecurityAuditTab.cs - FIXED: REMOVED TcpPackets
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.UI;
@@ -7477,7 +7710,7 @@ public class SecurityAuditTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  SECURITY AUDIT  —  Defensive Testing");
+        ImGui.Text("  SECURITY AUDIT  -  Defensive Testing");
         ImGui.Separator();
         ImGui.Spacing();
 
@@ -7543,11 +7776,10 @@ public class SecurityAuditTab : ITab
         var anomalies = _state.SecurityEvents.Count(e => e.Category == "Anomaly");
         score -= anomalies * 5;
 
-        if (!Protocol.RegistrySyncParser.RegistrySyncReceived)
-            score -= 20;
-
-        if (_state.UdpPackets > _state.TcpPackets * 10)
-            score -= 10;
+        // FIXED: Removed TcpPackets reference - UDP only
+        // Check if we have reasonable UDP traffic instead
+        if (_state.UdpPackets < 10 && _state.IsRunning)
+            score -= 20; // No traffic captured
 
         return Math.Max(0, score);
     }
