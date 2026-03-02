@@ -295,7 +295,7 @@ public class HyForceApp
 
     private void RenderAboutWindow()
     {
-        ImGui.SetNextWindowSize(new Vector2(400, 300), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new Vector2(450, 400), ImGuiCond.FirstUseEver);
         ImGui.SetNextWindowPos(ImGui.GetIO().DisplaySize * 0.5f, ImGuiCond.FirstUseEver, new Vector2(0.5f, 0.5f));
 
         bool showWindow = _state.ShowAboutWindow;
@@ -331,17 +331,51 @@ public class HyForceApp
 
             ImGui.TextWrapped("HyForce is a network security analysis tool for Hytale. " +
                 "It captures and analyzes UDP (QUIC gameplay) traffic " +
-                "to help identify security vulnerabilities and understand game protocol behavior. " +
-                "Hytale uses UDP/QUIC only - no TCP required!");
+                "to help identify security vulnerabilities and understand game protocol behavior.");
 
             ImGui.Spacing();
             ImGui.Separator();
             ImGui.Spacing();
 
+            // ENHANCED: Better decryption status display
             ImGui.TextColored(Theme.ColAccent, "Decryption Status:");
-            ImGui.Text($"Keys Available: {PacketDecryptor.DiscoveredKeys.Count}");
-            ImGui.Text($"Packets Decrypted: {PacketDecryptor.SuccessfulDecryptions}");
-            ImGui.Text($"Packets Failed: {PacketDecryptor.FailedDecryptions}");
+
+            var status = _state.GetKeyStatus();
+
+            // Key count with color
+            var keyColor = status.TotalKeys > 0 ? Theme.ColSuccess : Theme.ColWarn;
+            ImGui.Text("Keys Available: ");
+            ImGui.SameLine();
+            ImGui.TextColored(keyColor, status.TotalKeys.ToString());
+
+            if (status.TotalKeys > 0)
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(Theme.ColTextMuted, $"(from {status.KeySources.Count} sources)");
+            }
+
+            ImGui.Text($"Packets Decrypted: {status.SuccessfulDecryptions}");
+            ImGui.Text($"Packets Failed: {status.FailedDecryptions}");
+
+            // Show last key added time
+            if (status.LastKeyAdded.HasValue)
+            {
+                var timeAgo = DateTime.Now - status.LastKeyAdded.Value;
+                string timeStr = timeAgo.TotalMinutes < 1 ? "just now" :
+                    $"{timeAgo.TotalMinutes:F0}m ago";
+                ImGui.TextColored(Theme.ColTextMuted, $"Last key added: {timeStr}");
+            }
+
+            // Show key sources
+            if (status.KeySources.Any())
+            {
+                ImGui.Spacing();
+                ImGui.TextColored(Theme.ColTextMuted, "Key Sources:");
+                foreach (var source in status.KeySources.Take(3))
+                {
+                    ImGui.TextColored(Theme.ColTextMuted, $"  - {source}");
+                }
+            }
 
             ImGui.Spacing();
             ImGui.Separator();

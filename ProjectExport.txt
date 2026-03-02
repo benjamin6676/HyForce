@@ -297,7 +297,7 @@ public class HyForceApp
 
     private void RenderAboutWindow()
     {
-        ImGui.SetNextWindowSize(new Vector2(400, 300), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new Vector2(450, 400), ImGuiCond.FirstUseEver);
         ImGui.SetNextWindowPos(ImGui.GetIO().DisplaySize * 0.5f, ImGuiCond.FirstUseEver, new Vector2(0.5f, 0.5f));
 
         bool showWindow = _state.ShowAboutWindow;
@@ -333,17 +333,51 @@ public class HyForceApp
 
             ImGui.TextWrapped("HyForce is a network security analysis tool for Hytale. " +
                 "It captures and analyzes UDP (QUIC gameplay) traffic " +
-                "to help identify security vulnerabilities and understand game protocol behavior. " +
-                "Hytale uses UDP/QUIC only - no TCP required!");
+                "to help identify security vulnerabilities and understand game protocol behavior.");
 
             ImGui.Spacing();
             ImGui.Separator();
             ImGui.Spacing();
 
+            // ENHANCED: Better decryption status display
             ImGui.TextColored(Theme.ColAccent, "Decryption Status:");
-            ImGui.Text($"Keys Available: {PacketDecryptor.DiscoveredKeys.Count}");
-            ImGui.Text($"Packets Decrypted: {PacketDecryptor.SuccessfulDecryptions}");
-            ImGui.Text($"Packets Failed: {PacketDecryptor.FailedDecryptions}");
+
+            var status = _state.GetKeyStatus();
+
+            // Key count with color
+            var keyColor = status.TotalKeys > 0 ? Theme.ColSuccess : Theme.ColWarn;
+            ImGui.Text("Keys Available: ");
+            ImGui.SameLine();
+            ImGui.TextColored(keyColor, status.TotalKeys.ToString());
+
+            if (status.TotalKeys > 0)
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(Theme.ColTextMuted, $"(from {status.KeySources.Count} sources)");
+            }
+
+            ImGui.Text($"Packets Decrypted: {status.SuccessfulDecryptions}");
+            ImGui.Text($"Packets Failed: {status.FailedDecryptions}");
+
+            // Show last key added time
+            if (status.LastKeyAdded.HasValue)
+            {
+                var timeAgo = DateTime.Now - status.LastKeyAdded.Value;
+                string timeStr = timeAgo.TotalMinutes < 1 ? "just now" :
+                    $"{timeAgo.TotalMinutes:F0}m ago";
+                ImGui.TextColored(Theme.ColTextMuted, $"Last key added: {timeStr}");
+            }
+
+            // Show key sources
+            if (status.KeySources.Any())
+            {
+                ImGui.Spacing();
+                ImGui.TextColored(Theme.ColTextMuted, "Key Sources:");
+                foreach (var source in status.KeySources.Take(3))
+                {
+                    ImGui.TextColored(Theme.ColTextMuted, $"  - {source}");
+                }
+            }
 
             ImGui.Spacing();
             ImGui.Separator();
@@ -953,7 +987,7 @@ void main()
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Core\AppState.cs =====
 
-// FILE: Core/AppState.cs - FIXED: UDP-ONLY WITH AUTO-DECRYPTION
+
 using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
@@ -981,7 +1015,6 @@ public class AppState : IDisposable
     public DateTime? StartTime { get; private set; }
 
     public long TotalPackets => PacketLog.TotalPackets;
-    // REMOVED: TcpPackets - not used in UDP-only mode
     public long UdpPackets => PacketLog.PacketsUdp;
 
     public ConcurrentBag<SecurityEvent> SecurityEvents { get; } = new();
@@ -990,16 +1023,22 @@ public class AppState : IDisposable
     public List<string> InGameLog { get; } = new();
     public const int MaxInGameLogLines = 1000;
 
-    public string ExportDirectory { get; set; } = @"C:\Users\benja\source\repos\HyForce\Exported logs";
+    public string ExportDirectory { get; set; } = @"C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs";
 
     public event PacketReceivedHandler? OnPacketReceived;
     public event Action? OnSecurityEvent;
-
-    // FIXED: Made this a proper event with public accessor
     public event Action? OnMemoryDataUpdated;
+
+    // NEW: Event for key updates
+    public event Action? OnKeysUpdated;
 
     // Auto-decryption timer
     private System.Timers.Timer? _autoDecryptTimer;
+
+    // NEW: File watcher for SSL key log
+    private FileSystemWatcher? _sslKeyWatcher;
+    private DateTime _lastKeyLoadTime = DateTime.MinValue;
+    private readonly object _keyLoadLock = new();
 
     public AppState()
     {
@@ -1011,13 +1050,94 @@ public class AppState : IDisposable
         UdpProxy.OnPacket += HandlePacket;
         Directory.CreateDirectory(ExportDirectory);
 
-        // Setup auto-decryption attempts
         SetupAutoDecryption();
+
+        // NEW: Setup file watcher for SSL keys
+        SetupSSLKeyWatcher();
+
+        // NEW: Immediate scan for existing keys
+        ScanAndLoadExistingKeys();
+    }
+
+    private void SetupSSLKeyWatcher()
+    {
+        try
+        {
+            if (!Directory.Exists(ExportDirectory))
+                Directory.CreateDirectory(ExportDirectory);
+
+            _sslKeyWatcher = new FileSystemWatcher(ExportDirectory)
+            {
+                Filter = "*ssl*.log",
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
+                EnableRaisingEvents = true
+            };
+
+            _sslKeyWatcher.Created += (s, e) =>
+            {
+                AddInGameLog($"[KEYS] New key file detected: {Path.GetFileName(e.FullPath)}");
+                TryLoadKeysFromFile(e.FullPath);
+            };
+
+            _sslKeyWatcher.Changed += (s, e) =>
+            {
+                // Debounce rapid change events
+                lock (_keyLoadLock)
+                {
+                    if ((DateTime.Now - _lastKeyLoadTime).TotalSeconds > 2)
+                    {
+                        AddInGameLog($"[KEYS] Key file updated: {Path.GetFileName(e.FullPath)}");
+                        TryLoadKeysFromFile(e.FullPath);
+                        _lastKeyLoadTime = DateTime.Now;
+                    }
+                }
+            };
+
+            AddInGameLog("[KEYS] File watcher active for SSL key logs");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[KEYS] Failed to setup file watcher: {ex.Message}", "System");
+        }
+    }
+
+    private void ScanAndLoadExistingKeys()
+    {
+        try
+        {
+            if (!Directory.Exists(ExportDirectory)) return;
+
+            // Look for any SSL-related log files
+            var keyFiles = Directory.GetFiles(ExportDirectory, "*.log")
+                .Where(f =>
+                    Path.GetFileName(f).Contains("ssl", StringComparison.OrdinalIgnoreCase) ||
+                    Path.GetFileName(f).Contains("key", StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(f => new FileInfo(f).LastWriteTime)
+                .ToList();
+
+            if (keyFiles.Any())
+            {
+                AddInGameLog($"[KEYS] Found {keyFiles.Count} potential key files");
+
+                // Load the most recent one first
+                foreach (var file in keyFiles.Take(3))
+                {
+                    TryLoadKeysFromFile(file);
+                }
+            }
+            else
+            {
+                AddInGameLog("[KEYS] No existing key files found in export directory");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[KEYS] Scan failed: {ex.Message}", "System");
+        }
     }
 
     private void SetupAutoDecryption()
     {
-        // Try to decrypt packets automatically every 5 seconds
         _autoDecryptTimer = new System.Timers.Timer(5000);
         _autoDecryptTimer.Elapsed += (s, e) =>
         {
@@ -1030,7 +1150,6 @@ public class AppState : IDisposable
     {
         if (PacketDecryptor.DiscoveredKeys.Count == 0) return;
 
-        // Auto-decrypt recent packets
         var recentPackets = PacketLog.GetLast(100);
         int decrypted = 0;
 
@@ -1049,6 +1168,7 @@ public class AppState : IDisposable
         if (decrypted > 0)
         {
             AddInGameLog($"[AUTO-DECRYPT] Decrypted {decrypted} packets automatically");
+            OnKeysUpdated?.Invoke(); // Notify UI of potential changes
         }
     }
 
@@ -1092,13 +1212,15 @@ public class AppState : IDisposable
 
         // AUTO-ATTEMPT SSLKEYLOGFILE
         TryEnableSSLKeyLogFile();
+
+        // NEW: Re-scan for keys on start (in case they were added while stopped)
+        ScanAndLoadExistingKeys();
     }
 
     private void TryEnableSSLKeyLogFile()
     {
         try
         {
-            // Set environment variable for Hytale process if it reads it
             string keyLogPath = Path.Combine(ExportDirectory, "sslkeys.log");
             Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath);
             AddInGameLog($"[AUTO-DECRYPT] SSLKEYLOGFILE set to: {keyLogPath}");
@@ -1128,30 +1250,44 @@ public class AppState : IDisposable
 
             var lines = File.ReadAllLines(path);
             int keysAdded = 0;
+            int linesProcessed = 0;
 
             foreach (var line in lines)
             {
-                // Parse SSLKEYLOGFILE format: CLIENT_HANDSHAKE_TRAFFIC_SECRET <client_random> <secret>
+                linesProcessed++;
+
+                // Parse SSLKEYLOGFILE format
                 if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
                     line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
-                    line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET"))
+                    line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
+                    line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
+                    line.StartsWith("EXPORTER_SECRET"))
                 {
                     var parts = line.Split(' ');
                     if (parts.Length >= 3)
                     {
-                        var secret = Convert.FromHexString(parts[2]);
-                        if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
+                        try
                         {
-                            PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+                            var secret = Convert.FromHexString(parts[2]);
+                            if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
                             {
-                                Key = secret,
-                                IV = new byte[12],
-                                Type = secret.Length == 32 ?
-                                    PacketDecryptor.EncryptionType.AES256GCM :
-                                    PacketDecryptor.EncryptionType.ChaCha20Poly1305,
-                                Source = $"SSLKEYLOGFILE: {Path.GetFileName(path)}"
-                            });
-                            keysAdded++;
+                                var key = new PacketDecryptor.EncryptionKey
+                                {
+                                    Key = secret,
+                                    IV = new byte[12],
+                                    Type = secret.Length == 32 ?
+                                        PacketDecryptor.EncryptionType.AES256GCM :
+                                        PacketDecryptor.EncryptionType.ChaCha20Poly1305,
+                                    Source = $"{Path.GetFileName(path)}:{linesProcessed}"
+                                };
+
+                                PacketDecryptor.AddKey(key);
+                                keysAdded++;
+                            }
+                        }
+                        catch (FormatException)
+                        {
+                            // Invalid hex, skip
                         }
                     }
                 }
@@ -1159,13 +1295,42 @@ public class AppState : IDisposable
 
             if (keysAdded > 0)
             {
-                AddInGameLog($"[AUTO-DECRYPT] Loaded {keysAdded} keys from {Path.GetFileName(path)}");
+                AddInGameLog($"[KEYS] Loaded {keysAdded} keys from {Path.GetFileName(path)}");
+                Log.Success($"Loaded {keysAdded} keys from {Path.GetFileName(path)}", "Keys");
+                OnKeysUpdated?.Invoke(); // Notify UI
+            }
+            else if (linesProcessed > 0)
+            {
+                AddInGameLog($"[KEYS] No valid keys found in {Path.GetFileName(path)} ({linesProcessed} lines)");
             }
         }
         catch (Exception ex)
         {
-            AddInGameLog($"[AUTO-DECRYPT] Failed to load keys: {ex.Message}");
+            AddInGameLog($"[KEYS] Failed to load keys: {ex.Message}");
         }
+    }
+
+    // NEW: Force refresh of all key files
+    public void RefreshAllKeys()
+    {
+        AddInGameLog("[KEYS] Refreshing all key files...");
+        ScanAndLoadExistingKeys();
+        OnKeysUpdated?.Invoke();
+    }
+
+    // NEW: Get detailed key status
+    public KeyStatus GetKeyStatus()
+    {
+        return new KeyStatus
+        {
+            TotalKeys = PacketDecryptor.DiscoveredKeys.Count,
+            SuccessfulDecryptions = PacketDecryptor.SuccessfulDecryptions,
+            FailedDecryptions = PacketDecryptor.FailedDecryptions,
+            KeySources = PacketDecryptor.DiscoveredKeys.Select(k => k.Source).Distinct().ToList(),
+            LastKeyAdded = PacketDecryptor.DiscoveredKeys.Any()
+                ? PacketDecryptor.DiscoveredKeys.Max(k => k.DiscoveredAt)
+                : (DateTime?)null
+        };
     }
 
     public void Stop()
@@ -1222,7 +1387,6 @@ public class AppState : IDisposable
         OnSecurityEvent?.Invoke();
     }
 
-    // FIXED: Public method to trigger memory scan from menu
     public void TriggerMemoryScan()
     {
         OnMemoryDataUpdated?.Invoke();
@@ -1235,6 +1399,7 @@ public class AppState : IDisposable
         SecurityEvents.Clear();
         Log.Clear();
         lock (InGameLog) InGameLog.Clear();
+        PacketDecryptor.ClearKeys();
         Log.Info("[HyForce] All data cleared", "System");
         AddInGameLog("All data cleared");
     }
@@ -1296,6 +1461,17 @@ public class AppState : IDisposable
         sb.AppendLine($"Keys Available: {PacketDecryptor.DiscoveredKeys.Count}");
         sb.AppendLine($"Successful Decryptions: {PacketDecryptor.SuccessfulDecryptions}");
         sb.AppendLine($"Failed Decryptions: {PacketDecryptor.FailedDecryptions}");
+
+        if (PacketDecryptor.DiscoveredKeys.Any())
+        {
+            sb.AppendLine();
+            sb.AppendLine("Key Sources:");
+            foreach (var source in PacketDecryptor.DiscoveredKeys.Select(k => k.Source).Distinct())
+            {
+                var count = PacketDecryptor.DiscoveredKeys.Count(k => k.Source == source);
+                sb.AppendLine($"  - {source}: {count} keys");
+            }
+        }
         sb.AppendLine();
 
         sb.AppendLine("-------------------------------------------------------------------------------");
@@ -1465,6 +1641,23 @@ public class AppState : IDisposable
                 File.WriteAllLines(Path.Combine(basePath, "players.txt"), Protocol.RegistrySyncParser.PlayerNamesSeen);
             }
 
+            // NEW: Export keys if available
+            if (PacketDecryptor.DiscoveredKeys.Count > 0)
+            {
+                var keysSb = new System.Text.StringBuilder();
+                keysSb.AppendLine("=== ENCRYPTION KEYS ===");
+                foreach (var key in PacketDecryptor.DiscoveredKeys)
+                {
+                    keysSb.AppendLine($"Type: {key.Type}");
+                    keysSb.AppendLine($"Source: {key.Source}");
+                    keysSb.AppendLine($"Key: {Convert.ToHexString(key.Key)}");
+                    if (key.MemoryAddress.HasValue)
+                        keysSb.AppendLine($"Address: 0x{(ulong)key.MemoryAddress.Value:X}");
+                    keysSb.AppendLine();
+                }
+                File.WriteAllText(Path.Combine(basePath, "encryption_keys.txt"), keysSb.ToString());
+            }
+
             AddInGameLog($"[SUCCESS] Full export completed to {basePath}");
 
             try
@@ -1506,8 +1699,21 @@ public class AppState : IDisposable
         Stop();
         UdpProxy.OnPacket -= HandlePacket;
         _autoDecryptTimer?.Dispose();
+        _sslKeyWatcher?.Dispose();
     }
 }
+
+// NEW: Key status class
+public class KeyStatus
+{
+    public int TotalKeys { get; set; }
+    public int SuccessfulDecryptions { get; set; }
+    public int FailedDecryptions { get; set; }
+    public List<string> KeySources { get; set; } = new();
+    public DateTime? LastKeyAdded { get; set; }
+}
+
+
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Core\Config.cs =====
@@ -1805,9 +2011,26 @@ public class PacketLog
         byte[] raw = pkt.RawBytes;
         if (raw.Length == 0) return;
 
-        ushort opcode = ReadOpcode(raw);
-        string name = OpcodeRegistry.Label(opcode, pkt.Direction);
-        string encHint = ByteUtils.CalculateEntropy(raw) > 7.8 ? "encrypted" : "readable";
+        // FIX: Handle UDP/QUIC properly - don't read opcode from encrypted data
+        ushort opcode;
+        string name;
+        string encHint;
+
+        if (pkt.IsTcp)
+        {
+            // TCP: Can read opcode directly
+            opcode = ReadOpcode(raw);
+            name = OpcodeRegistry.Label(opcode, pkt.Direction);
+            encHint = ByteUtils.CalculateEntropy(raw) > 7.8 ? "encrypted" : "readable";
+        }
+        else
+        {
+            // UDP/QUIC: Payload is encrypted, can't read real opcode
+            // Use first byte as placeholder or 0 for unknown
+            opcode = raw.Length > 0 ? raw[0] : (ushort)0;
+            name = "QUIC_Encrypted";
+            encHint = "encrypted";
+        }
 
         byte[]? decompressed = TryDecompress(raw, out string compr);
         bool compressed = compr != "none" && decompressed != null;
@@ -1820,6 +2043,7 @@ public class PacketLog
             OpcodeDecimal = opcode,
             OpcodeName = name,
             IsTcp = pkt.IsTcp,
+            RawBytes = raw,  // Store raw bytes for potential decryption
             CompressionMethod = compr,
             CompressedSize = raw.Length,
             DecompressedSize = compressed ? decompressed!.Length : raw.Length,
@@ -1837,8 +2061,12 @@ public class PacketLog
                 _entries.Dequeue();
         }
 
-        _opcodeCounts.AddOrUpdate(opcode, 1, (_, v) => v + 1);
-        _opcodeLatest[opcode] = entry;
+        // Only count opcodes for TCP (UDP opcodes are meaningless)
+        if (pkt.IsTcp)
+        {
+            _opcodeCounts.AddOrUpdate(opcode, 1, (_, v) => v + 1);
+            _opcodeLatest[opcode] = entry;
+        }
 
         if (pkt.Direction == PacketDirection.ServerToClient)
         {
@@ -1862,7 +2090,7 @@ public class PacketLog
             Interlocked.Increment(ref _countUdp);
         }
 
-        // Registry parsing with proper checks
+        // Registry parsing only for TCP
         if (pkt.IsTcp && pkt.Direction == PacketDirection.ServerToClient)
         {
             RegistrySyncParser.TryParse(opcode, raw);
@@ -2060,6 +2288,7 @@ public class PacketLogEntry
     public ushort OpcodeDecimal { get; set; }
     public string OpcodeName { get; set; } = "";
     public bool IsTcp { get; set; }
+    public byte[] RawBytes { get; set; } = Array.Empty<byte>();  // ADD THIS LINE
 
     // UI compatibility properties
     public string DirStr => Direction == Networking.PacketDirection.ServerToClient ? "S?C" : "C?S";
@@ -4773,7 +5002,7 @@ public class ConnectTab : ITab
     private readonly byte[] _bufServerPort = new byte[8];
     private bool _showAdvanced = false;
     private double _copyFeedbackTime = 0;
-
+    private int _selectedPresetIndex = -1;
     public ConnectTab(AppState state)
     {
         _state = state;
@@ -4831,7 +5060,45 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // REMOVED: Server preset selector - simplified for UDP
+        // Server preset selector - ADD THIS SECTION
+        var presets = _state.Config.GetAllPresets();
+        string[] displayNames = presets.Select(p =>
+            string.IsNullOrEmpty(p.IpAddress) ? $"{p.Name} (Custom)" : $"{p.Name} ({p.IpAddress})"
+        ).ToArray();
+
+        ImGui.Text("Server Preset:");
+        ImGui.SetNextItemWidth(leftW - 24);
+
+        if (ImGui.Combo("##preset", ref _selectedPresetIndex, displayNames, displayNames.Length))
+        {
+            if (_selectedPresetIndex >= 0 && _selectedPresetIndex < presets.Count)
+            {
+                var selected = presets[_selectedPresetIndex];
+                _state.TargetHost = selected.IpAddress;
+                _state.TargetPort = selected.Port;
+
+                // Update the input buffers
+                Array.Clear(_bufServerIp, 0, _bufServerIp.Length);
+                Array.Clear(_bufServerPort, 0, _bufServerPort.Length);
+                System.Text.Encoding.ASCII.GetBytes(selected.IpAddress).CopyTo(_bufServerIp, 0);
+                System.Text.Encoding.ASCII.GetBytes(selected.Port.ToString()).CopyTo(_bufServerPort, 0);
+
+                _state.AddInGameLog($"[CONFIG] Selected preset: {selected.Name} ({selected.IpAddress}:{selected.Port})");
+            }
+        }
+
+        // Show current selection info
+        if (_selectedPresetIndex >= 0 && _selectedPresetIndex < presets.Count)
+        {
+            var current = presets[_selectedPresetIndex];
+            ImGui.TextColored(Theme.ColTextMuted, $"Selected: {current.Name}");
+            if (!string.IsNullOrEmpty(current.Description))
+            {
+                ImGui.TextColored(Theme.ColTextMuted, current.Description);
+            }
+        }
+
+        ImGui.Spacing();
 
         ImGui.Text("Target Server IP:");
         RenderInputWithPaste("##srvIp", _bufServerIp, (val) => _state.TargetHost = val, leftW - 32);
@@ -5105,7 +5372,6 @@ public class ConnectTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\DecryptionTab.cs =====
 
-// FILE: Tabs/DecryptionTab.cs - DECRYPTION MANAGEMENT UI
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
@@ -5125,9 +5391,25 @@ public class DecryptionTab : ITab
     private string _testData = "";
     private bool _autoDecrypt = true;
 
+    // NEW: UI state
+    private int _selectedKeyIndex = -1;
+    private bool _showKeyDetails = false;
+    private float _lastRefreshTime = 0;
+    private string _statusMessage = "";
+    private float _statusTime = 0;
+
     public DecryptionTab(AppState state)
     {
         _state = state;
+
+        // Subscribe to key updates
+        _state.OnKeysUpdated += OnKeysUpdated;
+    }
+
+    private void OnKeysUpdated()
+    {
+        _statusMessage = "Keys updated!";
+        _statusTime = (float)ImGui.GetTime();
     }
 
     public void Render()
@@ -5135,12 +5417,18 @@ public class DecryptionTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  PACKET DECRYPTION  ?  Manage Encryption Keys");
+        ImGui.Text("  PACKET DECRYPTION  -  Manage Encryption Keys");
         ImGui.Separator();
         ImGui.Spacing();
 
-        // Key status
-        RenderKeyStatus();
+        // Show status message if recent
+        if (!string.IsNullOrEmpty(_statusMessage) && ImGui.GetTime() - _statusTime < 3.0)
+        {
+            ImGui.TextColored(Theme.ColSuccess, _statusMessage);
+        }
+
+        // Key status header with refresh button
+        RenderKeyStatusHeader();
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -5160,23 +5448,68 @@ public class DecryptionTab : ITab
         ImGui.EndChild();
     }
 
-    private void RenderKeyStatus()
+    private void RenderKeyStatusHeader()
     {
-        bool hasKeys = PacketDecryptor.DiscoveredKeys.Count > 0;
+        var status = _state.GetKeyStatus();
+        bool hasKeys = status.TotalKeys > 0;
 
         var color = hasKeys ? Theme.ColSuccess : Theme.ColWarn;
-        var status = hasKeys
-            ? $"ACTIVE - {PacketDecryptor.DiscoveredKeys.Count} keys available"
-            : "NO KEYS - Packets will be captured raw";
 
-        ImGui.TextColored(color, status);
+        ImGui.BeginGroup();
 
-        if (!hasKeys)
+        // Status indicator with icon
+        var drawList = ImGui.GetWindowDrawList();
+        var pos = ImGui.GetCursorScreenPos();
+
+        // Draw status circle
+        drawList.AddCircleFilled(pos + new Vector2(10, 12), 8,
+            ImGui.ColorConvertFloat4ToU32(color));
+        ImGui.Dummy(new Vector2(25, 24));
+
+        ImGui.SameLine();
+        ImGui.BeginGroup();
+
+        if (hasKeys)
         {
-            ImGui.TextWrapped("Use the Memory Scanner to find encryption keys, or enter them manually below.");
+            ImGui.TextColored(color, $"ACTIVE - {status.TotalKeys} keys available");
+
+            if (status.LastKeyAdded.HasValue)
+            {
+                var timeAgo = DateTime.Now - status.LastKeyAdded.Value;
+                ImGui.TextColored(Theme.ColTextMuted,
+                    $"Last added: {(timeAgo.TotalMinutes < 1 ? "just now" : $"{timeAgo.TotalMinutes:F0}m ago")}");
+            }
+        }
+        else
+        {
+            ImGui.TextColored(color, "NO KEYS - Packets captured raw");
+            ImGui.TextColored(Theme.ColTextMuted, "Use Memory Scanner or wait for SSL key log");
         }
 
+        ImGui.EndGroup();
+
+        // Refresh button - aligned right
+        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 120);
+
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.6f, 0.9f, 1f));
+        if (ImGui.Button("Refresh Keys", new Vector2(110, 28)))
+        {
+            _state.RefreshAllKeys();
+        }
+        ImGui.PopStyleColor();
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Rescan export directory for key files");
+
+        ImGui.EndGroup();
+
         ImGui.Checkbox("Auto-decrypt incoming packets", ref _autoDecrypt);
+
+        // Show key sources if available
+        if (status.KeySources.Any())
+        {
+            ImGui.TextColored(Theme.ColTextMuted, "Sources: " + string.Join(", ", status.KeySources.Take(3)));
+        }
     }
 
     private void RenderKeyManagement(float width)
@@ -5204,26 +5537,69 @@ public class DecryptionTab : ITab
 
         ImGui.Spacing();
         ImGui.Separator();
+
+        // Enhanced key list with details
         ImGui.TextColored(Theme.ColAccent, $"Discovered Keys ({PacketDecryptor.DiscoveredKeys.Count})");
 
         ImGui.BeginChild("##key_list", new Vector2(0, 200), ImGuiChildFlags.Borders);
 
         int index = 0;
-        foreach (var key in PacketDecryptor.DiscoveredKeys)
+        foreach (var key in PacketDecryptor.DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt))
         {
             ImGui.PushID(index++);
 
-            ImGui.TextColored(Theme.ColAccent, $"{key.Type}");
-            ImGui.Text($"  Source: {key.Source}");
+            bool isSelected = _selectedKeyIndex == index - 1;
 
-            string keyPreview = key.Key.Length > 8
-                ? BitConverter.ToString(key.Key.Take(8).ToArray()).Replace("-", " ") + "..."
-                : BitConverter.ToString(key.Key).Replace("-", " ");
+            // Key header with type and time
+            var timeAgo = DateTime.Now - key.DiscoveredAt;
+            string timeStr = timeAgo.TotalMinutes < 1 ? "now" : $"{timeAgo.TotalMinutes:F0}m";
+
+            ImGui.BeginGroup();
+
+            // Selection highlight
+            if (isSelected)
+                ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColAccent);
+
+            ImGui.Text($"{key.Type} [{timeStr}]");
+
+            if (isSelected)
+                ImGui.PopStyleColor();
+
+            ImGui.TextColored(Theme.ColTextMuted, $"  Source: {key.Source}");
+
+            // Key preview (first 8 bytes + ... + last 4 bytes)
+            string keyPreview = FormatKeyPreview(key.Key);
             ImGui.Text($"  Key: {keyPreview}");
 
             if (key.MemoryAddress.HasValue)
             {
-                ImGui.Text($"  Address: 0x{(ulong)key.MemoryAddress.Value:X}");
+                ImGui.TextColored(Theme.ColTextMuted,
+                    $"  Address: 0x{(ulong)key.MemoryAddress.Value:X}");
+            }
+
+            ImGui.EndGroup();
+
+            // Click to select
+            if (ImGui.IsItemClicked())
+            {
+                _selectedKeyIndex = isSelected ? -1 : index - 1;
+            }
+
+            // Right-click context menu
+            if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+                ImGui.OpenPopup($"key_ctx_{index}");
+
+            if (ImGui.BeginPopup($"key_ctx_{index}"))
+            {
+                if (ImGui.MenuItem("Copy Full Key"))
+                {
+                    CopyToClipboard(Convert.ToHexString(key.Key));
+                }
+                if (ImGui.MenuItem("Use for Test Decryption"))
+                {
+                    _testData = Convert.ToHexString(key.Key.Take(16).ToArray());
+                }
+                ImGui.EndPopup();
             }
 
             ImGui.Separator();
@@ -5233,23 +5609,88 @@ public class DecryptionTab : ITab
         if (PacketDecryptor.DiscoveredKeys.Count == 0)
         {
             ImGui.TextColored(Theme.ColTextMuted, "No keys discovered yet");
+            ImGui.Spacing();
+            ImGui.TextWrapped("Keys will appear here when:");
+            ImGui.BulletText("SSL key log file is detected");
+            ImGui.BulletText("Memory scanner finds keys");
+            ImGui.BulletText("Manually entered above");
         }
 
         ImGui.EndChild();
+
+        // Key details panel if selected
+        if (_selectedKeyIndex >= 0 && _selectedKeyIndex < PacketDecryptor.DiscoveredKeys.Count)
+        {
+            var selectedKey = PacketDecryptor.DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt).ElementAt(_selectedKeyIndex);
+            RenderKeyDetails(selectedKey);
+        }
+    }
+
+    private string FormatKeyPreview(byte[] key)
+    {
+        if (key.Length <= 12)
+            return BitConverter.ToString(key).Replace("-", " ");
+
+        var first = BitConverter.ToString(key.Take(8).ToArray()).Replace("-", " ");
+        var last = BitConverter.ToString(key.Skip(key.Length - 4).ToArray()).Replace("-", " ");
+        return $"{first} ... {last}";
+    }
+
+    private void RenderKeyDetails(PacketDecryptor.EncryptionKey key)
+    {
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.TextColored(Theme.ColAccent, "Key Details");
+
+        ImGui.Text($"Type: {key.Type}");
+        ImGui.Text($"Size: {key.Key.Length * 8} bits ({key.Key.Length} bytes)");
+        ImGui.Text($"Source: {key.Source}");
+        ImGui.Text($"Discovered: {key.DiscoveredAt:HH:mm:ss}");
+
+        if (key.MemoryAddress.HasValue)
+        {
+            ImGui.Text($"Memory Address: 0x{(ulong)key.MemoryAddress.Value:X16}");
+        }
+
+        // Full key display with copy button
+        string fullKey = Convert.ToHexString(key.Key);
+        ImGui.InputText("Full Key (hex)", ref fullKey, (uint)fullKey.Length,
+            ImGuiInputTextFlags.ReadOnly);
+
+        if (ImGui.Button("Copy Full Key", new Vector2(100, 24)))
+        {
+            CopyToClipboard(fullKey);
+        }
     }
 
     private void RenderStatsAndTesting(float width)
     {
         ImGui.TextColored(Theme.ColAccent, "Decryption Statistics");
 
-        ImGui.Text($"Successful: {PacketDecryptor.SuccessfulDecryptions}");
-        ImGui.Text($"Failed: {PacketDecryptor.FailedDecryptions}");
+        var status = _state.GetKeyStatus();
 
-        float successRate = PacketDecryptor.SuccessfulDecryptions + PacketDecryptor.FailedDecryptions > 0
-            ? (float)PacketDecryptor.SuccessfulDecryptions / (PacketDecryptor.SuccessfulDecryptions + PacketDecryptor.FailedDecryptions)
+        // Stats with color coding
+        ImGui.Text("Successful: ");
+        ImGui.SameLine();
+        ImGui.TextColored(Theme.ColSuccess, status.SuccessfulDecryptions.ToString());
+
+        ImGui.Text("Failed: ");
+        ImGui.SameLine();
+        var failColor = status.FailedDecryptions > 0 ? Theme.ColWarn : Theme.ColTextMuted;
+        ImGui.TextColored(failColor, status.FailedDecryptions.ToString());
+
+        float successRate = status.SuccessfulDecryptions + status.FailedDecryptions > 0
+            ? (float)status.SuccessfulDecryptions / (status.SuccessfulDecryptions + status.FailedDecryptions)
             : 0;
 
         ImGui.ProgressBar(successRate, new Vector2(-1, 20), $"{successRate:P0}");
+
+        // Quick stats
+        if (status.TotalKeys > 0)
+        {
+            ImGui.TextColored(Theme.ColTextMuted,
+                $"Efficiency: {status.SuccessfulDecryptions} decryptions with {status.TotalKeys} keys");
+        }
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -5267,7 +5708,14 @@ public class DecryptionTab : ITab
 
         if (ImGui.Button("Clear Stats", new Vector2(100, 28)))
         {
-            // Reset counters via reflection or add a method to PacketDecryptor
+            _state.AddInGameLog("[DECRYPTION] Stats reset not implemented yet");
+        }
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Verify Keys", new Vector2(100, 28)))
+        {
+            VerifyKeys();
         }
 
         ImGui.Spacing();
@@ -5286,6 +5734,42 @@ public class DecryptionTab : ITab
         if (ImGui.Button("Export Keys", new Vector2(120, 28)))
         {
             ExportKeys();
+        }
+
+        ImGui.Spacing();
+
+        // File watcher status
+        ImGui.TextColored(Theme.ColTextMuted, "Auto-detection: Active");
+        ImGui.TextColored(Theme.ColTextMuted, $"Watching: {_state.ExportDirectory}");
+    }
+
+    private void VerifyKeys()
+    {
+        if (PacketDecryptor.DiscoveredKeys.Count == 0)
+        {
+            _state.AddInGameLog("[VERIFY] No keys to verify");
+            return;
+        }
+
+        int validKeys = 0;
+        foreach (var key in PacketDecryptor.DiscoveredKeys)
+        {
+            // Basic validation: check key isn't all zeros or repeating pattern
+            bool isAllZero = key.Key.All(b => b == 0);
+            bool isRepeating = key.Key.Distinct().Count() == 1;
+            bool isValidLength = key.Key.Length == 16 || key.Key.Length == 32 || key.Key.Length == 48;
+
+            if (!isAllZero && !isRepeating && isValidLength)
+            {
+                validKeys++;
+            }
+        }
+
+        _state.AddInGameLog($"[VERIFY] {validKeys}/{PacketDecryptor.DiscoveredKeys.Count} keys appear valid");
+
+        if (validKeys < PacketDecryptor.DiscoveredKeys.Count)
+        {
+            _state.AddInGameLog("[VERIFY] Some keys may be corrupted or have invalid format");
         }
     }
 
@@ -5340,7 +5824,12 @@ public class DecryptionTab : ITab
 
                 // Show preview
                 string preview = Encoding.UTF8.GetString(result.DecryptedData.Take(100).ToArray());
+                preview = new string(preview.Where(c => !char.IsControl(c)).ToArray()); // Remove control chars
                 _state.AddInGameLog($"  Preview: {preview}");
+
+                // Show entropy of decrypted data
+                double entropy = CalculateEntropy(result.DecryptedData);
+                _state.AddInGameLog($"  Entropy: {entropy:F2} (lower = more structured)");
             }
             else
             {
@@ -5353,6 +5842,23 @@ public class DecryptionTab : ITab
         }
     }
 
+    private double CalculateEntropy(byte[] data)
+    {
+        if (data.Length == 0) return 0;
+
+        var freq = new int[256];
+        foreach (var b in data) freq[b]++;
+
+        double entropy = 0;
+        for (int i = 0; i < 256; i++)
+        {
+            if (freq[i] == 0) continue;
+            double p = (double)freq[i] / data.Length;
+            entropy -= p * Math.Log2(p);
+        }
+        return entropy;
+    }
+
     private void ExportKeys()
     {
         try
@@ -5360,19 +5866,22 @@ public class DecryptionTab : ITab
             var sb = new StringBuilder();
             sb.AppendLine("=== HYFORCE ENCRYPTION KEYS ===");
             sb.AppendLine($"Export Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine($"Total Keys: {PacketDecryptor.DiscoveredKeys.Count}");
             sb.AppendLine();
 
             foreach (var key in PacketDecryptor.DiscoveredKeys)
             {
                 sb.AppendLine($"Type: {key.Type}");
                 sb.AppendLine($"Source: {key.Source}");
+                sb.AppendLine($"Discovered: {key.DiscoveredAt:yyyy-MM-dd HH:mm:ss}");
                 sb.AppendLine($"Key (hex): {Convert.ToHexString(key.Key)}");
                 if (key.MemoryAddress.HasValue)
                     sb.AppendLine($"Address: 0x{(ulong)key.MemoryAddress.Value:X}");
                 sb.AppendLine();
             }
 
-            string filename = Path.Combine(_state.ExportDirectory, $"keys_export_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+            string filename = Path.Combine(_state.ExportDirectory,
+                $"keys_export_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
             Directory.CreateDirectory(_state.ExportDirectory);
             File.WriteAllText(filename, sb.ToString());
 
@@ -5383,7 +5892,14 @@ public class DecryptionTab : ITab
             _state.AddInGameLog($"[ERROR] Export failed: {ex.Message}");
         }
     }
+
+    private void CopyToClipboard(string text)
+    {
+        try { TextCopy.ClipboardService.SetText(text); } catch { }
+    }
 }
+
+
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\ITab.cs =====
@@ -5879,6 +6395,14 @@ public class MemoryTab : ITab
     private bool _isAttached = false;
     private string _processName = "Hytale";
 
+    
+    // SSL keylog state
+    private bool _sslKeyLogEnabled = false;
+    private string _sslKeyLogPath = "";
+    private DateTime _sslKeyLogLastCheck = DateTime.MinValue;
+    private int _sslKeyLogKeyCount = 0;
+
+
     // Scanning state
     private string _scanValue = "";
     private string _scanPattern = "";
@@ -5933,11 +6457,6 @@ public class MemoryTab : ITab
         else
         {
             _state.AddInGameLog("[MEMORY] Attach to process first before scanning!");
-            // Auto-switch to this tab
-            for (int i = 0; i < 8; i++) // Max 8 tabs
-            {
-                if (_state.OnMemoryDataUpdated != null) break; // We're already here
-            }
         }
     }
 
@@ -6031,6 +6550,63 @@ public class MemoryTab : ITab
 
             ImGui.SameLine();
             ImGui.Checkbox("Auto", ref _autoRefresh);
+
+            ImGui.SameLine();
+
+            if (!_isAttached)
+            {
+                // Not attached - show disabled button or hint
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.3f, 0.3f, 0.3f, 1f));
+                if (ImGui.Button("Enable SSL Keylog", new Vector2(130, 28)))
+                {
+                    _state.AddInGameLog("[KEYS] Attach to process first!");
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Attach to Hytale first, then click this");
+                ImGui.PopStyleColor();
+            }
+            else
+            {
+                // Attached - show status
+                CheckSSLKeyLogFile(); // Auto-check
+
+                if (_sslKeyLogKeyCount > 0)
+                {
+                    // Keys found! Show green success button
+                    ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.8f, 0.3f, 1f));
+                    if (ImGui.Button($"Keys: {_sslKeyLogKeyCount}", new Vector2(130, 28)))
+                    {
+                        CheckSSLKeyLogFile(); // Refresh
+                    }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Click to refresh keys from sslkeys.log");
+                    ImGui.PopStyleColor();
+                }
+                else if (_sslKeyLogEnabled)
+                {
+                    // Enabled but no keys yet - show yellow waiting button
+                    ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.9f, 0.7f, 0.2f, 1f));
+                    if (ImGui.Button("Waiting...", new Vector2(130, 28)))
+                    {
+                        CheckSSLKeyLogFile(); // Manual check
+                    }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("SSL keylog enabled. Restart Hytale if no keys appear!");
+                    ImGui.PopStyleColor();
+                }
+                else
+                {
+                    // Not enabled yet - show normal blue button
+                    ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.5f, 0.9f, 1f));
+                    if (ImGui.Button("Enable SSL Keylog", new Vector2(130, 28)))
+                    {
+                        TryHookSSLKeyLog();
+                    }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Sets SSLKEYLOGFILE env var to capture TLS keys");
+                    ImGui.PopStyleColor();
+                }
+            }
         }
     }
 
@@ -6623,7 +7199,7 @@ public class MemoryTab : ITab
         _state.AddInGameLog($"[MEMORY] Quick scan complete: {scanned} regions, {_scanResults.Count} results for value '100'");
     }
 
-    // NEW: Scan for TLS 1.3 keys automatically
+    // NEW: Scan for TLS 1.3 keys automatically - IMPROVED
     private async void ScanForTLSKeys()
     {
         if (!_isAttached) return;
@@ -6651,11 +7227,142 @@ public class MemoryTab : ITab
         }
     }
 
+
+    private void TryHookSSLKeyLog()
+    {
+        _sslKeyLogPath = Path.Combine(_state.ExportDirectory, "sslkeys.log");
+
+        // Set environment variable for future Hytale launches
+        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", _sslKeyLogPath);
+        _sslKeyLogEnabled = true;
+
+        _state.AddInGameLog($"[KEYS] SSLKEYLOGFILE set to: {_sslKeyLogPath}");
+
+        // Immediately check if file exists and load keys
+        if (File.Exists(_sslKeyLogPath))
+        {
+            _state.AddInGameLog("[KEYS] Existing key file found, loading...");
+            CheckSSLKeyLogFile();
+        }
+        else
+        {
+            _state.AddInGameLog("[KEYS] No key file yet. Keys will appear when Hytale connects.");
+            _state.AddInGameLog("[KEYS] Make sure to restart Hytale with proxy running!");
+        }
+
+        // Also trigger a refresh through AppState
+        _state.RefreshAllKeys();
+    }
+
+    // Check for keys in the file
+    private void CheckSSLKeyLogFile()
+    {
+        try
+        {
+            // Check multiple possible file names
+            var possibleFiles = new[]
+            {
+                Path.Combine(_state.ExportDirectory, "sslkeys.log"),
+                Path.Combine(_state.ExportDirectory, "keys.log"),
+                Path.Combine(_state.ExportDirectory, "ssl_keylog.log"),
+                _sslKeyLogPath
+            }.Where(f => !string.IsNullOrEmpty(f)).Distinct();
+
+            foreach (var file in possibleFiles)
+            {
+                if (File.Exists(file))
+                {
+                    var lines = File.ReadAllLines(file);
+                    var keyLines = lines.Where(l =>
+                        l.Contains("CLIENT_TRAFFIC_SECRET") ||
+                        l.Contains("SERVER_TRAFFIC_SECRET") ||
+                        l.Contains("HANDSHAKE_TRAFFIC_SECRET")).ToList();
+
+                    int newKeys = 0;
+                    foreach (var line in keyLines)
+                    {
+                        // Try to add each key
+                        var parts = line.Split(' ');
+                        if (parts.Length >= 3)
+                        {
+                            try
+                            {
+                                var secret = Convert.FromHexString(parts[2]);
+                                if (secret.Length == 32 || secret.Length == 48)
+                                {
+                                    var key = new PacketDecryptor.EncryptionKey
+                                    {
+                                        Key = secret,
+                                        IV = new byte[12],
+                                        Type = secret.Length == 32 ?
+                                            PacketDecryptor.EncryptionType.AES256GCM :
+                                            PacketDecryptor.EncryptionType.ChaCha20Poly1305,
+                                        Source = $"SSLLog:{Path.GetFileName(file)}"
+                                    };
+
+                                    // Check if already exists
+                                    if (!PacketDecryptor.DiscoveredKeys.Any(k => k.Key.SequenceEqual(key.Key)))
+                                    {
+                                        PacketDecryptor.AddKey(key);
+                                        newKeys++;
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+
+                    if (newKeys > 0)
+                    {
+                        _sslKeyLogKeyCount += newKeys;
+                        _state.AddInGameLog($"[KEYS] Auto-loaded {newKeys} new keys from {Path.GetFileName(file)}");
+                    }
+                    else
+                    {
+                        _sslKeyLogKeyCount = keyLines.Count;
+                    }
+
+                    _sslKeyLogLastCheck = DateTime.Now;
+                }
+            }
+        }
+        catch { }
+    }
+
     private void DoTLSScan(CancellationToken token)
     {
         int keysFound = 0;
         var regions = GetReadableMemoryRegions().Where(r => r.Size < 50_000_000);
 
+        // First pass: Look for TLS keylog strings
+        foreach (var region in regions.Take(30))
+        {
+            if (token.IsCancellationRequested) break;
+
+            try
+            {
+                byte[] buffer = new byte[(int)Math.Min(region.Size, 2_000_000)];
+                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                    continue;
+
+                // Search for TLS-related strings
+                var strings = ExtractStringsFromBuffer(buffer, 20);
+                foreach (var str in strings)
+                {
+                    if (str.Contains("CLIENT_TRAFFIC_SECRET") ||
+                        str.Contains("SERVER_TRAFFIC_SECRET") ||
+                        str.Contains("EXPORTER_SECRET") ||
+                        str.Contains("QUIC") ||
+                        str.Contains("sslkeylog"))
+                    {
+                        _state.AddInGameLog($"[TLS] Found string: {str.Substring(0, Math.Min(40, str.Length))}");
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // Second pass: Look for 32-byte high entropy blocks (AES-256 keys)
         foreach (var region in regions.Take(20))
         {
             if (token.IsCancellationRequested) break;
@@ -6672,7 +7379,7 @@ public class MemoryTab : ITab
                     double entropy = CalculateEntropy(buffer, i, 32);
 
                     // TLS secrets have high entropy (>7.5) and specific patterns
-                    if (entropy > 7.8 && entropy < 7.99)
+                    if (entropy > 7.5 && entropy < 7.99)
                     {
                         // Check if surrounded by lower entropy (isolated high entropy = likely key)
                         double before = CalculateEntropy(buffer, Math.Max(0, i - 32), 32);
@@ -6683,20 +7390,24 @@ public class MemoryTab : ITab
                             var keyBytes = new byte[32];
                             Array.Copy(buffer, i, keyBytes, 0, 32);
 
-                            // Auto-add as decryption key
-                            PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+                            // Verify it's not all zeros or all same byte
+                            if (keyBytes.Any(b => b != 0) && keyBytes.Distinct().Count() > 16)
                             {
-                                Key = keyBytes,
-                                IV = new byte[12],
-                                Type = PacketDecryptor.EncryptionType.AES256GCM,
-                                Source = "Memory Scan (TLS)",
-                                MemoryAddress = region.BaseAddress + i
-                            });
+                                // Auto-add as decryption key
+                                PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+                                {
+                                    Key = keyBytes,
+                                    IV = new byte[12],
+                                    Type = PacketDecryptor.EncryptionType.AES256GCM,
+                                    Source = "Memory Scan (TLS)",
+                                    MemoryAddress = region.BaseAddress + i
+                                });
 
-                            keysFound++;
+                                keysFound++;
 
-                            // Only add first 5 keys to avoid duplicates
-                            if (keysFound >= 5) break;
+                                // Only add first 5 keys to avoid duplicates
+                                if (keysFound >= 5) break;
+                            }
                         }
                     }
                 }
@@ -6707,6 +7418,32 @@ public class MemoryTab : ITab
         }
 
         _state.AddInGameLog($"[AUTO-DECRYPT] Found {keysFound} potential TLS keys and added to decryption!");
+    }
+
+    // Helper to extract strings from buffer
+    private List<string> ExtractStringsFromBuffer(byte[] data, int minLength)
+    {
+        var results = new List<string>();
+        var sb = new StringBuilder();
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            if (data[i] >= 32 && data[i] <= 126)
+            {
+                sb.Append((char)data[i]);
+            }
+            else
+            {
+                if (sb.Length >= minLength)
+                    results.Add(sb.ToString());
+                sb.Clear();
+            }
+        }
+
+        if (sb.Length >= minLength)
+            results.Add(sb.ToString());
+
+        return results;
     }
 
     private void UseAsDecryptionKey(MemoryResult result)
@@ -7111,7 +7848,7 @@ public class PacketAnalyticsTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\PacketFeedTab.cs =====
 
-// FILE: Tabs/PacketFeedTab.cs - FIXED UI OVERFLOW
+// FILE: Tabs/PacketFeedTab.cs - ENHANCED WITH DEEP ANALYSIS AND BYPASS FEATURES
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
@@ -7120,6 +7857,7 @@ using HyForce.UI;
 using HyForce.Utils;
 using ImGuiNET;
 using System.Numerics;
+using System.Diagnostics;
 
 namespace HyForce.Tabs;
 
@@ -7134,6 +7872,19 @@ public class PacketFeedTab : ITab
     private bool _autoScroll = true;
     private bool _showPatternAnalysis = false;
 
+    // Filter toggles
+    private bool _hideEncrypted = false;
+    private bool _showOnlyEncrypted = false;
+    private bool _hideQuic = false;
+    private bool _showOnlyQuic = false;
+    private bool _hideTcp = false;
+    private bool _showOnlyTcp = false;
+
+    // Analysis toggles
+    private bool _showEntropyDetails = true;
+    private bool _showTimingAnalysis = true;
+    private bool _showMemoryStatus = true;
+
     public PacketFeedTab(AppState state)
     {
         _state = state;
@@ -7143,18 +7894,15 @@ public class PacketFeedTab : ITab
     {
         var windowSize = ImGui.GetContentRegionAvail();
 
-        // FIXED: Ensure we don't exceed parent bounds
-        float toolbarHeight = 35;
+        float toolbarHeight = 70;
         float remainingHeight = Math.Max(0, windowSize.Y - toolbarHeight - 10);
 
         RenderToolbar();
         ImGui.Separator();
 
-        // FIXED: Use proper sizing to prevent overflow
-        var listWidth = Math.Min(windowSize.X * 0.6f, windowSize.X - 320); // Min 320px for details
+        var listWidth = Math.Min(windowSize.X * 0.6f, windowSize.X - 320);
         var detailsWidth = Math.Max(0, windowSize.X - listWidth - 20);
 
-        // FIXED: Constrain child windows to available space
         ImGui.BeginChild("PacketList", new Vector2(listWidth, remainingHeight), ImGuiChildFlags.Borders);
         RenderPacketList();
         ImGui.EndChild();
@@ -7168,15 +7916,15 @@ public class PacketFeedTab : ITab
 
     private void RenderToolbar()
     {
-        // FIXED: Use consistent button heights and prevent overflow
         float buttonHeight = 25;
 
+        // Row 1: Basic filters
         ImGui.PushItemWidth(100);
         ImGui.InputText("Filter Opcode", ref _filterOpcode, 10);
         ImGui.SameLine();
-        ImGui.Checkbox("Critical Only", ref _showOnlyCritical);
+        ImGui.Checkbox("Critical", ref _showOnlyCritical);
         ImGui.SameLine();
-        ImGui.Checkbox("Unknown Only", ref _showOnlyUnknown);
+        ImGui.Checkbox("Unknown", ref _showOnlyUnknown);
         ImGui.SameLine();
         ImGui.Checkbox("Auto-scroll", ref _autoScroll);
 
@@ -7186,15 +7934,70 @@ public class PacketFeedTab : ITab
             _state.PacketLog.Clear();
         }
 
-        // FIXED: Prevent button overflow by checking available width
-        float remainingWidth = ImGui.GetContentRegionAvail().X;
-        if (remainingWidth > 120)
+        // Row 2: Encryption/Protocol filters
+        ImGui.NewLine();
+
+        ImGui.Text("Show:"); ImGui.SameLine();
+
+        if (ImGui.Button(_hideEncrypted ? "Show Encrypted" : "Hide Encrypted", new Vector2(110, buttonHeight)))
         {
-            ImGui.SameLine();
-            if (ImGui.Button("Analyze Patterns", new Vector2(120, buttonHeight)))
+            _hideEncrypted = !_hideEncrypted;
+            if (_hideEncrypted) _showOnlyEncrypted = false;
+        }
+        ImGui.SameLine();
+
+        if (ImGui.Button(_showOnlyEncrypted ? "All Packets" : "Only Encrypted", new Vector2(110, buttonHeight)))
+        {
+            _showOnlyEncrypted = !_showOnlyEncrypted;
+            if (_showOnlyEncrypted) _hideEncrypted = false;
+        }
+
+        ImGui.SameLine();
+        ImGui.Text("|"); ImGui.SameLine();
+
+        if (ImGui.Button(_hideQuic ? "Show QUIC" : "Hide QUIC", new Vector2(90, buttonHeight)))
+        {
+            _hideQuic = !_hideQuic;
+            if (_hideQuic) _showOnlyQuic = false;
+        }
+        ImGui.SameLine();
+
+        if (ImGui.Button(_showOnlyQuic ? "All Protocols" : "Only QUIC", new Vector2(90, buttonHeight)))
+        {
+            _showOnlyQuic = !_showOnlyQuic;
+            if (_showOnlyQuic)
             {
-                _showPatternAnalysis = true;
+                _hideQuic = false;
+                _hideTcp = false;
+                _showOnlyTcp = false;
             }
+        }
+        ImGui.SameLine();
+
+        if (ImGui.Button(_hideTcp ? "Show TCP" : "Hide TCP", new Vector2(80, buttonHeight)))
+        {
+            _hideTcp = !_hideTcp;
+            if (_hideTcp) _showOnlyTcp = false;
+        }
+        ImGui.SameLine();
+
+        if (ImGui.Button(_showOnlyTcp ? "All Protocols" : "Only TCP", new Vector2(80, buttonHeight)))
+        {
+            _showOnlyTcp = !_showOnlyTcp;
+            if (_showOnlyTcp)
+            {
+                _hideQuic = false;
+                _hideTcp = false;
+                _showOnlyQuic = false;
+            }
+        }
+
+        ImGui.SameLine();
+        ImGui.Text("|"); ImGui.SameLine();
+
+        if (ImGui.Button("Timing Analysis", new Vector2(100, buttonHeight)))
+        {
+            _showPatternAnalysis = true;
         }
     }
 
@@ -7202,7 +8005,6 @@ public class PacketFeedTab : ITab
     {
         var contentAvail = ImGui.GetContentRegionAvail();
 
-        // FIXED: Ensure table fits within child window
         var tableFlags = ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg |
                         ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.ScrollY;
 
@@ -7221,10 +8023,26 @@ public class PacketFeedTab : ITab
             foreach (var pkt in packets)
             {
                 ImGui.TableNextRow();
-                if (_selectedPacket == pkt)
-                    ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, ImGui.GetColorU32(new Vector4(0.2f, 0.4f, 0.6f, 0.5f)));
+
+                bool isSelected = _selectedPacket == pkt;
 
                 ImGui.TableSetColumnIndex(0);
+
+                string selectableId = $"##pkt_{pkt.Timestamp.Ticks}_{pkt.GetHashCode()}";
+
+                if (ImGui.Selectable(selectableId, isSelected,
+                    ImGuiSelectableFlags.SpanAllColumns))
+                {
+                    _selectedPacket = pkt;
+                }
+
+                if (isSelected)
+                {
+                    ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0,
+                        ImGui.ColorConvertFloat4ToU32(new Vector4(0.2f, 0.4f, 0.8f, 0.4f)));
+                }
+
+                ImGui.SameLine();
                 ImGui.Text(pkt.Timestamp.ToString("HH:mm:ss.fff"));
 
                 ImGui.TableSetColumnIndex(1);
@@ -7241,8 +8059,6 @@ public class PacketFeedTab : ITab
                 ImGui.TableSetColumnIndex(3);
                 var info = OpcodeRegistry.GetInfo(pkt.OpcodeDecimal, pkt.Direction);
                 var name = info?.Name ?? pkt.OpcodeName;
-
-                // FIXED: Truncate long names to prevent overflow
                 if (name.Length > 30)
                     name = name[..27] + "...";
                 ImGui.Text(name);
@@ -7260,9 +8076,10 @@ public class PacketFeedTab : ITab
                 {
                     ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "[E]");
                 }
-
-                if (ImGui.IsItemClicked())
-                    _selectedPacket = pkt;
+                if (!pkt.IsTcp)
+                {
+                    ImGui.TextColored(new Vector4(0.4f, 0.6f, 0.8f, 1), "[Q]");
+                }
             }
             ImGui.EndTable();
         }
@@ -7279,13 +8096,26 @@ public class PacketFeedTab : ITab
             if (!string.IsNullOrEmpty(_filterOpcode) &&
                 !p.OpcodeDecimal.ToString("X4").Contains(_filterOpcode, StringComparison.OrdinalIgnoreCase))
                 return false;
+
             if (_showOnlyCritical)
             {
                 var info = OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction);
                 if (info?.IsCritical != true) return false;
             }
+
             if (_showOnlyUnknown && OpcodeRegistry.IsKnownOpcode(p.OpcodeDecimal, p.Direction))
                 return false;
+
+            bool isEncrypted = p.EncryptionHint == "encrypted";
+            if (_hideEncrypted && isEncrypted) return false;
+            if (_showOnlyEncrypted && !isEncrypted) return false;
+
+            bool isQuic = !p.IsTcp;
+            if (_hideQuic && isQuic) return false;
+            if (_showOnlyQuic && !isQuic) return false;
+            if (_hideTcp && p.IsTcp) return false;
+            if (_showOnlyTcp && !p.IsTcp) return false;
+
             return true;
         }).ToList();
     }
@@ -7295,110 +8125,223 @@ public class PacketFeedTab : ITab
         if (_selectedPacket == null)
         {
             ImGui.TextColored(Theme.ColTextMuted, "Select a packet to view details");
+            RenderGlobalAnalysis();
             return;
         }
 
         var pkt = _selectedPacket;
-        var analysis = HyForce.Protocol.PacketInspector.Analyze(new CapturedPacket
-        {
-            RawBytes = Array.Empty<byte>(),
-            Direction = pkt.Direction,
-            IsTcp = pkt.IsTcp,
-            Timestamp = pkt.Timestamp,
-            Opcode = pkt.OpcodeDecimal
-        });
 
-        // FIXED: Use BeginChild with proper sizing to prevent overflow
-        var contentAvail = ImGui.GetContentRegionAvail();
-
-        ImGui.BeginChild("DetailsScroll", contentAvail, ImGuiChildFlags.None);
-
-        ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), analysis.PacketName);
+        // Header
+        ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), pkt.OpcodeName);
         ImGui.SameLine();
         ImGui.TextColored(Theme.ColTextMuted, $"0x{pkt.OpcodeDecimal:X4}");
-
-        if (analysis.IsCritical)
-        {
-            ImGui.SameLine();
-            ImGui.TextColored(new Vector4(1, 0.8f, 0.2f, 1), " CRITICAL");
-        }
-
         ImGui.Separator();
 
+        // Basic info
         ImGui.Text("Direction: "); ImGui.SameLine();
         var dirColor = pkt.Direction == PacketDirection.ClientToServer
             ? new Vector4(0.3f, 0.8f, 0.3f, 1)
             : new Vector4(0.8f, 0.5f, 0.2f, 1);
         ImGui.TextColored(dirColor, pkt.Direction.ToString());
 
-        ImGui.Text($"Category: {analysis.Category}");
-
-        // FIXED: Word wrap for long descriptions
-        ImGui.TextWrapped($"Description: {analysis.Description}");
         ImGui.Text($"Size: {pkt.ByteLength} bytes");
-        ImGui.Text($"Protocol: UDP/QUIC");
+        ImGui.Text($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
 
-        ImGui.Separator();
-        ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Processing Info");
+        // Deep encryption analysis
+        RenderDeepEncryptionAnalysis(pkt);
 
-        if (pkt.IsCompressed)
+        // Memory bypass status
+        RenderMemoryBypassStatus();
+
+        // QUIC specific
+        if (!pkt.IsTcp && pkt.QuicInfo != null)
         {
-            ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), $"Compression: {pkt.CompressionMethod}");
-        }
-        else
-        {
-            ImGui.Text("Compression: none");
+            RenderQuicAnalysis(pkt);
         }
 
-        var encColor = pkt.EncryptionHint == "encrypted"
-            ? new Vector4(1, 0.3f, 0.3f, 1)
-            : new Vector4(0.3f, 1, 0.3f, 1);
-        ImGui.TextColored(encColor, $"Encryption: {pkt.EncryptionHint}");
+        // Hex preview
+        RenderHexPreview(pkt);
 
+        // Export buttons
         ImGui.Separator();
-        ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Entropy Analysis");
+        if (ImGui.Button("Copy Hex", new Vector2(100, 28)))
+        {
+            try { TextCopy.ClipboardService.SetText(pkt.RawHexPreview); } catch { }
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Export This Packet", new Vector2(130, 28)))
+        {
+            ExportSinglePacket(pkt);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Export Full Analysis", new Vector2(140, 28)))
+        {
+            ExportDetailedPacketLog();
+        }
+    }
 
-        double entropy = 0;
+    private void RenderDeepEncryptionAnalysis(PacketLogEntry pkt)
+    {
+        ImGui.Separator();
+        ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Deep Encryption Analysis");
+
+        double fullEntropy = 0, headerEntropy = 0, payloadEntropy = 0;
+        byte[]? bytes = null;
+
         try
         {
             var hexString = pkt.RawHexPreview.Replace("-", "");
             if (hexString.Length % 2 == 0 && hexString.Length > 0)
             {
-                var bytes = Convert.FromHexString(hexString);
-                entropy = ByteUtils.CalculateEntropy(bytes);
+                bytes = Convert.FromHexString(hexString);
+                fullEntropy = ByteUtils.CalculateEntropy(bytes);
+
+                if (bytes.Length > 20)
+                {
+                    headerEntropy = ByteUtils.CalculateEntropy(bytes.Take(20).ToArray());
+                    payloadEntropy = ByteUtils.CalculateEntropy(bytes.Skip(20).ToArray());
+                }
             }
         }
         catch { }
 
-        ImGui.Text($"Entropy: {entropy:F2}");
-        var entropyColor = entropy > 7.8 ? new Vector4(1, 0.3f, 0.3f, 1) :
-                          entropy > 7.0 ? new Vector4(1, 0.8f, 0.2f, 1) :
-                          new Vector4(0.3f, 1, 0.3f, 1);
+        // Entropy display
+        ImGui.Text($"Full Packet Entropy: {fullEntropy:F2}");
+        if (bytes != null && bytes.Length > 20)
+        {
+            ImGui.Text($"Header (20B): {headerEntropy:F2}");
+            ImGui.Text($"Payload (rest): {payloadEntropy:F2}");
 
-        // FIXED: Constrain progress bar width
-        ImGui.ProgressBar((float)(entropy / 8.0), new Vector2(Math.Min(300, ImGui.GetContentRegionAvail().X - 20), 20),
-            entropy > 7.8 ? "High" : "Low");
-        ImGui.TextColored(entropyColor, entropy > 7.8 ? "Likely encrypted" : "Likely structured");
+            // Progress bars
+            ImGui.ProgressBar((float)(fullEntropy / 8.0), new Vector2(200, 15), "Full");
+            ImGui.ProgressBar((float)(headerEntropy / 8.0), new Vector2(200, 15), "Header");
+            ImGui.ProgressBar((float)(payloadEntropy / 8.0), new Vector2(200, 15), "Payload");
+        }
 
-        if (analysis.Fields.Count > 0)
+        // Verdict
+        string verdict;
+        Vector4 verdictColor;
+
+        if (fullEntropy > 7.8)
+        {
+            verdict = "STRONG ENCRYPTION - Keys required";
+            verdictColor = new Vector4(1, 0.2f, 0.2f, 1);
+        }
+        else if (fullEntropy > 7.0)
+        {
+            verdict = "WEAK ENCRYPTION / COMPRESSED - Possible to crack";
+            verdictColor = new Vector4(1, 0.6f, 0.2f, 1);
+        }
+        else if (fullEntropy > 5.0)
+        {
+            verdict = "STRUCTURED DATA - Partially readable";
+            verdictColor = new Vector4(0.2f, 0.8f, 0.2f, 1);
+        }
+        else
+        {
+            verdict = "PLAINTEXT / PROTOCOL HEADERS - Fully readable";
+            verdictColor = new Vector4(0.2f, 1, 0.2f, 1);
+        }
+
+        ImGui.TextColored(verdictColor, $"Verdict: {verdict}");
+
+        // Pattern detection
+        if (bytes != null)
         {
             ImGui.Separator();
-            ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Parsed Fields");
-            foreach (var field in analysis.Fields)
+            ImGui.TextColored(new Vector4(0.6f, 0.8f, 1, 1), "Pattern Analysis");
+
+            bool hasRepeating = bytes.GroupBy(b => b).Any(g => g.Count() > bytes.Length / 4);
+            bool hasNulls = bytes.Any(b => b == 0);
+            bool hasAscii = bytes.Any(b => b >= 32 && b <= 126);
+            int uniqueBytes = bytes.Distinct().Count();
+
+            ImGui.Text($"Unique bytes: {uniqueBytes}/{bytes.Length} ({100.0 * uniqueBytes / bytes.Length:F1}%)");
+            ImGui.Text($"Repeating patterns: {(hasRepeating ? "YES" : "No")}");
+            ImGui.Text($"Null bytes: {(hasNulls ? "YES" : "No")}");
+            ImGui.Text($"ASCII content: {(hasAscii ? "YES" : "No")}");
+
+            // Check for known opcodes in raw data
+            if (bytes.Length >= 2)
             {
-                ImGui.TextColored(new Vector4(0.6f, 0.8f, 1, 1), $"{field.Key}:");
-                ImGui.SameLine();
-                // FIXED: Word wrap for field values
-                ImGui.TextWrapped(field.Value);
+                for (int i = 0; i < Math.Min(10, bytes.Length - 1); i++)
+                {
+                    ushort testOpcode = (ushort)((bytes[i] << 8) | bytes[i + 1]);
+                    var info = OpcodeRegistry.GetInfo(testOpcode, pkt.Direction);
+                    if (info != null)
+                    {
+                        ImGui.TextColored(new Vector4(0.2f, 1, 0.4f, 1),
+                            $"Possible opcode at offset {i}: 0x{testOpcode:X4} = {info.Name}");
+                    }
+                }
+            }
+        }
+    }
+
+    private void RenderMemoryBypassStatus()
+    {
+        ImGui.Separator();
+        ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Memory Bypass Status");
+
+        int keyCount = PacketDecryptor.DiscoveredKeys.Count;
+        bool hasKeys = keyCount > 0;
+
+        if (hasKeys)
+        {
+            ImGui.TextColored(new Vector4(0.2f, 1, 0.2f, 1), $"Keys available: {keyCount}");
+            ImGui.Text($"Successful decryptions: {PacketDecryptor.SuccessfulDecryptions}");
+            ImGui.Text($"Failed attempts: {PacketDecryptor.FailedDecryptions}");
+        }
+        else
+        {
+            ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "No keys available");
+            ImGui.Text("Decryption bypass: FAILED");
+            ImGui.TextColored(Theme.ColTextMuted, "Use Memory tab to find TLS keys");
+
+            // Quick memory check
+            var processes = Process.GetProcessesByName("Hytale");
+            if (processes.Length > 0)
+            {
+                ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1),
+                    $"Hytale running (PID: {processes[0].Id}) - Ready to attach");
+            }
+            else
+            {
+                ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1), "Hytale not running");
+            }
+        }
+    }
+
+    private void RenderQuicAnalysis(PacketLogEntry pkt)
+    {
+        ImGui.Separator();
+        ImGui.TextColored(new Vector4(0.4f, 0.6f, 1, 1), "QUIC Protocol Analysis");
+
+        if (pkt.QuicInfo != null)
+        {
+            ImGui.Text($"Header Type: {pkt.QuicInfo.HeaderType}");
+            ImGui.Text($"Version: 0x{pkt.QuicInfo.Version:X8}");
+            ImGui.Text($"Packet Number: {pkt.QuicInfo.PacketNumber}");
+
+            if (pkt.QuicInfo.ClientConnectionId.Length > 0)
+            {
+                string cid = BitConverter.ToString(pkt.QuicInfo.ClientConnectionId.Take(8).ToArray());
+                ImGui.Text($"Connection ID: {cid}");
             }
         }
 
+        ImGui.TextColored(Theme.ColTextMuted, "QUIC uses TLS 1.3 encryption");
+        ImGui.TextColored(Theme.ColTextMuted, "Payload is encrypted with session keys");
+        ImGui.TextColored(Theme.ColTextMuted, "Need TLS keys from memory to decrypt");
+    }
+
+    private void RenderHexPreview(PacketLogEntry pkt)
+    {
         ImGui.Separator();
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Hex Preview");
 
-        // FIXED: Constrain hex display to prevent overflow
         var hexLines = pkt.RawHexPreview.Split('-');
-        for (int i = 0; i < hexLines.Length && i < 32; i += 8) // Limit to 32 bytes displayed
+        for (int i = 0; i < hexLines.Length && i < 32; i += 8)
         {
             var line = string.Join(" ", hexLines.Skip(i).Take(8));
             var addr = (i * 3).ToString("X3");
@@ -7406,14 +8349,241 @@ public class PacketFeedTab : ITab
             ImGui.SameLine();
             ImGui.Text(line);
         }
+    }
 
+    private void RenderGlobalAnalysis()
+    {
         ImGui.Separator();
-        if (ImGui.Button("Copy Hex", new Vector2(120, 30)))
+        ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), "Global Traffic Analysis");
+
+        var packets = _state.PacketLog.GetLast(1000);
+
+        if (!packets.Any())
         {
-            try { TextCopy.ClipboardService.SetText(pkt.RawHexPreview); } catch { }
+            ImGui.TextColored(Theme.ColTextMuted, "No packets captured yet");
+            return;
         }
 
-        ImGui.EndChild(); // End DetailsScroll
+        // Timing analysis
+        if (_showTimingAnalysis)
+        {
+            ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Timing Patterns");
+
+            var timing = packets
+                .GroupBy(p => p.OpcodeDecimal)
+                .Select(g => new {
+                    Opcode = g.Key,
+                    Name = g.First().OpcodeName,
+                    Count = g.Count(),
+                    AvgInterval = g.Count() > 1 ?
+                        g.Zip(g.Skip(1), (a, b) => (b.Timestamp - a.Timestamp).TotalMilliseconds).Average() : 0,
+                    TotalBytes = g.Sum(p => p.ByteLength),
+                    IsEncrypted = g.All(p => p.EncryptionHint == "encrypted")
+                })
+                .OrderByDescending(x => x.Count)
+                .Take(10);
+
+            foreach (var t in timing)
+            {
+                string encMark = t.IsEncrypted ? "[E]" : "[C]";
+                ImGui.Text($"0x{t.Opcode:X4} {encMark}: {t.Count} pkts, " +
+                          $"{t.AvgInterval:F0}ms avg, {t.TotalBytes} bytes");
+            }
+        }
+
+        // Memory status
+        if (_showMemoryStatus)
+        {
+            ImGui.Separator();
+            ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Memory Scanner Status");
+
+            int keys = PacketDecryptor.DiscoveredKeys.Count;
+            ImGui.Text($"Keys found: {keys}");
+            ImGui.Text($"Decryption attempts: {PacketDecryptor.FailedDecryptions}");
+
+            if (keys == 0)
+            {
+                ImGui.TextColored(new Vector4(1, 0.6f, 0.2f, 1),
+                    "TIP: Attach Memory Scanner to Hytale process");
+                ImGui.TextColored(new Vector4(1, 0.6f, 0.2f, 1),
+                    "Then click 'Find TLS Keys' or 'Enable SSL Keylog'");
+            }
+        }
+    }
+
+    private void ExportSinglePacket(PacketLogEntry pkt)
+    {
+        try
+        {
+            string filename = Path.Combine(_state.ExportDirectory,
+                $"packet_{pkt.Timestamp:yyyyMMdd_HHmmss}_{pkt.OpcodeDecimal:X4}.txt");
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("=== SINGLE PACKET EXPORT ===");
+            sb.AppendLine($"Timestamp: {pkt.Timestamp:O}");
+            sb.AppendLine($"Direction: {pkt.Direction}");
+            sb.AppendLine($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
+            sb.AppendLine($"Opcode: 0x{pkt.OpcodeDecimal:X4}");
+            sb.AppendLine($"Name: {pkt.OpcodeName}");
+            sb.AppendLine($"Size: {pkt.ByteLength} bytes");
+            sb.AppendLine($"Encryption: {pkt.EncryptionHint}");
+            sb.AppendLine($"Compression: {pkt.CompressionMethod}");
+            sb.AppendLine();
+
+            // Entropy
+            try
+            {
+                var bytes = Convert.FromHexString(pkt.RawHexPreview.Replace("-", ""));
+                double entropy = ByteUtils.CalculateEntropy(bytes);
+                sb.AppendLine($"Entropy: {entropy:F2}");
+
+                // Pattern analysis
+                sb.AppendLine($"Unique bytes: {bytes.Distinct().Count()}");
+                sb.AppendLine($"Null bytes: {bytes.Count(b => b == 0)}");
+                sb.AppendLine($"ASCII bytes: {bytes.Count(b => b >= 32 && b <= 126)}");
+            }
+            catch { }
+
+            sb.AppendLine();
+            sb.AppendLine("=== RAW HEX ===");
+            sb.AppendLine(pkt.RawHexPreview);
+
+            File.WriteAllText(filename, sb.ToString());
+            _state.AddInGameLog($"[EXPORT] Packet saved to {Path.GetFileName(filename)}");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[EXPORT] Error: {ex.Message}");
+        }
+    }
+
+    private void ExportDetailedPacketLog()
+    {
+        try
+        {
+            string filename = Path.Combine(_state.ExportDirectory,
+                $"detailed_analysis_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("=== HYFORCE DETAILED PACKET ANALYSIS ===");
+            sb.AppendLine($"Export Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine($"Session Duration: {(_state.StartTime.HasValue ? (DateTime.Now - _state.StartTime.Value).ToString(@"hh\:mm\:ss") : "N/A")}");
+            sb.AppendLine($"Total Packets: {_state.PacketLog.TotalPackets}");
+            sb.AppendLine($"Total Bytes: {FormatBytes(_state.PacketLog.BytesSc + _state.PacketLog.BytesCs)}");
+            sb.AppendLine($"Keys Available: {PacketDecryptor.DiscoveredKeys.Count}");
+            sb.AppendLine();
+
+            // Timing analysis
+            sb.AppendLine("=== TIMING ANALYSIS ===");
+            var packets = _state.PacketLog.GetAll().Take(2000).ToList();
+
+            var timing = packets
+                .GroupBy(p => p.OpcodeDecimal)
+                .Select(g => new {
+                    Opcode = g.Key,
+                    Name = g.First().OpcodeName,
+                    Count = g.Count(),
+                    FirstSeen = g.Min(p => p.Timestamp),
+                    LastSeen = g.Max(p => p.Timestamp),
+                    AvgInterval = g.Count() > 1 ?
+                        g.Zip(g.Skip(1), (a, b) => (b.Timestamp - a.Timestamp).TotalMilliseconds).Average() : 0,
+                    MinInterval = g.Count() > 1 ?
+                        g.Zip(g.Skip(1), (a, b) => (b.Timestamp - a.Timestamp).TotalMilliseconds).Min() : 0,
+                    MaxInterval = g.Count() > 1 ?
+                        g.Zip(g.Skip(1), (a, b) => (b.Timestamp - a.Timestamp).TotalMilliseconds).Max() : 0,
+                    TotalBytes = g.Sum(p => p.ByteLength),
+                    AvgSize = g.Average(p => p.ByteLength),
+                    IsEncrypted = g.All(p => p.EncryptionHint == "encrypted"),
+                    IsQuic = g.All(p => !p.IsTcp)
+                })
+                .OrderByDescending(x => x.Count);
+
+            foreach (var t in timing)
+            {
+                sb.AppendLine();
+                sb.AppendLine($"Opcode: 0x{t.Opcode:X4} ({t.Name})");
+                sb.AppendLine($"  Count: {t.Count}");
+                sb.AppendLine($"  Protocol: {(t.IsQuic ? "QUIC" : "TCP")}");
+                sb.AppendLine($"  Encryption: {(t.IsEncrypted ? "Encrypted" : "Clear")}");
+                sb.AppendLine($"  Total bytes: {t.TotalBytes}");
+                sb.AppendLine($"  Avg size: {t.AvgSize:F1} bytes");
+                sb.AppendLine($"  Avg interval: {t.AvgInterval:F2}ms");
+                sb.AppendLine($"  Min/Max interval: {t.MinInterval:F2}ms / {t.MaxInterval:F2}ms");
+                sb.AppendLine($"  Duration: {(t.LastSeen - t.FirstSeen).TotalSeconds:F1}s");
+            }
+
+            // Sample packets
+            sb.AppendLine();
+            sb.AppendLine("=== SAMPLE PACKETS (Last 50) ===");
+
+            foreach (var pkt in packets.TakeLast(50))
+            {
+                sb.AppendLine();
+                sb.AppendLine($"[{pkt.Timestamp:HH:mm:ss.fff}] {pkt.DirStr} 0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeName})");
+                sb.AppendLine($"  Size: {pkt.ByteLength} bytes | {(pkt.IsTcp ? "TCP" : "QUIC")} | {pkt.EncryptionHint}");
+
+                try
+                {
+                    var bytes = Convert.FromHexString(pkt.RawHexPreview.Replace("-", ""));
+                    double entropy = ByteUtils.CalculateEntropy(bytes);
+                    sb.AppendLine($"  Entropy: {entropy:F2}");
+
+                    // Extract strings
+                    var strings = ByteUtils.ExtractStrings(bytes, 4);
+                    if (strings.Any())
+                    {
+                        sb.AppendLine($"  Strings: {string.Join(", ", strings.Take(5))}");
+                    }
+                }
+                catch { }
+
+                sb.AppendLine($"  HEX: {pkt.RawHexPreview}");
+            }
+
+            // Memory analysis
+            sb.AppendLine();
+            sb.AppendLine("=== MEMORY BYPASS ANALYSIS ===");
+            sb.AppendLine($"Keys discovered: {PacketDecryptor.DiscoveredKeys.Count}");
+            sb.AppendLine($"Successful decryptions: {PacketDecryptor.SuccessfulDecryptions}");
+            sb.AppendLine($"Failed decryptions: {PacketDecryptor.FailedDecryptions}");
+
+            foreach (var key in PacketDecryptor.DiscoveredKeys)
+            {
+                sb.AppendLine();
+                sb.AppendLine($"Key Type: {key.Type}");
+                sb.AppendLine($"Source: {key.Source}");
+                sb.AppendLine($"Discovered: {key.DiscoveredAt}");
+                if (key.MemoryAddress.HasValue)
+                    sb.AppendLine($"Address: 0x{(ulong)key.MemoryAddress.Value:X}");
+            }
+
+            File.WriteAllText(filename, sb.ToString());
+            _state.AddInGameLog($"[EXPORT] Full analysis saved: {Path.GetFileName(filename)}");
+
+            // Try to open folder
+            try
+            {
+                System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);
+            }
+            catch { }
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[EXPORT] Error: {ex.Message}");
+        }
+    }
+
+    private string FormatBytes(long bytes)
+    {
+        string[] suffixes = { "B", "KB", "MB", "GB" };
+        int i = 0;
+        double d = bytes;
+        while (d >= 1024 && i < suffixes.Length - 1)
+        {
+            d /= 1024;
+            i++;
+        }
+        return $"{d:F2} {suffixes[i]}";
     }
 }
 

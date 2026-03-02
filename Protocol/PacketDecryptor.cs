@@ -1,4 +1,4 @@
-﻿// FILE: Protocol/PacketDecryptor.cs - ENHANCED WITH AUTO-EXTRACTION
+﻿// FILE: Protocol/PacketDecryptor.cs - ENHANCED WITH AUTO-EXTRACTION AND VALIDATION
 using System.Security.Cryptography;
 using System.Text;
 
@@ -11,7 +11,7 @@ public static class PacketDecryptor
         None,
         AES128GCM,
         AES256GCM,
-        ChaCha20Poly1305,  // Added for QUIC TLS 1.3
+        ChaCha20Poly1305,
         XOR,
         Custom
     }
@@ -48,25 +48,31 @@ public static class PacketDecryptor
     {
         if (encryptedData == null || encryptedData.Length < 16)
         {
-            return new DecryptionResult
-            {
-                Success = false,
-                ErrorMessage = "Data too short"
-            };
+            return new DecryptionResult { Success = false, ErrorMessage = "Data too short" };
         }
 
-        // Try each discovered key
+        // Try each discovered key with validation
         foreach (var key in DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt))
         {
             var result = TryDecryptWithKey(encryptedData, key, associatedData);
-            if (result.Success)
+
+            // Validate decrypted data looks reasonable
+            if (result.Success && result.DecryptedData != null)
             {
-                SuccessfulDecryptions++;
-                return result;
+                if (IsValidDecryptedData(result.DecryptedData))
+                {
+                    SuccessfulDecryptions++;
+                    return result;
+                }
+                else
+                {
+                    result.Success = false;
+                    result.ErrorMessage = "Key produced invalid data";
+                }
             }
         }
 
-        // Try common/default keys
+        // Try common/default keys as last resort
         var defaultResult = TryCommonKeys(encryptedData, associatedData);
         if (defaultResult.Success)
         {
@@ -75,17 +81,98 @@ public static class PacketDecryptor
         }
 
         FailedDecryptions++;
-        return new DecryptionResult
+        return new DecryptionResult { Success = false, ErrorMessage = "No valid decryption key found" };
+    }
+
+    // NEW: QUIC-specific decryption handling
+    public static DecryptionResult TryDecryptQUIC(byte[] packetData, EncryptionKey key)
+    {
+        if (packetData.Length < 21) // Minimum QUIC packet size
+            return new DecryptionResult { Success = false, ErrorMessage = "Packet too small for QUIC" };
+
+        try
         {
-            Success = false,
-            ErrorMessage = "No valid decryption key found"
-        };
+            bool isLongHeader = (packetData[0] & 0x80) != 0;
+            int headerLen;
+            byte[]? headerBytes = null;
+
+            if (isLongHeader)
+            {
+                // Long header: type(1) + version(4) + DCID len(1) + DCID + SCID len(1) + SCID + len(2) + PN
+                if (packetData.Length < 7) return new DecryptionResult { Success = false };
+                int dcidLen = packetData[5];
+                int scidLen = packetData[6 + dcidLen];
+                headerLen = 7 + dcidLen + scidLen + 2 + 4; // Approximate
+                if (headerLen > packetData.Length) headerLen = 16; // Fallback
+            }
+            else
+            {
+                // Short header: type(1) + DCID (4-8 bytes typically) + PN (1-4 bytes)
+                headerLen = 1 + 8; // Assume 8-byte DCID for Hytale
+            }
+
+            headerLen = Math.Min(headerLen, packetData.Length - 16);
+            headerBytes = packetData[..headerLen];
+
+            var ciphertext = packetData[headerLen..^16];
+            var tag = packetData[^16..];
+
+            // Build nonce from IV + packet number (simplified)
+            var nonce = new byte[12];
+            Array.Copy(key.IV, 0, nonce, 0, 12);
+
+            // XOR packet number into nonce last bytes if available
+            if (headerLen >= 4 && packetData.Length > headerLen)
+            {
+                for (int i = 0; i < 4 && i < (packetData.Length - headerLen); i++)
+                {
+                    nonce[8 + i] ^= packetData[headerLen - 4 + i];
+                }
+            }
+
+            using var aes = new AesGcm(key.Key, 16);
+            var plaintext = new byte[ciphertext.Length];
+
+            aes.Decrypt(nonce, ciphertext, tag, plaintext, headerBytes);
+
+            // Validate result
+            if (!IsValidDecryptedData(plaintext))
+            {
+                return new DecryptionResult { Success = false, ErrorMessage = "Decrypted data validation failed" };
+            }
+
+            return new DecryptionResult
+            {
+                Success = true,
+                DecryptedData = plaintext,
+                DetectedType = EncryptionType.AES256GCM,
+                Metadata =
+                {
+                    ["algorithm"] = "AES-256-GCM",
+                    ["original_size"] = packetData.Length,
+                    ["decrypted_size"] = plaintext.Length,
+                    ["header_len"] = headerLen,
+                    ["quic_header_type"] = isLongHeader ? "Long" : "Short"
+                }
+            };
+        }
+        catch (Exception ex)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
+        }
     }
 
     private static DecryptionResult TryDecryptWithKey(byte[] data, EncryptionKey key, byte[]? associatedData)
     {
         try
         {
+            // Try QUIC-specific handling first for UDP packets
+            if (data.Length > 0 && (data[0] & 0x80) != 0 || data.Length > 1000)
+            {
+                var quicResult = TryDecryptQUIC(data, key);
+                if (quicResult.Success) return quicResult;
+            }
+
             return key.Type switch
             {
                 EncryptionType.AES128GCM or EncryptionType.AES256GCM =>
@@ -94,16 +181,12 @@ public static class PacketDecryptor
                     DecryptChaCha20(data, key.Key, key.IV, associatedData),
                 EncryptionType.XOR =>
                     DecryptXOR(data, key.Key),
-                _ => new DecryptionResult { Success = false }
+                _ => new DecryptionResult { Success = false, ErrorMessage = "Unknown key type" }
             };
         }
         catch (Exception ex)
         {
-            return new DecryptionResult
-            {
-                Success = false,
-                ErrorMessage = ex.Message
-            };
+            return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
         }
     }
 
@@ -113,7 +196,7 @@ public static class PacketDecryptor
         {
             // Check minimum size: nonce(12) + ciphertext(1+) + tag(16)
             if (data.Length < 29)
-                return new DecryptionResult { Success = false };
+                return new DecryptionResult { Success = false, ErrorMessage = "Data too short for AES-GCM" };
 
             using var aes = new AesGcm(key, 16);
 
@@ -124,21 +207,20 @@ public static class PacketDecryptor
 
             aes.Decrypt(nonce, ciphertext, tag, plaintext, associatedData);
 
-            // Verify it looks like valid data
-            double entropy = CalculateEntropy(plaintext);
-            bool looksValid = entropy < 7.5 || ContainsPrintableStrings(plaintext);
-
-            if (!looksValid)
-                return new DecryptionResult { Success = false };
+            // Validate it looks like valid data
+            if (!IsValidDecryptedData(plaintext))
+            {
+                return new DecryptionResult { Success = false, ErrorMessage = "Validation failed" };
+            }
 
             return new DecryptionResult
             {
                 Success = true,
                 DecryptedData = plaintext,
                 DetectedType = EncryptionType.AES256GCM,
-                Metadata = {
+                Metadata =
+                {
                     ["algorithm"] = "AES-GCM",
-                    ["entropy"] = entropy,
                     ["original_size"] = data.Length,
                     ["decrypted_size"] = plaintext.Length
                 }
@@ -156,9 +238,9 @@ public static class PacketDecryptor
         {
             // ChaCha20-Poly1305: nonce(12) + ciphertext + tag(16)
             if (data.Length < 29 || key.Length != 32)
-                return new DecryptionResult { Success = false };
+                return new DecryptionResult { Success = false, ErrorMessage = "Invalid ChaCha20 data" };
 
-            // Note: .NET doesn't have built-in ChaCha20, use BouncyCastle or libsodium
+            // Note: .NET 5+ doesn't have built-in ChaCha20, would need BouncyCastle
             // For now, return failure but mark as potential ChaCha20
             return new DecryptionResult
             {
@@ -174,7 +256,7 @@ public static class PacketDecryptor
 
     private static DecryptionResult DecryptXOR(byte[] data, byte[] key)
     {
-        if (key.Length == 0) return new DecryptionResult { Success = false };
+        if (key.Length == 0) return new DecryptionResult { Success = false, ErrorMessage = "Empty XOR key" };
 
         var result = new byte[data.Length];
         for (int i = 0; i < data.Length; i++)
@@ -190,7 +272,8 @@ public static class PacketDecryptor
             Success = looksValid,
             DecryptedData = result,
             DetectedType = EncryptionType.XOR,
-            Metadata = {
+            Metadata =
+            {
                 ["entropy"] = entropy,
                 ["key_length"] = key.Length
             }
@@ -207,7 +290,8 @@ public static class PacketDecryptor
         {
             Key = zeroKey32,
             IV = new byte[12],
-            Type = EncryptionType.AES256GCM
+            Type = EncryptionType.AES256GCM,
+            Source = "Common Debug Key"
         }, associatedData);
 
         if (result.Success) return result;
@@ -218,7 +302,8 @@ public static class PacketDecryptor
             "HYTALE_DEBUG_KEY_32_BYTES_LONG!!",
             "0123456789abcdef0123456789abcdef",
             "hytalehytalehytalehytalehytale12",
-            "QUIC_DEBUG_KEY_32_BYTES_LONG!!"
+            "QUIC_DEBUG_KEY_32_BYTES_LONG!!",
+            "HytaleHytaleHytaleHytaleHytale!!"
         };
 
         foreach (var debugKey in debugKeys)
@@ -230,7 +315,8 @@ public static class PacketDecryptor
                 {
                     Key = keyBytes,
                     IV = new byte[12],
-                    Type = EncryptionType.AES256GCM
+                    Type = EncryptionType.AES256GCM,
+                    Source = "Common Debug Key"
                 }, associatedData);
 
                 if (result.Success)
@@ -244,10 +330,37 @@ public static class PacketDecryptor
         return new DecryptionResult { Success = false };
     }
 
+    // NEW: Validate decrypted data looks like valid protocol data
+    private static bool IsValidDecryptedData(byte[] data)
+    {
+        if (data.Length < 2) return false;
+
+        // Check for reasonable entropy (not too random, not too structured)
+        double entropy = CalculateEntropy(data);
+        if (entropy > 7.9) return false; // Still looks encrypted
+
+        // Look for common QUIC/Hytale frame types
+        byte firstByte = data[0];
+
+        // Valid QUIC short header frame types
+        bool hasValidFrame = firstByte <= 0x20 || // Common frames
+                            (firstByte >= 0x40 && firstByte <= 0x7F) || // ACK frames
+                            (firstByte >= 0x80 && firstByte <= 0xBF); // Stream frames
+
+        // Or check for printable strings (protocol often contains strings)
+        bool hasStrings = ContainsPrintableStrings(data, 4);
+
+        // Or reasonable structure (not all zeros, not all same byte)
+        bool hasStructure = data.Any(b => b != 0) && data.Distinct().Count() > 4;
+
+        return hasValidFrame || hasStrings || (entropy < 6.0 && hasStructure);
+    }
+
     public static void AddKey(EncryptionKey key)
     {
         if (key.Key == null || key.Key.Length == 0) return;
 
+        // Check for duplicates
         if (!DiscoveredKeys.Any(k => k.Key.SequenceEqual(key.Key)))
         {
             DiscoveredKeys.Add(key);
@@ -274,12 +387,8 @@ public static class PacketDecryptor
 
         try
         {
-            // Look for SSLKEYLOGFILE patterns in memory
-            // TLS 1.3 secrets are 32 or 48 bytes with high entropy
-            // and are often near "CLIENT_TRAFFIC_SECRET" strings
-
-            // This would need memory scanning implementation
-            // For now, placeholder for auto-extraction logic
+            // This is called from MemoryTab - actual scanning happens there
+            // This method is for external triggers
         }
         catch { }
     }
@@ -299,17 +408,21 @@ public static class PacketDecryptor
                 if (parts.Length >= 3 &&
                     (parts[0].Contains("TRAFFIC_SECRET") || parts[0].Contains("HANDSHAKE_TRAFFIC_SECRET")))
                 {
-                    var secret = Convert.FromHexString(parts[2]);
-                    if (secret.Length == 32)
+                    try
                     {
-                        AddKey(new EncryptionKey
+                        var secret = Convert.FromHexString(parts[2]);
+                        if (secret.Length == 32 || secret.Length == 48)
                         {
-                            Key = secret,
-                            IV = new byte[12],
-                            Type = EncryptionType.AES256GCM,
-                            Source = $"SSLLog:{Path.GetFileName(path)}"
-                        });
+                            AddKey(new EncryptionKey
+                            {
+                                Key = secret,
+                                IV = new byte[12],
+                                Type = secret.Length == 32 ? EncryptionType.AES256GCM : EncryptionType.ChaCha20Poly1305,
+                                Source = $"SSLLog:{Path.GetFileName(path)}"
+                            });
+                        }
                     }
+                    catch (FormatException) { /* Invalid hex */ }
                 }
             }
         }

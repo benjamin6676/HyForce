@@ -1,5 +1,4 @@
-﻿// FILE: Tabs/DecryptionTab.cs - DECRYPTION MANAGEMENT UI
-using HyForce.Core;
+﻿using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
@@ -18,9 +17,25 @@ public class DecryptionTab : ITab
     private string _testData = "";
     private bool _autoDecrypt = true;
 
+    // NEW: UI state
+    private int _selectedKeyIndex = -1;
+    private bool _showKeyDetails = false;
+    private float _lastRefreshTime = 0;
+    private string _statusMessage = "";
+    private float _statusTime = 0;
+
     public DecryptionTab(AppState state)
     {
         _state = state;
+
+        // Subscribe to key updates
+        _state.OnKeysUpdated += OnKeysUpdated;
+    }
+
+    private void OnKeysUpdated()
+    {
+        _statusMessage = "Keys updated!";
+        _statusTime = (float)ImGui.GetTime();
     }
 
     public void Render()
@@ -28,12 +43,18 @@ public class DecryptionTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  PACKET DECRYPTION  �  Manage Encryption Keys");
+        ImGui.Text("  PACKET DECRYPTION  -  Manage Encryption Keys");
         ImGui.Separator();
         ImGui.Spacing();
 
-        // Key status
-        RenderKeyStatus();
+        // Show status message if recent
+        if (!string.IsNullOrEmpty(_statusMessage) && ImGui.GetTime() - _statusTime < 3.0)
+        {
+            ImGui.TextColored(Theme.ColSuccess, _statusMessage);
+        }
+
+        // Key status header with refresh button
+        RenderKeyStatusHeader();
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -53,23 +74,68 @@ public class DecryptionTab : ITab
         ImGui.EndChild();
     }
 
-    private void RenderKeyStatus()
+    private void RenderKeyStatusHeader()
     {
-        bool hasKeys = PacketDecryptor.DiscoveredKeys.Count > 0;
+        var status = _state.GetKeyStatus();
+        bool hasKeys = status.TotalKeys > 0;
 
         var color = hasKeys ? Theme.ColSuccess : Theme.ColWarn;
-        var status = hasKeys
-            ? $"ACTIVE - {PacketDecryptor.DiscoveredKeys.Count} keys available"
-            : "NO KEYS - Packets will be captured raw";
 
-        ImGui.TextColored(color, status);
+        ImGui.BeginGroup();
 
-        if (!hasKeys)
+        // Status indicator with icon
+        var drawList = ImGui.GetWindowDrawList();
+        var pos = ImGui.GetCursorScreenPos();
+
+        // Draw status circle
+        drawList.AddCircleFilled(pos + new Vector2(10, 12), 8,
+            ImGui.ColorConvertFloat4ToU32(color));
+        ImGui.Dummy(new Vector2(25, 24));
+
+        ImGui.SameLine();
+        ImGui.BeginGroup();
+
+        if (hasKeys)
         {
-            ImGui.TextWrapped("Use the Memory Scanner to find encryption keys, or enter them manually below.");
+            ImGui.TextColored(color, $"ACTIVE - {status.TotalKeys} keys available");
+
+            if (status.LastKeyAdded.HasValue)
+            {
+                var timeAgo = DateTime.Now - status.LastKeyAdded.Value;
+                ImGui.TextColored(Theme.ColTextMuted,
+                    $"Last added: {(timeAgo.TotalMinutes < 1 ? "just now" : $"{timeAgo.TotalMinutes:F0}m ago")}");
+            }
+        }
+        else
+        {
+            ImGui.TextColored(color, "NO KEYS - Packets captured raw");
+            ImGui.TextColored(Theme.ColTextMuted, "Use Memory Scanner or wait for SSL key log");
         }
 
+        ImGui.EndGroup();
+
+        // Refresh button - aligned right
+        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 120);
+
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.6f, 0.9f, 1f));
+        if (ImGui.Button("Refresh Keys", new Vector2(110, 28)))
+        {
+            _state.RefreshAllKeys();
+        }
+        ImGui.PopStyleColor();
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Rescan export directory for key files");
+
+        ImGui.EndGroup();
+
         ImGui.Checkbox("Auto-decrypt incoming packets", ref _autoDecrypt);
+
+        // Show key sources if available
+        if (status.KeySources.Any())
+        {
+            ImGui.TextColored(Theme.ColTextMuted, "Sources: " + string.Join(", ", status.KeySources.Take(3)));
+        }
     }
 
     private void RenderKeyManagement(float width)
@@ -97,26 +163,69 @@ public class DecryptionTab : ITab
 
         ImGui.Spacing();
         ImGui.Separator();
+
+        // Enhanced key list with details
         ImGui.TextColored(Theme.ColAccent, $"Discovered Keys ({PacketDecryptor.DiscoveredKeys.Count})");
 
         ImGui.BeginChild("##key_list", new Vector2(0, 200), ImGuiChildFlags.Borders);
 
         int index = 0;
-        foreach (var key in PacketDecryptor.DiscoveredKeys)
+        foreach (var key in PacketDecryptor.DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt))
         {
             ImGui.PushID(index++);
 
-            ImGui.TextColored(Theme.ColAccent, $"{key.Type}");
-            ImGui.Text($"  Source: {key.Source}");
+            bool isSelected = _selectedKeyIndex == index - 1;
 
-            string keyPreview = key.Key.Length > 8
-                ? BitConverter.ToString(key.Key.Take(8).ToArray()).Replace("-", " ") + "..."
-                : BitConverter.ToString(key.Key).Replace("-", " ");
+            // Key header with type and time
+            var timeAgo = DateTime.Now - key.DiscoveredAt;
+            string timeStr = timeAgo.TotalMinutes < 1 ? "now" : $"{timeAgo.TotalMinutes:F0}m";
+
+            ImGui.BeginGroup();
+
+            // Selection highlight
+            if (isSelected)
+                ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColAccent);
+
+            ImGui.Text($"{key.Type} [{timeStr}]");
+
+            if (isSelected)
+                ImGui.PopStyleColor();
+
+            ImGui.TextColored(Theme.ColTextMuted, $"  Source: {key.Source}");
+
+            // Key preview (first 8 bytes + ... + last 4 bytes)
+            string keyPreview = FormatKeyPreview(key.Key);
             ImGui.Text($"  Key: {keyPreview}");
 
             if (key.MemoryAddress.HasValue)
             {
-                ImGui.Text($"  Address: 0x{(ulong)key.MemoryAddress.Value:X}");
+                ImGui.TextColored(Theme.ColTextMuted,
+                    $"  Address: 0x{(ulong)key.MemoryAddress.Value:X}");
+            }
+
+            ImGui.EndGroup();
+
+            // Click to select
+            if (ImGui.IsItemClicked())
+            {
+                _selectedKeyIndex = isSelected ? -1 : index - 1;
+            }
+
+            // Right-click context menu
+            if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+                ImGui.OpenPopup($"key_ctx_{index}");
+
+            if (ImGui.BeginPopup($"key_ctx_{index}"))
+            {
+                if (ImGui.MenuItem("Copy Full Key"))
+                {
+                    CopyToClipboard(Convert.ToHexString(key.Key));
+                }
+                if (ImGui.MenuItem("Use for Test Decryption"))
+                {
+                    _testData = Convert.ToHexString(key.Key.Take(16).ToArray());
+                }
+                ImGui.EndPopup();
             }
 
             ImGui.Separator();
@@ -126,23 +235,88 @@ public class DecryptionTab : ITab
         if (PacketDecryptor.DiscoveredKeys.Count == 0)
         {
             ImGui.TextColored(Theme.ColTextMuted, "No keys discovered yet");
+            ImGui.Spacing();
+            ImGui.TextWrapped("Keys will appear here when:");
+            ImGui.BulletText("SSL key log file is detected");
+            ImGui.BulletText("Memory scanner finds keys");
+            ImGui.BulletText("Manually entered above");
         }
 
         ImGui.EndChild();
+
+        // Key details panel if selected
+        if (_selectedKeyIndex >= 0 && _selectedKeyIndex < PacketDecryptor.DiscoveredKeys.Count)
+        {
+            var selectedKey = PacketDecryptor.DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt).ElementAt(_selectedKeyIndex);
+            RenderKeyDetails(selectedKey);
+        }
+    }
+
+    private string FormatKeyPreview(byte[] key)
+    {
+        if (key.Length <= 12)
+            return BitConverter.ToString(key).Replace("-", " ");
+
+        var first = BitConverter.ToString(key.Take(8).ToArray()).Replace("-", " ");
+        var last = BitConverter.ToString(key.Skip(key.Length - 4).ToArray()).Replace("-", " ");
+        return $"{first} ... {last}";
+    }
+
+    private void RenderKeyDetails(PacketDecryptor.EncryptionKey key)
+    {
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.TextColored(Theme.ColAccent, "Key Details");
+
+        ImGui.Text($"Type: {key.Type}");
+        ImGui.Text($"Size: {key.Key.Length * 8} bits ({key.Key.Length} bytes)");
+        ImGui.Text($"Source: {key.Source}");
+        ImGui.Text($"Discovered: {key.DiscoveredAt:HH:mm:ss}");
+
+        if (key.MemoryAddress.HasValue)
+        {
+            ImGui.Text($"Memory Address: 0x{(ulong)key.MemoryAddress.Value:X16}");
+        }
+
+        // Full key display with copy button
+        string fullKey = Convert.ToHexString(key.Key);
+        ImGui.InputText("Full Key (hex)", ref fullKey, (uint)fullKey.Length,
+            ImGuiInputTextFlags.ReadOnly);
+
+        if (ImGui.Button("Copy Full Key", new Vector2(100, 24)))
+        {
+            CopyToClipboard(fullKey);
+        }
     }
 
     private void RenderStatsAndTesting(float width)
     {
         ImGui.TextColored(Theme.ColAccent, "Decryption Statistics");
 
-        ImGui.Text($"Successful: {PacketDecryptor.SuccessfulDecryptions}");
-        ImGui.Text($"Failed: {PacketDecryptor.FailedDecryptions}");
+        var status = _state.GetKeyStatus();
 
-        float successRate = PacketDecryptor.SuccessfulDecryptions + PacketDecryptor.FailedDecryptions > 0
-            ? (float)PacketDecryptor.SuccessfulDecryptions / (PacketDecryptor.SuccessfulDecryptions + PacketDecryptor.FailedDecryptions)
+        // Stats with color coding
+        ImGui.Text("Successful: ");
+        ImGui.SameLine();
+        ImGui.TextColored(Theme.ColSuccess, status.SuccessfulDecryptions.ToString());
+
+        ImGui.Text("Failed: ");
+        ImGui.SameLine();
+        var failColor = status.FailedDecryptions > 0 ? Theme.ColWarn : Theme.ColTextMuted;
+        ImGui.TextColored(failColor, status.FailedDecryptions.ToString());
+
+        float successRate = status.SuccessfulDecryptions + status.FailedDecryptions > 0
+            ? (float)status.SuccessfulDecryptions / (status.SuccessfulDecryptions + status.FailedDecryptions)
             : 0;
 
         ImGui.ProgressBar(successRate, new Vector2(-1, 20), $"{successRate:P0}");
+
+        // Quick stats
+        if (status.TotalKeys > 0)
+        {
+            ImGui.TextColored(Theme.ColTextMuted,
+                $"Efficiency: {status.SuccessfulDecryptions} decryptions with {status.TotalKeys} keys");
+        }
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -160,7 +334,14 @@ public class DecryptionTab : ITab
 
         if (ImGui.Button("Clear Stats", new Vector2(100, 28)))
         {
-            // Reset counters via reflection or add a method to PacketDecryptor
+            _state.AddInGameLog("[DECRYPTION] Stats reset not implemented yet");
+        }
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Verify Keys", new Vector2(100, 28)))
+        {
+            VerifyKeys();
         }
 
         ImGui.Spacing();
@@ -179,6 +360,42 @@ public class DecryptionTab : ITab
         if (ImGui.Button("Export Keys", new Vector2(120, 28)))
         {
             ExportKeys();
+        }
+
+        ImGui.Spacing();
+
+        // File watcher status
+        ImGui.TextColored(Theme.ColTextMuted, "Auto-detection: Active");
+        ImGui.TextColored(Theme.ColTextMuted, $"Watching: {_state.ExportDirectory}");
+    }
+
+    private void VerifyKeys()
+    {
+        if (PacketDecryptor.DiscoveredKeys.Count == 0)
+        {
+            _state.AddInGameLog("[VERIFY] No keys to verify");
+            return;
+        }
+
+        int validKeys = 0;
+        foreach (var key in PacketDecryptor.DiscoveredKeys)
+        {
+            // Basic validation: check key isn't all zeros or repeating pattern
+            bool isAllZero = key.Key.All(b => b == 0);
+            bool isRepeating = key.Key.Distinct().Count() == 1;
+            bool isValidLength = key.Key.Length == 16 || key.Key.Length == 32 || key.Key.Length == 48;
+
+            if (!isAllZero && !isRepeating && isValidLength)
+            {
+                validKeys++;
+            }
+        }
+
+        _state.AddInGameLog($"[VERIFY] {validKeys}/{PacketDecryptor.DiscoveredKeys.Count} keys appear valid");
+
+        if (validKeys < PacketDecryptor.DiscoveredKeys.Count)
+        {
+            _state.AddInGameLog("[VERIFY] Some keys may be corrupted or have invalid format");
         }
     }
 
@@ -233,7 +450,12 @@ public class DecryptionTab : ITab
 
                 // Show preview
                 string preview = Encoding.UTF8.GetString(result.DecryptedData.Take(100).ToArray());
+                preview = new string(preview.Where(c => !char.IsControl(c)).ToArray()); // Remove control chars
                 _state.AddInGameLog($"  Preview: {preview}");
+
+                // Show entropy of decrypted data
+                double entropy = CalculateEntropy(result.DecryptedData);
+                _state.AddInGameLog($"  Entropy: {entropy:F2} (lower = more structured)");
             }
             else
             {
@@ -246,6 +468,23 @@ public class DecryptionTab : ITab
         }
     }
 
+    private double CalculateEntropy(byte[] data)
+    {
+        if (data.Length == 0) return 0;
+
+        var freq = new int[256];
+        foreach (var b in data) freq[b]++;
+
+        double entropy = 0;
+        for (int i = 0; i < 256; i++)
+        {
+            if (freq[i] == 0) continue;
+            double p = (double)freq[i] / data.Length;
+            entropy -= p * Math.Log2(p);
+        }
+        return entropy;
+    }
+
     private void ExportKeys()
     {
         try
@@ -253,19 +492,22 @@ public class DecryptionTab : ITab
             var sb = new StringBuilder();
             sb.AppendLine("=== HYFORCE ENCRYPTION KEYS ===");
             sb.AppendLine($"Export Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine($"Total Keys: {PacketDecryptor.DiscoveredKeys.Count}");
             sb.AppendLine();
 
             foreach (var key in PacketDecryptor.DiscoveredKeys)
             {
                 sb.AppendLine($"Type: {key.Type}");
                 sb.AppendLine($"Source: {key.Source}");
+                sb.AppendLine($"Discovered: {key.DiscoveredAt:yyyy-MM-dd HH:mm:ss}");
                 sb.AppendLine($"Key (hex): {Convert.ToHexString(key.Key)}");
                 if (key.MemoryAddress.HasValue)
                     sb.AppendLine($"Address: 0x{(ulong)key.MemoryAddress.Value:X}");
                 sb.AppendLine();
             }
 
-            string filename = Path.Combine(_state.ExportDirectory, $"keys_export_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+            string filename = Path.Combine(_state.ExportDirectory,
+                $"keys_export_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
             Directory.CreateDirectory(_state.ExportDirectory);
             File.WriteAllText(filename, sb.ToString());
 
@@ -276,4 +518,10 @@ public class DecryptionTab : ITab
             _state.AddInGameLog($"[ERROR] Export failed: {ex.Message}");
         }
     }
+
+    private void CopyToClipboard(string text)
+    {
+        try { TextCopy.ClipboardService.SetText(text); } catch { }
+    }
 }
+

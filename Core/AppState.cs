@@ -1,4 +1,4 @@
-﻿// FILE: Core/AppState.cs - FIXED: UDP-ONLY WITH AUTO-DECRYPTION
+﻿
 using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
@@ -26,7 +26,6 @@ public class AppState : IDisposable
     public DateTime? StartTime { get; private set; }
 
     public long TotalPackets => PacketLog.TotalPackets;
-    // REMOVED: TcpPackets - not used in UDP-only mode
     public long UdpPackets => PacketLog.PacketsUdp;
 
     public ConcurrentBag<SecurityEvent> SecurityEvents { get; } = new();
@@ -35,16 +34,22 @@ public class AppState : IDisposable
     public List<string> InGameLog { get; } = new();
     public const int MaxInGameLogLines = 1000;
 
-    public string ExportDirectory { get; set; } = @"C:\Users\benja\source\repos\HyForce\Exported logs";
+    public string ExportDirectory { get; set; } = @"C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs";
 
     public event PacketReceivedHandler? OnPacketReceived;
     public event Action? OnSecurityEvent;
-
-    // FIXED: Made this a proper event with public accessor
     public event Action? OnMemoryDataUpdated;
+
+    // NEW: Event for key updates
+    public event Action? OnKeysUpdated;
 
     // Auto-decryption timer
     private System.Timers.Timer? _autoDecryptTimer;
+
+    // NEW: File watcher for SSL key log
+    private FileSystemWatcher? _sslKeyWatcher;
+    private DateTime _lastKeyLoadTime = DateTime.MinValue;
+    private readonly object _keyLoadLock = new();
 
     public AppState()
     {
@@ -56,13 +61,94 @@ public class AppState : IDisposable
         UdpProxy.OnPacket += HandlePacket;
         Directory.CreateDirectory(ExportDirectory);
 
-        // Setup auto-decryption attempts
         SetupAutoDecryption();
+
+        // NEW: Setup file watcher for SSL keys
+        SetupSSLKeyWatcher();
+
+        // NEW: Immediate scan for existing keys
+        ScanAndLoadExistingKeys();
+    }
+
+    private void SetupSSLKeyWatcher()
+    {
+        try
+        {
+            if (!Directory.Exists(ExportDirectory))
+                Directory.CreateDirectory(ExportDirectory);
+
+            _sslKeyWatcher = new FileSystemWatcher(ExportDirectory)
+            {
+                Filter = "*ssl*.log",
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
+                EnableRaisingEvents = true
+            };
+
+            _sslKeyWatcher.Created += (s, e) =>
+            {
+                AddInGameLog($"[KEYS] New key file detected: {Path.GetFileName(e.FullPath)}");
+                TryLoadKeysFromFile(e.FullPath);
+            };
+
+            _sslKeyWatcher.Changed += (s, e) =>
+            {
+                // Debounce rapid change events
+                lock (_keyLoadLock)
+                {
+                    if ((DateTime.Now - _lastKeyLoadTime).TotalSeconds > 2)
+                    {
+                        AddInGameLog($"[KEYS] Key file updated: {Path.GetFileName(e.FullPath)}");
+                        TryLoadKeysFromFile(e.FullPath);
+                        _lastKeyLoadTime = DateTime.Now;
+                    }
+                }
+            };
+
+            AddInGameLog("[KEYS] File watcher active for SSL key logs");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[KEYS] Failed to setup file watcher: {ex.Message}", "System");
+        }
+    }
+
+    private void ScanAndLoadExistingKeys()
+    {
+        try
+        {
+            if (!Directory.Exists(ExportDirectory)) return;
+
+            // Look for any SSL-related log files
+            var keyFiles = Directory.GetFiles(ExportDirectory, "*.log")
+                .Where(f =>
+                    Path.GetFileName(f).Contains("ssl", StringComparison.OrdinalIgnoreCase) ||
+                    Path.GetFileName(f).Contains("key", StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(f => new FileInfo(f).LastWriteTime)
+                .ToList();
+
+            if (keyFiles.Any())
+            {
+                AddInGameLog($"[KEYS] Found {keyFiles.Count} potential key files");
+
+                // Load the most recent one first
+                foreach (var file in keyFiles.Take(3))
+                {
+                    TryLoadKeysFromFile(file);
+                }
+            }
+            else
+            {
+                AddInGameLog("[KEYS] No existing key files found in export directory");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[KEYS] Scan failed: {ex.Message}", "System");
+        }
     }
 
     private void SetupAutoDecryption()
     {
-        // Try to decrypt packets automatically every 5 seconds
         _autoDecryptTimer = new System.Timers.Timer(5000);
         _autoDecryptTimer.Elapsed += (s, e) =>
         {
@@ -75,7 +161,6 @@ public class AppState : IDisposable
     {
         if (PacketDecryptor.DiscoveredKeys.Count == 0) return;
 
-        // Auto-decrypt recent packets
         var recentPackets = PacketLog.GetLast(100);
         int decrypted = 0;
 
@@ -94,6 +179,7 @@ public class AppState : IDisposable
         if (decrypted > 0)
         {
             AddInGameLog($"[AUTO-DECRYPT] Decrypted {decrypted} packets automatically");
+            OnKeysUpdated?.Invoke(); // Notify UI of potential changes
         }
     }
 
@@ -137,13 +223,15 @@ public class AppState : IDisposable
 
         // AUTO-ATTEMPT SSLKEYLOGFILE
         TryEnableSSLKeyLogFile();
+
+        // NEW: Re-scan for keys on start (in case they were added while stopped)
+        ScanAndLoadExistingKeys();
     }
 
     private void TryEnableSSLKeyLogFile()
     {
         try
         {
-            // Set environment variable for Hytale process if it reads it
             string keyLogPath = Path.Combine(ExportDirectory, "sslkeys.log");
             Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath);
             AddInGameLog($"[AUTO-DECRYPT] SSLKEYLOGFILE set to: {keyLogPath}");
@@ -173,30 +261,44 @@ public class AppState : IDisposable
 
             var lines = File.ReadAllLines(path);
             int keysAdded = 0;
+            int linesProcessed = 0;
 
             foreach (var line in lines)
             {
-                // Parse SSLKEYLOGFILE format: CLIENT_HANDSHAKE_TRAFFIC_SECRET <client_random> <secret>
+                linesProcessed++;
+
+                // Parse SSLKEYLOGFILE format
                 if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
                     line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
-                    line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET"))
+                    line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
+                    line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
+                    line.StartsWith("EXPORTER_SECRET"))
                 {
                     var parts = line.Split(' ');
                     if (parts.Length >= 3)
                     {
-                        var secret = Convert.FromHexString(parts[2]);
-                        if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
+                        try
                         {
-                            PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+                            var secret = Convert.FromHexString(parts[2]);
+                            if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
                             {
-                                Key = secret,
-                                IV = new byte[12],
-                                Type = secret.Length == 32 ?
-                                    PacketDecryptor.EncryptionType.AES256GCM :
-                                    PacketDecryptor.EncryptionType.ChaCha20Poly1305,
-                                Source = $"SSLKEYLOGFILE: {Path.GetFileName(path)}"
-                            });
-                            keysAdded++;
+                                var key = new PacketDecryptor.EncryptionKey
+                                {
+                                    Key = secret,
+                                    IV = new byte[12],
+                                    Type = secret.Length == 32 ?
+                                        PacketDecryptor.EncryptionType.AES256GCM :
+                                        PacketDecryptor.EncryptionType.ChaCha20Poly1305,
+                                    Source = $"{Path.GetFileName(path)}:{linesProcessed}"
+                                };
+
+                                PacketDecryptor.AddKey(key);
+                                keysAdded++;
+                            }
+                        }
+                        catch (FormatException)
+                        {
+                            // Invalid hex, skip
                         }
                     }
                 }
@@ -204,13 +306,42 @@ public class AppState : IDisposable
 
             if (keysAdded > 0)
             {
-                AddInGameLog($"[AUTO-DECRYPT] Loaded {keysAdded} keys from {Path.GetFileName(path)}");
+                AddInGameLog($"[KEYS] Loaded {keysAdded} keys from {Path.GetFileName(path)}");
+                Log.Success($"Loaded {keysAdded} keys from {Path.GetFileName(path)}", "Keys");
+                OnKeysUpdated?.Invoke(); // Notify UI
+            }
+            else if (linesProcessed > 0)
+            {
+                AddInGameLog($"[KEYS] No valid keys found in {Path.GetFileName(path)} ({linesProcessed} lines)");
             }
         }
         catch (Exception ex)
         {
-            AddInGameLog($"[AUTO-DECRYPT] Failed to load keys: {ex.Message}");
+            AddInGameLog($"[KEYS] Failed to load keys: {ex.Message}");
         }
+    }
+
+    // NEW: Force refresh of all key files
+    public void RefreshAllKeys()
+    {
+        AddInGameLog("[KEYS] Refreshing all key files...");
+        ScanAndLoadExistingKeys();
+        OnKeysUpdated?.Invoke();
+    }
+
+    // NEW: Get detailed key status
+    public KeyStatus GetKeyStatus()
+    {
+        return new KeyStatus
+        {
+            TotalKeys = PacketDecryptor.DiscoveredKeys.Count,
+            SuccessfulDecryptions = PacketDecryptor.SuccessfulDecryptions,
+            FailedDecryptions = PacketDecryptor.FailedDecryptions,
+            KeySources = PacketDecryptor.DiscoveredKeys.Select(k => k.Source).Distinct().ToList(),
+            LastKeyAdded = PacketDecryptor.DiscoveredKeys.Any()
+                ? PacketDecryptor.DiscoveredKeys.Max(k => k.DiscoveredAt)
+                : (DateTime?)null
+        };
     }
 
     public void Stop()
@@ -228,6 +359,15 @@ public class AppState : IDisposable
         AnalyzePacket(packet);
         Database.ProcessPacket(packet);
         OnPacketReceived?.Invoke(packet);
+
+        // NEW: If decryption keeps failing, trigger auto-key scan
+        if (PacketDecryptor.FailedDecryptions > 100 &&
+            PacketDecryptor.DiscoveredKeys.Count == 0 &&
+            _autoDecryptTimer?.Enabled == true)
+        {
+            // Trigger memory scan from menu system
+            TriggerMemoryScan();
+        }
     }
 
     private void AnalyzePacket(CapturedPacket packet)
@@ -267,7 +407,6 @@ public class AppState : IDisposable
         OnSecurityEvent?.Invoke();
     }
 
-    // FIXED: Public method to trigger memory scan from menu
     public void TriggerMemoryScan()
     {
         OnMemoryDataUpdated?.Invoke();
@@ -280,6 +419,7 @@ public class AppState : IDisposable
         SecurityEvents.Clear();
         Log.Clear();
         lock (InGameLog) InGameLog.Clear();
+        PacketDecryptor.ClearKeys();
         Log.Info("[HyForce] All data cleared", "System");
         AddInGameLog("All data cleared");
     }
@@ -341,6 +481,17 @@ public class AppState : IDisposable
         sb.AppendLine($"Keys Available: {PacketDecryptor.DiscoveredKeys.Count}");
         sb.AppendLine($"Successful Decryptions: {PacketDecryptor.SuccessfulDecryptions}");
         sb.AppendLine($"Failed Decryptions: {PacketDecryptor.FailedDecryptions}");
+
+        if (PacketDecryptor.DiscoveredKeys.Any())
+        {
+            sb.AppendLine();
+            sb.AppendLine("Key Sources:");
+            foreach (var source in PacketDecryptor.DiscoveredKeys.Select(k => k.Source).Distinct())
+            {
+                var count = PacketDecryptor.DiscoveredKeys.Count(k => k.Source == source);
+                sb.AppendLine($"  - {source}: {count} keys");
+            }
+        }
         sb.AppendLine();
 
         sb.AppendLine("-------------------------------------------------------------------------------");
@@ -510,6 +661,23 @@ public class AppState : IDisposable
                 File.WriteAllLines(Path.Combine(basePath, "players.txt"), Protocol.RegistrySyncParser.PlayerNamesSeen);
             }
 
+            // NEW: Export keys if available
+            if (PacketDecryptor.DiscoveredKeys.Count > 0)
+            {
+                var keysSb = new System.Text.StringBuilder();
+                keysSb.AppendLine("=== ENCRYPTION KEYS ===");
+                foreach (var key in PacketDecryptor.DiscoveredKeys)
+                {
+                    keysSb.AppendLine($"Type: {key.Type}");
+                    keysSb.AppendLine($"Source: {key.Source}");
+                    keysSb.AppendLine($"Key: {Convert.ToHexString(key.Key)}");
+                    if (key.MemoryAddress.HasValue)
+                        keysSb.AppendLine($"Address: 0x{(ulong)key.MemoryAddress.Value:X}");
+                    keysSb.AppendLine();
+                }
+                File.WriteAllText(Path.Combine(basePath, "encryption_keys.txt"), keysSb.ToString());
+            }
+
             AddInGameLog($"[SUCCESS] Full export completed to {basePath}");
 
             try
@@ -551,5 +719,17 @@ public class AppState : IDisposable
         Stop();
         UdpProxy.OnPacket -= HandlePacket;
         _autoDecryptTimer?.Dispose();
+        _sslKeyWatcher?.Dispose();
     }
 }
+
+// NEW: Key status class
+public class KeyStatus
+{
+    public int TotalKeys { get; set; }
+    public int SuccessfulDecryptions { get; set; }
+    public int FailedDecryptions { get; set; }
+    public List<string> KeySources { get; set; } = new();
+    public DateTime? LastKeyAdded { get; set; }
+}
+

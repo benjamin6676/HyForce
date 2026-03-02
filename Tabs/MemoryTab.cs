@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/MemoryTab.cs - FIXED: NO FREEZE, AUTO-KEY EXTRACTION
+﻿// FILE: Tabs/MemoryTab.cs - ENHANCED AUTOMATIC KEY EXTRACTION
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
@@ -48,8 +48,14 @@ public class MemoryTab : ITab
     private bool _showEditPopup = false;
     private string _editValue = "";
 
-    // FIXED: Add cancellation token for scans
+    // Cancellation token for scans
     private CancellationTokenSource? _scanCts;
+
+    // Auto-scanning state
+    private System.Timers.Timer? _autoKeyScanTimer;
+    private HashSet<string> _scannedRegions = new();
+    private int _consecutiveEmptyScans = 0;
+    private const int MaxEmptyScans = 10;
 
     // Windows API
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
@@ -66,16 +72,14 @@ public class MemoryTab : ITab
     public MemoryTab(AppState state)
     {
         _state = state;
-        // FIXED: Subscribe to event for menu-triggered scans
         _state.OnMemoryDataUpdated += OnQuickScanRequested;
     }
 
     private void OnQuickScanRequested()
     {
-        // This will be called from menu - safe to call QuickScanPlayer
         if (_isAttached)
         {
-            QuickScanPlayer();
+            ScanForTLSKeys();
         }
         else
         {
@@ -153,7 +157,6 @@ public class MemoryTab : ITab
             ImGui.PopStyleColor();
 
             ImGui.SameLine();
-            // FIXED: Disable button during scan
             bool scanning = _scanCts != null;
             if (scanning)
             {
@@ -163,13 +166,18 @@ public class MemoryTab : ITab
             }
             else
             {
-                if (ImGui.Button("Quick Scan Player", new Vector2(140, 28)))
-                    QuickScanPlayer();
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.8f, 0.4f, 1f));
+                if (ImGui.Button("Auto-Extract Keys", new Vector2(140, 28)))
+                    ScanForTLSKeys();
+                ImGui.PopStyleColor();
+
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Automatically find QUIC/TLS 1.3 keys from memory");
             }
 
             ImGui.SameLine();
-            if (ImGui.Button("Find TLS Keys", new Vector2(120, 28)))
-                ScanForTLSKeys();
+            if (ImGui.Button("Quick Scan Player", new Vector2(140, 28)))
+                QuickScanPlayer();
 
             ImGui.SameLine();
             ImGui.Checkbox("Auto", ref _autoRefresh);
@@ -178,7 +186,6 @@ public class MemoryTab : ITab
 
             if (!_isAttached)
             {
-                // Not attached - show disabled button or hint
                 ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.3f, 0.3f, 0.3f, 1f));
                 if (ImGui.Button("Enable SSL Keylog", new Vector2(130, 28)))
                 {
@@ -190,16 +197,14 @@ public class MemoryTab : ITab
             }
             else
             {
-                // Attached - show status
-                CheckSSLKeyLogFile(); // Auto-check
+                CheckSSLKeyLogFile();
 
                 if (_sslKeyLogKeyCount > 0)
                 {
-                    // Keys found! Show green success button
                     ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.8f, 0.3f, 1f));
                     if (ImGui.Button($"Keys: {_sslKeyLogKeyCount}", new Vector2(130, 28)))
                     {
-                        CheckSSLKeyLogFile(); // Refresh
+                        CheckSSLKeyLogFile();
                     }
                     if (ImGui.IsItemHovered())
                         ImGui.SetTooltip("Click to refresh keys from sslkeys.log");
@@ -207,11 +212,10 @@ public class MemoryTab : ITab
                 }
                 else if (_sslKeyLogEnabled)
                 {
-                    // Enabled but no keys yet - show yellow waiting button
                     ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.9f, 0.7f, 0.2f, 1f));
                     if (ImGui.Button("Waiting...", new Vector2(130, 28)))
                     {
-                        CheckSSLKeyLogFile(); // Manual check
+                        CheckSSLKeyLogFile();
                     }
                     if (ImGui.IsItemHovered())
                         ImGui.SetTooltip("SSL keylog enabled. Restart Hytale if no keys appear!");
@@ -219,7 +223,6 @@ public class MemoryTab : ITab
                 }
                 else
                 {
-                    // Not enabled yet - show normal blue button
                     ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.5f, 0.9f, 1f));
                     if (ImGui.Button("Enable SSL Keylog", new Vector2(130, 28)))
                     {
@@ -239,14 +242,14 @@ public class MemoryTab : ITab
         ImGui.TextColored(Theme.ColAccent, "How to use:");
         ImGui.BulletText("Launch Hytale and connect to a server");
         ImGui.BulletText("Click 'Attach to Hytale'");
-        ImGui.BulletText("Use 'Quick Scan Player' to find health/position");
-        ImGui.BulletText("Use 'Find TLS Keys' for automatic decryption");
+        ImGui.BulletText("Use 'Auto-Extract Keys' to automatically find decryption keys");
+        ImGui.BulletText("Keys will be used automatically to decrypt packets");
 
         ImGui.Spacing();
         ImGui.TextColored(Theme.ColWarn, "Run as Administrator for best results");
 
         ImGui.Spacing();
-        ImGui.TextColored(Theme.ColDanger, "WARNING: Scans may take 5-10 seconds but won't freeze UI.");
+        ImGui.TextColored(Theme.ColDanger, "WARNING: This tool is for security research only.");
     }
 
     private void RenderScanPanel(float width)
@@ -525,7 +528,458 @@ public class MemoryTab : ITab
         ImGui.EndChild();
     }
 
-    // ==================== SCANNING METHODS - FIXED ====================
+    // ==================== ENHANCED AUTOMATIC KEY SCANNER ====================
+
+    private async void ScanForTLSKeys()
+    {
+        if (!_isAttached || _hytaleProcess == null) return;
+
+        _state.AddInGameLog("[AUTO-KEY] Starting automatic TLS key extraction...");
+        _scanCts = new CancellationTokenSource();
+        var token = _scanCts.Token;
+
+        try
+        {
+            // Phase 1: Quick scan for SSL_CTX structures (contains key pointers)
+            var keyPointers = await Task.Run(() => FindSSLContexts(token), token);
+
+            if (keyPointers.Count > 0)
+            {
+                _state.AddInGameLog($"[AUTO-KEY] Found {keyPointers.Count} SSL context(s)");
+
+                // Phase 2: Extract keys from each context
+                foreach (var ctxPtr in keyPointers)
+                {
+                    if (token.IsCancellationRequested) break;
+                    ExtractKeysFromSSLContext(ctxPtr);
+                }
+            }
+            else
+            {
+                // Phase 3: Fallback to entropy-based scanning
+                _state.AddInGameLog("[AUTO-KEY] No SSL contexts found, using entropy scan...");
+                await Task.Run(() => EntropyScanForKeys(token), token);
+            }
+
+            // Phase 4: Start background watcher if keys found
+            if (PacketDecryptor.DiscoveredKeys.Count > 0)
+            {
+                StartKeyWatcher();
+                _state.AddInGameLog($"[AUTO-KEY] SUCCESS! Found {PacketDecryptor.DiscoveredKeys.Count} key(s)");
+                _sslKeyLogKeyCount = PacketDecryptor.DiscoveredKeys.Count;
+            }
+            else
+            {
+                _state.AddInGameLog("[AUTO-KEY] No keys found yet. Retrying in background...");
+                StartBackgroundScanning();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _state.AddInGameLog("[AUTO-KEY] Scan cancelled");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[AUTO-KEY] Error: {ex.Message}");
+        }
+        finally
+        {
+            _scanCts = null;
+        }
+    }
+
+    private List<IntPtr> FindSSLContexts(CancellationToken token)
+    {
+        var contexts = new List<IntPtr>();
+        var regions = GetReadableMemoryRegions()
+            .Where(r => r.Size > 0x1000 && r.Size < 0x10000000)
+            .OrderByDescending(r => r.Size);
+
+        foreach (var region in regions.Take(20))
+        {
+            if (token.IsCancellationRequested) break;
+
+            try
+            {
+                const int chunkSize = 0x100000;
+                long offset = 0;
+
+                while (offset < region.Size)
+                {
+                    int toRead = (int)Math.Min(chunkSize, region.Size - offset);
+                    byte[] buffer = new byte[toRead];
+
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress + (int)offset,
+                        buffer, toRead, out int read)) break;
+
+                    for (int i = 0; i < buffer.Length - 8; i += 8)
+                    {
+                        long potentialPtr = BitConverter.ToInt64(buffer, i);
+
+                        if (IsValidHeapPointer((IntPtr)potentialPtr))
+                        {
+                            if (VerifySSLContext((IntPtr)potentialPtr))
+                            {
+                                contexts.Add((IntPtr)potentialPtr);
+                                if (contexts.Count >= 10) return contexts;
+                            }
+                        }
+                    }
+
+                    offset += toRead;
+                }
+            }
+            catch { }
+        }
+
+        return contexts;
+    }
+
+    private bool VerifySSLContext(IntPtr ctxPtr)
+    {
+        try
+        {
+            byte[] ctxData = new byte[64];
+            if (!ReadProcessMemory(_processHandle, ctxPtr, ctxData, 64, out int read))
+                return false;
+
+            long methodPtr = BitConverter.ToInt64(ctxData, 0);
+            if (!IsValidHeapPointer((IntPtr)methodPtr)) return false;
+
+            byte[] methodData = new byte[32];
+            if (!ReadProcessMemory(_processHandle, (IntPtr)methodPtr, methodData, 32, out read))
+                return false;
+
+            bool hasTLS13 = methodData.Contains((byte)0x03) && methodData.Contains((byte)0x04);
+            return hasTLS13;
+        }
+        catch { return false; }
+    }
+
+    private void ExtractKeysFromSSLContext(IntPtr ctxPtr)
+    {
+        try
+        {
+            byte[] ctxData = new byte[512];
+            if (!ReadProcessMemory(_processHandle, ctxPtr, ctxData, 512, out int read))
+                return;
+
+            for (int i = 0; i < ctxData.Length - 8; i += 8)
+            {
+                long sessionPtr = BitConverter.ToInt64(ctxData, i);
+                if (!IsValidHeapPointer((IntPtr)sessionPtr)) continue;
+
+                var keys = ExtractSessionKeys((IntPtr)sessionPtr);
+                if (keys != null)
+                {
+                    PacketDecryptor.AddKey(keys);
+                    _state.AddInGameLog($"[AUTO-KEY] Extracted key from SSL session at offset 0x{i:X}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[AUTO-KEY] Extraction error: {ex.Message}");
+        }
+    }
+
+    private PacketDecryptor.EncryptionKey? ExtractSessionKeys(IntPtr sessionPtr)
+    {
+        try
+        {
+            byte[] sessionData = new byte[256];
+            if (!ReadProcessMemory(_processHandle, sessionPtr, sessionData, 256, out int read))
+                return null;
+
+            // Look for 48-byte master secret (TLS 1.3)
+            for (int i = 0; i < sessionData.Length - 48; i++)
+            {
+                double entropy = CalculateEntropy(sessionData, i, 48);
+
+                if (entropy > 7.5 && entropy < 7.99)
+                {
+                    var secret = new byte[48];
+                    Array.Copy(sessionData, i, secret, 0, 48);
+
+                    if (secret.All(b => b == 0) || secret.Distinct().Count() < 10)
+                        continue;
+
+                    return new PacketDecryptor.EncryptionKey
+                    {
+                        Key = secret,
+                        IV = new byte[12],
+                        Type = PacketDecryptor.EncryptionType.AES256GCM,
+                        Source = $"SSL_SESSION@0x{(ulong)sessionPtr:X}",
+                        MemoryAddress = sessionPtr + i
+                    };
+                }
+            }
+
+            // Try 32-byte keys
+            for (int i = 0; i < sessionData.Length - 32; i++)
+            {
+                double entropy = CalculateEntropy(sessionData, i, 32);
+
+                if (entropy > 7.5 && entropy < 7.99)
+                {
+                    var secret = new byte[32];
+                    Array.Copy(sessionData, i, secret, 0, 32);
+
+                    if (secret.All(b => b == 0) || secret.Distinct().Count() < 10)
+                        continue;
+
+                    return new PacketDecryptor.EncryptionKey
+                    {
+                        Key = secret,
+                        IV = new byte[12],
+                        Type = PacketDecryptor.EncryptionType.AES256GCM,
+                        Source = $"SSL_SESSION@0x{(ulong)sessionPtr:X}",
+                        MemoryAddress = sessionPtr + i
+                    };
+                }
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    private void EntropyScanForKeys(CancellationToken token)
+    {
+        var regions = GetReadableMemoryRegions()
+            .Where(r => r.Size > 0x10000 && r.Size < 0x5000000)
+            .OrderByDescending(r => r.Size)
+            .ToList();
+
+        int totalKeysFound = 0;
+        int regionsScanned = 0;
+
+        foreach (var region in regions.Take(30))
+        {
+            if (token.IsCancellationRequested) break;
+
+            string regionKey = $"{(ulong)region.BaseAddress:X}-{(ulong)(region.BaseAddress + (int)region.Size):X}";
+            if (_scannedRegions.Contains(regionKey)) continue;
+            _scannedRegions.Add(regionKey);
+
+            try
+            {
+                if (IsImageRegion(region)) continue;
+
+                byte[] buffer = new byte[(int)Math.Min(region.Size, 2_000_000)];
+                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                    continue;
+
+                regionsScanned++;
+
+                totalKeysFound += ScanForAESKeys(buffer, region.BaseAddress, token);
+                totalKeysFound += ScanForChaChaKeys(buffer, region.BaseAddress, token);
+
+                if (totalKeysFound >= 5) break;
+
+                if (regionsScanned % 5 == 0)
+                    Thread.Sleep(10);
+            }
+            catch { }
+        }
+
+        _state.AddInGameLog($"[AUTO-KEY] Scanned {regionsScanned} regions, found {totalKeysFound} keys");
+    }
+
+    private int ScanForAESKeys(byte[] buffer, IntPtr baseAddr, CancellationToken token)
+    {
+        int found = 0;
+
+        for (int i = 0; i < buffer.Length - 32; i += 16)
+        {
+            if (token.IsCancellationRequested) break;
+
+            double entropy = CalculateEntropy(buffer, i, 32);
+
+            if (entropy < 7.8 || entropy > 7.99) continue;
+
+            var keyBytes = new byte[32];
+            Array.Copy(buffer, i, keyBytes, 0, 32);
+
+            if (keyBytes.All(b => b == 0)) continue;
+            if (keyBytes.Distinct().Count() < 15) continue;
+
+            bool hasContext = CheckForTLSContext(buffer, i);
+
+            var key = new PacketDecryptor.EncryptionKey
+            {
+                Key = keyBytes,
+                IV = new byte[12],
+                Type = PacketDecryptor.EncryptionType.AES256GCM,
+                Source = hasContext ? "AES-256-GCM (with TLS context)" : "AES-256-GCM (high entropy)",
+                MemoryAddress = baseAddr + i
+            };
+
+            PacketDecryptor.AddKey(key);
+            found++;
+
+            _state.AddInGameLog($"[AUTO-KEY] Found AES-256 key at 0x{(ulong)(baseAddr + i):X} " +
+                               $"(entropy: {entropy:F2})");
+        }
+
+        return found;
+    }
+
+    private int ScanForChaChaKeys(byte[] buffer, IntPtr baseAddr, CancellationToken token)
+    {
+        int found = 0;
+
+        for (int i = 0; i < buffer.Length - 32; i += 4)
+        {
+            if (token.IsCancellationRequested) break;
+
+            double entropy = CalculateEntropy(buffer, i, 32);
+
+            if (entropy < 7.8 || entropy > 7.99) continue;
+
+            var keyBytes = new byte[32];
+            Array.Copy(buffer, i, keyBytes, 0, 32);
+
+            if (keyBytes.All(b => b == 0)) continue;
+
+            var key = new PacketDecryptor.EncryptionKey
+            {
+                Key = keyBytes,
+                IV = new byte[12],
+                Type = PacketDecryptor.EncryptionType.ChaCha20Poly1305,
+                Source = "ChaCha20-Poly1305 candidate",
+                MemoryAddress = baseAddr + i
+            };
+
+            PacketDecryptor.AddKey(key);
+            found++;
+        }
+
+        return found;
+    }
+
+    private bool IsImageRegion(MemoryRegion region)
+    {
+        ulong addr = (ulong)region.BaseAddress;
+        return (addr & 0xFFFFF) == 0 && region.Size > 0x100000;
+    }
+
+    private bool CheckForTLSContext(byte[] buffer, int keyOffset)
+    {
+        int searchStart = Math.Max(0, keyOffset - 256);
+        int searchEnd = Math.Min(buffer.Length, keyOffset + 256);
+
+        for (int i = searchStart; i < searchEnd - 2; i++)
+        {
+            if (buffer[i] == 0x03 && buffer[i + 1] == 0x04) return true;
+            if (buffer[i] == 0x13 && buffer[i + 1] == 0x01) return true;
+            if (buffer[i] == 0x13 && buffer[i + 1] == 0x02) return true;
+        }
+
+        return false;
+    }
+
+    private bool IsValidHeapPointer(IntPtr ptr)
+    {
+        ulong addr = (ulong)ptr;
+        return addr > 0x10000 && addr < 0x7FFFFFFF0000 && (addr & 0x7) == 0;
+    }
+
+    private void StartKeyWatcher()
+    {
+        _autoKeyScanTimer?.Stop();
+        _autoKeyScanTimer = new System.Timers.Timer(3000);
+        _autoKeyScanTimer.Elapsed += (s, e) =>
+        {
+            if (_isAttached && PacketDecryptor.DiscoveredKeys.Count < 10)
+            {
+                QuickScanForNewKeys();
+            }
+        };
+        _autoKeyScanTimer.AutoReset = true;
+        _autoKeyScanTimer.Start();
+
+        _state.AddInGameLog("[AUTO-KEY] Background key monitoring started");
+    }
+
+    private void QuickScanForNewKeys()
+    {
+        var newKeys = 0;
+
+        var regions = GetReadableMemoryRegions()
+            .Where(r => r.Size < 10000000)
+            .Take(10);
+
+        foreach (var region in regions)
+        {
+            try
+            {
+                byte[] buffer = new byte[Math.Min((int)region.Size, 500000)];
+                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                    continue;
+
+                for (int i = 0; i < buffer.Length - 32; i += 32)
+                {
+                    double entropy = CalculateEntropy(buffer, i, 32);
+                    if (entropy > 7.8 && entropy < 7.99)
+                    {
+                        var keyBytes = new byte[32];
+                        Array.Copy(buffer, i, keyBytes, 0, 32);
+
+                        if (!PacketDecryptor.DiscoveredKeys.Any(k => k.Key.SequenceEqual(keyBytes)))
+                        {
+                            var key = new PacketDecryptor.EncryptionKey
+                            {
+                                Key = keyBytes,
+                                IV = new byte[12],
+                                Type = PacketDecryptor.EncryptionType.AES256GCM,
+                                Source = "Background scan",
+                                MemoryAddress = region.BaseAddress + i
+                            };
+                            PacketDecryptor.AddKey(key);
+                            newKeys++;
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        if (newKeys > 0)
+        {
+            _sslKeyLogKeyCount = PacketDecryptor.DiscoveredKeys.Count;
+            _state.AddInGameLog($"[AUTO-KEY] Found {newKeys} additional key(s) in background");
+        }
+    }
+
+    private void StartBackgroundScanning()
+    {
+        _autoKeyScanTimer?.Stop();
+        _consecutiveEmptyScans = 0;
+
+        _autoKeyScanTimer = new System.Timers.Timer(5000);
+        _autoKeyScanTimer.Elapsed += async (s, e) =>
+        {
+            if (!_isAttached || _consecutiveEmptyScans >= MaxEmptyScans)
+            {
+                _autoKeyScanTimer?.Stop();
+                _state.AddInGameLog("[AUTO-KEY] Background scanning stopped (max attempts reached)");
+                return;
+            }
+
+            _state.AddInGameLog("[AUTO-KEY] Retrying key extraction...");
+            await Task.Run(() => EntropyScanForKeys(CancellationToken.None));
+
+            if (PacketDecryptor.DiscoveredKeys.Count == 0)
+                _consecutiveEmptyScans++;
+            else
+                StartKeyWatcher();
+        };
+        _autoKeyScanTimer.AutoReset = true;
+        _autoKeyScanTimer.Start();
+    }
+
+    // ==================== STANDARD SCANNING METHODS ====================
 
     private async void PerformFirstScan()
     {
@@ -560,7 +1014,7 @@ public class MemoryTab : ITab
 
         var regions = GetReadableMemoryRegions();
         int scannedRegions = 0;
-        int maxRegions = 50; // FIXED: Limit regions
+        int maxRegions = 50;
 
         foreach (var region in regions.Take(maxRegions))
         {
@@ -583,7 +1037,6 @@ public class MemoryTab : ITab
                 }
                 scannedRegions++;
 
-                // FIXED: Yield periodically
                 if (scannedRegions % 10 == 0)
                 {
                     Thread.Sleep(1);
@@ -759,7 +1212,6 @@ public class MemoryTab : ITab
         }
     }
 
-    // FIXED: Quick scan with timeout and background execution
     private async void QuickScanPlayer()
     {
         if (!_isAttached) return;
@@ -796,20 +1248,19 @@ public class MemoryTab : ITab
         var regions = GetReadableMemoryRegions().Where(r => r.Size < 100_000_000);
         int scanned = 0;
 
-        foreach (var region in regions.Take(30)) // FIXED: Limit to 30 regions
+        foreach (var region in regions.Take(30))
         {
             if (token.IsCancellationRequested) break;
 
             try
             {
                 byte[] buffer = new byte[(int)Math.Min(region.Size, 1_000_000)];
-                if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                {
-                    ScanExactValue(buffer, region.BaseAddress, "100");
-                }
+                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                    continue;
+
+                ScanExactValue(buffer, region.BaseAddress, "100");
                 scanned++;
 
-                // FIXED: Yield every 5 regions
                 if (scanned % 5 == 0)
                 {
                     Thread.Sleep(1);
@@ -820,195 +1271,6 @@ public class MemoryTab : ITab
 
         _filteredResults = new List<MemoryResult>(_scanResults);
         _state.AddInGameLog($"[MEMORY] Quick scan complete: {scanned} regions, {_scanResults.Count} results for value '100'");
-    }
-
-    // NEW: Scan for TLS 1.3 keys automatically - IMPROVED
-    private async void ScanForTLSKeys()
-    {
-        if (!_isAttached) return;
-
-        _scanCts = new CancellationTokenSource();
-        var token = _scanCts.Token;
-
-        _state.AddInGameLog("[MEMORY] Scanning for TLS 1.3 secrets...");
-
-        try
-        {
-            await Task.Run(() => DoTLSScan(token), token);
-        }
-        catch (OperationCanceledException)
-        {
-            _state.AddInGameLog("[MEMORY] TLS scan cancelled");
-        }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[MEMORY] TLS scan error: {ex.Message}");
-        }
-        finally
-        {
-            _scanCts = null;
-        }
-    }
-
-
-    private void TryHookSSLKeyLog()
-    {
-        _sslKeyLogPath = Path.Combine(_state.ExportDirectory, "sslkeys.log");
-
-        // Set environment variable
-        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", _sslKeyLogPath);
-        _sslKeyLogEnabled = true;
-
-        _state.AddInGameLog($"[KEYS] SSLKEYLOGFILE set to: {_sslKeyLogPath}");
-
-        // Check if file exists and load keys
-        CheckSSLKeyLogFile();
-
-        if (_sslKeyLogKeyCount == 0)
-        {
-            _state.AddInGameLog("[KEYS] No keys found yet. RESTART Hytale with proxy running!");
-        }
-    }
-
-    // Check for keys in the file
-    private void CheckSSLKeyLogFile()
-    {
-        try
-        {
-            if (File.Exists(_sslKeyLogPath))
-            {
-                var lines = File.ReadAllLines(_sslKeyLogPath);
-                var keyLines = lines.Where(l =>
-                    l.Contains("CLIENT_TRAFFIC_SECRET") ||
-                    l.Contains("SERVER_TRAFFIC_SECRET")).ToList();
-
-                _sslKeyLogKeyCount = keyLines.Count;
-
-                if (_sslKeyLogKeyCount > 0)
-                {
-                    _state.AddInGameLog($"[KEYS] Found {_sslKeyLogKeyCount} keys in sslkeys.log!");
-                    _state.TryLoadKeysFromFile(_sslKeyLogPath);
-                }
-            }
-        }
-        catch { }
-    }
-
-    private void DoTLSScan(CancellationToken token)
-    {
-        int keysFound = 0;
-        var regions = GetReadableMemoryRegions().Where(r => r.Size < 50_000_000);
-
-        // First pass: Look for TLS keylog strings
-        foreach (var region in regions.Take(30))
-        {
-            if (token.IsCancellationRequested) break;
-
-            try
-            {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 2_000_000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
-
-                // Search for TLS-related strings
-                var strings = ExtractStringsFromBuffer(buffer, 20);
-                foreach (var str in strings)
-                {
-                    if (str.Contains("CLIENT_TRAFFIC_SECRET") ||
-                        str.Contains("SERVER_TRAFFIC_SECRET") ||
-                        str.Contains("EXPORTER_SECRET") ||
-                        str.Contains("QUIC") ||
-                        str.Contains("sslkeylog"))
-                    {
-                        _state.AddInGameLog($"[TLS] Found string: {str.Substring(0, Math.Min(40, str.Length))}");
-                    }
-                }
-            }
-            catch { }
-        }
-
-        // Second pass: Look for 32-byte high entropy blocks (AES-256 keys)
-        foreach (var region in regions.Take(20))
-        {
-            if (token.IsCancellationRequested) break;
-
-            try
-            {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 2_000_000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
-
-                // Look for high-entropy 32-byte sequences (TLS 1.3 secrets)
-                for (int i = 0; i < buffer.Length - 32; i += 16)
-                {
-                    double entropy = CalculateEntropy(buffer, i, 32);
-
-                    // TLS secrets have high entropy (>7.5) and specific patterns
-                    if (entropy > 7.5 && entropy < 7.99)
-                    {
-                        // Check if surrounded by lower entropy (isolated high entropy = likely key)
-                        double before = CalculateEntropy(buffer, Math.Max(0, i - 32), 32);
-                        double after = CalculateEntropy(buffer, Math.Min(buffer.Length - 32, i + 64), 32);
-
-                        if (before < 6 && after < 6)
-                        {
-                            var keyBytes = new byte[32];
-                            Array.Copy(buffer, i, keyBytes, 0, 32);
-
-                            // Verify it's not all zeros or all same byte
-                            if (keyBytes.Any(b => b != 0) && keyBytes.Distinct().Count() > 16)
-                            {
-                                // Auto-add as decryption key
-                                PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
-                                {
-                                    Key = keyBytes,
-                                    IV = new byte[12],
-                                    Type = PacketDecryptor.EncryptionType.AES256GCM,
-                                    Source = "Memory Scan (TLS)",
-                                    MemoryAddress = region.BaseAddress + i
-                                });
-
-                                keysFound++;
-
-                                // Only add first 5 keys to avoid duplicates
-                                if (keysFound >= 5) break;
-                            }
-                        }
-                    }
-                }
-
-                if (keysFound >= 5) break;
-            }
-            catch { }
-        }
-
-        _state.AddInGameLog($"[AUTO-DECRYPT] Found {keysFound} potential TLS keys and added to decryption!");
-    }
-
-    // Helper to extract strings from buffer
-    private List<string> ExtractStringsFromBuffer(byte[] data, int minLength)
-    {
-        var results = new List<string>();
-        var sb = new StringBuilder();
-
-        for (int i = 0; i < data.Length; i++)
-        {
-            if (data[i] >= 32 && data[i] <= 126)
-            {
-                sb.Append((char)data[i]);
-            }
-            else
-            {
-                if (sb.Length >= minLength)
-                    results.Add(sb.ToString());
-                sb.Clear();
-            }
-        }
-
-        if (sb.Length >= minLength)
-            results.Add(sb.ToString());
-
-        return results;
     }
 
     private void UseAsDecryptionKey(MemoryResult result)
@@ -1025,7 +1287,7 @@ public class MemoryTab : ITab
             MemoryAddress = result.Address
         });
 
-        _state.AddInGameLog($"[AUTO-DECRYPT] Added 32 bytes from 0x{(ulong)result.Address:X} as decryption key");
+        _state.AddInGameLog($"[AUTO-KEY] Added 32 bytes from 0x{(ulong)result.Address:X} as decryption key");
     }
 
     private void FindPointersTo(IntPtr target)
@@ -1040,15 +1302,15 @@ public class MemoryTab : ITab
             try
             {
                 byte[] buffer = new byte[(int)Math.Min(region.Size, 5_000_000)];
-                if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                    continue;
+
+                for (int i = 0; i < buffer.Length - 8; i += 8)
                 {
-                    for (int i = 0; i < buffer.Length - 8; i += 8)
+                    long val = BitConverter.ToInt64(buffer, i);
+                    if ((IntPtr)val == target)
                     {
-                        long val = BitConverter.ToInt64(buffer, i);
-                        if ((IntPtr)val == target)
-                        {
-                            _pointerMap[target].Add(region.BaseAddress + i);
-                        }
+                        _pointerMap[target].Add(region.BaseAddress + i);
                     }
                 }
             }
@@ -1203,9 +1465,7 @@ public class MemoryTab : ITab
                 {
                     _isAttached = true;
                     _state.AddInGameLog($"[MEMORY] Attached to {_hytaleProcess.ProcessName} (PID: {_hytaleProcess.Id})");
-
-                    // Auto-scan for TLS keys on attach
-                    ScanForTLSKeys();
+                    ScanForTLSKeys(); // Auto-scan on attach
                 }
                 else
                 {
@@ -1225,6 +1485,9 @@ public class MemoryTab : ITab
 
     private void Detach()
     {
+        _autoKeyScanTimer?.Stop();
+        _autoKeyScanTimer = null;
+
         if (_processHandle != IntPtr.Zero)
             CloseHandle(_processHandle);
 
@@ -1234,8 +1497,102 @@ public class MemoryTab : ITab
         _scanResults.Clear();
         _watches.Clear();
         _pointerMap.Clear();
+        _scannedRegions.Clear();
         _scanCts?.Cancel();
         _scanCts = null;
+    }
+
+    private void TryHookSSLKeyLog()
+    {
+        _sslKeyLogPath = Path.Combine(_state.ExportDirectory, "sslkeys.log");
+        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", _sslKeyLogPath);
+        _sslKeyLogEnabled = true;
+
+        _state.AddInGameLog($"[KEYS] SSLKEYLOGFILE set to: {_sslKeyLogPath}");
+
+        if (File.Exists(_sslKeyLogPath))
+        {
+            _state.AddInGameLog("[KEYS] Existing key file found, loading...");
+            CheckSSLKeyLogFile();
+        }
+        else
+        {
+            _state.AddInGameLog("[KEYS] No key file yet. Keys will appear when Hytale connects.");
+            _state.AddInGameLog("[KEYS] Make sure to restart Hytale with proxy running!");
+        }
+
+        _state.RefreshAllKeys();
+    }
+
+    private void CheckSSLKeyLogFile()
+    {
+        try
+        {
+            var possibleFiles = new[]
+            {
+                Path.Combine(_state.ExportDirectory, "sslkeys.log"),
+                Path.Combine(_state.ExportDirectory, "keys.log"),
+                Path.Combine(_state.ExportDirectory, "ssl_keylog.log"),
+                _sslKeyLogPath
+            }.Where(f => !string.IsNullOrEmpty(f)).Distinct();
+
+            foreach (var file in possibleFiles)
+            {
+                if (File.Exists(file))
+                {
+                    var lines = File.ReadAllLines(file);
+                    var keyLines = lines.Where(l =>
+                        l.Contains("CLIENT_TRAFFIC_SECRET") ||
+                        l.Contains("SERVER_TRAFFIC_SECRET") ||
+                        l.Contains("HANDSHAKE_TRAFFIC_SECRET")).ToList();
+
+                    int newKeys = 0;
+                    foreach (var line in keyLines)
+                    {
+                        var parts = line.Split(' ');
+                        if (parts.Length >= 3)
+                        {
+                            try
+                            {
+                                var secret = Convert.FromHexString(parts[2]);
+                                if (secret.Length == 32 || secret.Length == 48)
+                                {
+                                    var key = new PacketDecryptor.EncryptionKey
+                                    {
+                                        Key = secret,
+                                        IV = new byte[12],
+                                        Type = secret.Length == 32 ?
+                                            PacketDecryptor.EncryptionType.AES256GCM :
+                                            PacketDecryptor.EncryptionType.ChaCha20Poly1305,
+                                        Source = $"SSLLog:{Path.GetFileName(file)}"
+                                    };
+
+                                    if (!PacketDecryptor.DiscoveredKeys.Any(k => k.Key.SequenceEqual(key.Key)))
+                                    {
+                                        PacketDecryptor.AddKey(key);
+                                        newKeys++;
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+
+                    if (newKeys > 0)
+                    {
+                        _sslKeyLogKeyCount += newKeys;
+                        _state.AddInGameLog($"[KEYS] Auto-loaded {newKeys} new keys from {Path.GetFileName(file)}");
+                    }
+                    else
+                    {
+                        _sslKeyLogKeyCount = keyLines.Count;
+                    }
+
+                    _sslKeyLogLastCheck = DateTime.Now;
+                }
+            }
+        }
+        catch { }
     }
 
     private void CopyToClipboard(string text)
