@@ -128,8 +128,8 @@ public class ConnectTab : ITab
         ImGui.Spacing();
 
         // UDP-ONLY INFO
-        ImGui.TextColored(Theme.ColAccent, "Mode: UDP-ONLY");
-        ImGui.TextWrapped("Hytale uses QUIC over UDP. No TCP needed.");
+        ImGui.TextColored(Theme.ColAccent, "Mode: UDP-ONLY (QUIC Handshake Preserved)");
+        ImGui.TextWrapped("Hytale uses QUIC over UDP. Handshake is now preserved.");
         ImGui.Spacing();
 
         ImGui.Text("Listen Port (UDP):");

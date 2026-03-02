@@ -488,7 +488,7 @@ public class HyForceApp
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\App\ImGuiController.cs =====
 
-// FILE: App/ImGuiController.cs
+// FILE: App/ImGuiController.cs - FIXED: Memory leak in clipboard callbacks
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Veldrid;
@@ -516,10 +516,10 @@ public class ImGuiController : IDisposable
 
     // Static clipboard buffer for callbacks
     private static string _clipboardBuffer = "";
+    private static IntPtr _clipboardPtr = IntPtr.Zero;
+    private static readonly object _clipboardLock = new();
 
     // Use standard delegate types that match ImGui's expected signatures
-    // SetClipboardTextFn: void(void* user_data, const char* text)
-    // GetClipboardTextFn: const char*(void* user_data)
     private delegate void SetClipboardTextDelegate(IntPtr userData, IntPtr text);
     private delegate IntPtr GetClipboardTextDelegate(IntPtr userData);
 
@@ -549,7 +549,6 @@ public class ImGuiController : IDisposable
         _getClipboardDelegate = new GetClipboardTextDelegate(GetClipboardTextCallback);
 
         // Assign to function pointers in PlatformIO
-        // In ImGui.NET 1.91+, these are IntPtr fields that point to native function pointers
         platformIO.Platform_SetClipboardTextFn = Marshal.GetFunctionPointerForDelegate(_setClipboardDelegate);
         platformIO.Platform_GetClipboardTextFn = Marshal.GetFunctionPointerForDelegate(_getClipboardDelegate);
 
@@ -586,11 +585,20 @@ public class ImGuiController : IDisposable
         if (string.IsNullOrEmpty(_clipboardBuffer))
             return IntPtr.Zero;
 
-        // Allocate unmanaged memory - this will leak but ImGui expects it to persist
-        var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
-        var ptr = Marshal.AllocHGlobal(bytes.Length);
-        Marshal.Copy(bytes, 0, ptr, bytes.Length);
-        return ptr;
+        lock (_clipboardLock)
+        {
+            // Free previous allocation to prevent memory leak
+            if (_clipboardPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_clipboardPtr);
+                _clipboardPtr = IntPtr.Zero;
+            }
+
+            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
+            _clipboardPtr = Marshal.AllocHGlobal(bytes.Length);
+            Marshal.Copy(bytes, 0, _clipboardPtr, bytes.Length);
+            return _clipboardPtr;
+        }
     }
 
     public void WindowResized(int width, int height)
@@ -971,6 +979,16 @@ void main()
 
     public void Dispose()
     {
+        // CRITICAL: Free clipboard memory to prevent leak
+        lock (_clipboardLock)
+        {
+            if (_clipboardPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_clipboardPtr);
+                _clipboardPtr = IntPtr.Zero;
+            }
+        }
+
         _vertexBuffer?.Dispose();
         _indexBuffer?.Dispose();
         _projMatrixBuffer?.Dispose();
@@ -987,11 +1005,12 @@ void main()
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Core\AppState.cs =====
 
-
+// FILE: Core/AppState.cs - FIXED: File locking issues with SSL key log
 using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
 using System.Collections.Concurrent;
+using System.IO;
 
 namespace HyForce.Core;
 
@@ -1023,7 +1042,7 @@ public class AppState : IDisposable
     public List<string> InGameLog { get; } = new();
     public const int MaxInGameLogLines = 1000;
 
-    public string ExportDirectory { get; set; } = @"C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs";
+    public string ExportDirectory { get; set; } = @"C:\Users\benja\source\repos\HyForce\Exported logs";
 
     public event PacketReceivedHandler? OnPacketReceived;
     public event Action? OnSecurityEvent;
@@ -1039,6 +1058,10 @@ public class AppState : IDisposable
     private FileSystemWatcher? _sslKeyWatcher;
     private DateTime _lastKeyLoadTime = DateTime.MinValue;
     private readonly object _keyLoadLock = new();
+
+    // FIXED: Retry queue for locked files
+    private readonly Queue<string> _pendingKeyFiles = new();
+    private readonly System.Timers.Timer _retryTimer;
 
     public AppState()
     {
@@ -1057,6 +1080,12 @@ public class AppState : IDisposable
 
         // NEW: Immediate scan for existing keys
         ScanAndLoadExistingKeys();
+
+        // FIXED: Setup retry timer for locked files
+        _retryTimer = new System.Timers.Timer(2000);
+        _retryTimer.Elapsed += (s, e) => ProcessPendingKeyFiles();
+        _retryTimer.AutoReset = true;
+        _retryTimer.Start();
     }
 
     private void SetupSSLKeyWatcher()
@@ -1076,7 +1105,7 @@ public class AppState : IDisposable
             _sslKeyWatcher.Created += (s, e) =>
             {
                 AddInGameLog($"[KEYS] New key file detected: {Path.GetFileName(e.FullPath)}");
-                TryLoadKeysFromFile(e.FullPath);
+                QueueKeyFileLoad(e.FullPath);
             };
 
             _sslKeyWatcher.Changed += (s, e) =>
@@ -1087,7 +1116,7 @@ public class AppState : IDisposable
                     if ((DateTime.Now - _lastKeyLoadTime).TotalSeconds > 2)
                     {
                         AddInGameLog($"[KEYS] Key file updated: {Path.GetFileName(e.FullPath)}");
-                        TryLoadKeysFromFile(e.FullPath);
+                        QueueKeyFileLoad(e.FullPath);
                         _lastKeyLoadTime = DateTime.Now;
                     }
                 }
@@ -1122,7 +1151,7 @@ public class AppState : IDisposable
                 // Load the most recent one first
                 foreach (var file in keyFiles.Take(3))
                 {
-                    TryLoadKeysFromFile(file);
+                    QueueKeyFileLoad(file);
                 }
             }
             else
@@ -1133,6 +1162,57 @@ public class AppState : IDisposable
         catch (Exception ex)
         {
             Log.Warn($"[KEYS] Scan failed: {ex.Message}", "System");
+        }
+    }
+
+    // FIXED: Queue file for loading with retry
+    private void QueueKeyFileLoad(string path)
+    {
+        lock (_pendingKeyFiles)
+        {
+            if (!_pendingKeyFiles.Contains(path))
+            {
+                _pendingKeyFiles.Enqueue(path);
+            }
+        }
+    }
+
+    // FIXED: Process queued files with retry logic
+    private void ProcessPendingKeyFiles()
+    {
+        lock (_pendingKeyFiles)
+        {
+            int count = _pendingKeyFiles.Count;
+            for (int i = 0; i < count; i++)
+            {
+                if (_pendingKeyFiles.Count == 0) break;
+
+                string path = _pendingKeyFiles.Dequeue();
+
+                // Try to load, if fails re-queue
+                if (!TryLoadKeysFromFileInternal(path))
+                {
+                    // Re-queue for retry (max 5 attempts)
+                    if (!path.Contains("|retry5"))
+                    {
+                        int retryCount = 0;
+                        if (path.Contains("|retry"))
+                        {
+                            int.TryParse(path.Split("|retry")[1], out retryCount);
+                        }
+
+                        if (retryCount < 5)
+                        {
+                            string retryPath = path.Split("|retry")[0] + $"|retry{retryCount + 1}";
+                            _pendingKeyFiles.Enqueue(retryPath);
+                        }
+                        else
+                        {
+                            AddInGameLog($"[KEYS] Gave up on {Path.GetFileName(path)} after 5 attempts");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1233,7 +1313,7 @@ public class AppState : IDisposable
             foreach (var log in existingLogs)
             {
                 AddInGameLog($"[AUTO-DECRYPT] Found existing key log: {Path.GetFileName(log)}");
-                TryLoadKeysFromFile(log);
+                QueueKeyFileLoad(log);
             }
         }
         catch (Exception ex)
@@ -1242,52 +1322,67 @@ public class AppState : IDisposable
         }
     }
 
+    // FIXED: Public method uses queue
     public void TryLoadKeysFromFile(string path)
     {
+        QueueKeyFileLoad(path);
+    }
+
+    // FIXED: Internal method with proper file sharing
+    private bool TryLoadKeysFromFileInternal(string path)
+    {
+        // Strip retry marker for actual path
+        string actualPath = path.Split("|retry")[0];
+
         try
         {
-            if (!File.Exists(path)) return;
+            if (!File.Exists(actualPath)) return true; // Done, file gone
 
-            var lines = File.ReadAllLines(path);
             int keysAdded = 0;
             int linesProcessed = 0;
 
-            foreach (var line in lines)
+            // FIXED: Use FileStream with FileShare.ReadWrite to allow concurrent access
+            using (var fs = new FileStream(actualPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(fs))
             {
-                linesProcessed++;
-
-                // Parse SSLKEYLOGFILE format
-                if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
-                    line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
-                    line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
-                    line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
-                    line.StartsWith("EXPORTER_SECRET"))
+                string? line;
+                while ((line = reader.ReadLine()) != null)
                 {
-                    var parts = line.Split(' ');
-                    if (parts.Length >= 3)
-                    {
-                        try
-                        {
-                            var secret = Convert.FromHexString(parts[2]);
-                            if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
-                            {
-                                var key = new PacketDecryptor.EncryptionKey
-                                {
-                                    Key = secret,
-                                    IV = new byte[12],
-                                    Type = secret.Length == 32 ?
-                                        PacketDecryptor.EncryptionType.AES256GCM :
-                                        PacketDecryptor.EncryptionType.ChaCha20Poly1305,
-                                    Source = $"{Path.GetFileName(path)}:{linesProcessed}"
-                                };
+                    linesProcessed++;
 
-                                PacketDecryptor.AddKey(key);
-                                keysAdded++;
-                            }
-                        }
-                        catch (FormatException)
+                    // Parse SSLKEYLOGFILE format
+                    if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
+                        line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
+                        line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
+                        line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
+                        line.StartsWith("EXPORTER_SECRET"))
+                    {
+                        var parts = line.Split(' ');
+                        if (parts.Length >= 3)
                         {
-                            // Invalid hex, skip
+                            try
+                            {
+                                var secret = Convert.FromHexString(parts[2]);
+                                if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
+                                {
+                                    var key = new PacketDecryptor.EncryptionKey
+                                    {
+                                        Key = secret,
+                                        IV = new byte[12],
+                                        Type = secret.Length == 32 ?
+                                            PacketDecryptor.EncryptionType.AES256GCM :
+                                            PacketDecryptor.EncryptionType.ChaCha20Poly1305,
+                                        Source = $"{Path.GetFileName(actualPath)}:{linesProcessed}"
+                                    };
+
+                                    PacketDecryptor.AddKey(key);
+                                    keysAdded++;
+                                }
+                            }
+                            catch (FormatException)
+                            {
+                                // Invalid hex, skip
+                            }
                         }
                     }
                 }
@@ -1295,19 +1390,34 @@ public class AppState : IDisposable
 
             if (keysAdded > 0)
             {
-                AddInGameLog($"[KEYS] Loaded {keysAdded} keys from {Path.GetFileName(path)}");
-                Log.Success($"Loaded {keysAdded} keys from {Path.GetFileName(path)}", "Keys");
+                AddInGameLog($"[KEYS] Loaded {keysAdded} keys from {Path.GetFileName(actualPath)}");
+                Log.Success($"Loaded {keysAdded} keys from {Path.GetFileName(actualPath)}", "Keys");
                 OnKeysUpdated?.Invoke(); // Notify UI
+                return true; // Success
             }
             else if (linesProcessed > 0)
             {
-                AddInGameLog($"[KEYS] No valid keys found in {Path.GetFileName(path)} ({linesProcessed} lines)");
+                AddInGameLog($"[KEYS] No valid keys found in {Path.GetFileName(actualPath)} ({linesProcessed} lines)");
+                return true; // Success, just no keys
             }
+            return true; // Empty file
+        }
+        catch (IOException ex) when (IsFileLocked(ex))
+        {
+            // File is locked, will retry
+            return false;
         }
         catch (Exception ex)
         {
             AddInGameLog($"[KEYS] Failed to load keys: {ex.Message}");
+            return true; // Don't retry on other errors
         }
+    }
+
+    private static bool IsFileLocked(IOException exception)
+    {
+        int errorCode = exception.HResult & 0xFFFF;
+        return errorCode == 32 || errorCode == 33; // ERROR_SHARING_VIOLATION or ERROR_LOCK_VIOLATION
     }
 
     // NEW: Force refresh of all key files
@@ -1709,6 +1819,7 @@ public class AppState : IDisposable
         UdpProxy.OnPacket -= HandlePacket;
         _autoDecryptTimer?.Dispose();
         _sslKeyWatcher?.Dispose();
+        _retryTimer?.Dispose();
     }
 }
 
@@ -1721,8 +1832,6 @@ public class KeyStatus
     public List<string> KeySources { get; set; } = new();
     public DateTime? LastKeyAdded { get; set; }
 }
-
-
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Core\Config.cs =====
@@ -3335,6 +3444,7 @@ public class TcpSession
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Networking\UdpProxy.cs =====
 
+// FILE: Networking/UdpProxy.cs - FIXED: Proper disposal pattern
 using HyForce.Core;
 using System.Collections.Concurrent;
 using System.Net;
@@ -3353,7 +3463,7 @@ public class UdpProxy : IDisposable
     public int ServerPort { get; private set; }
     public int ListenPort { get; private set; }
 
-    public event PacketReceivedHandler? OnPacket;  // CHANGED from PacketHandler
+    public event PacketReceivedHandler? OnPacket;
 
     private readonly Data.TestLog _log;
     private UdpClient? _listener;
@@ -3387,7 +3497,7 @@ public class UdpProxy : IDisposable
             ServerPort = serverPort;
             ListenPort = listenPort;
             IsRunning = true;
-            StatusMessage = $"Listening 0.0.0.0:{listenPort} ? {serverIp}:{serverPort}";
+            StatusMessage = $"Listening 0.0.0.0:{listenPort} -> {serverIp}:{serverPort}";
 
             _log.Info($"[UDP] Started on 0.0.0.0:{listenPort}", "UDP");
             _log.Info($"[UDP] QUIC-aware with CID translation", "UDP");
@@ -3410,9 +3520,10 @@ public class UdpProxy : IDisposable
         _listener?.Close();
         _listener = null;
 
+        // FIXED: Proper disposal of sessions
         foreach (var session in _sessions.Values)
         {
-            session.ServerSocket.Close();
+            session.Dispose();
         }
         _sessions.Clear();
 
@@ -3538,7 +3649,7 @@ public class UdpProxy : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    _log.Error($"[UDP] S?C error: {ex.Message}", "UDP");
+                    _log.Error($"[UDP] S->C error: {ex.Message}", "UDP");
                 }
             }
         }
@@ -3600,7 +3711,8 @@ public class UdpProxy : IDisposable
     public void Dispose() => Stop();
 }
 
-public class QuicSession
+// FIXED: Implement IDisposable properly
+public class QuicSession : IDisposable
 {
     public IPEndPoint ClientEndpoint { get; }
     public UdpClient ServerSocket { get; }
@@ -3610,6 +3722,8 @@ public class QuicSession
 
     public Dictionary<byte[], byte[]> ClientToServerCidMap { get; } = new();
     public Dictionary<byte[], byte[]> ServerToClientCidMap { get; } = new();
+
+    private bool _disposed;
 
     public QuicSession(IPEndPoint clientEp, UdpClient serverSocket, byte[] serverCid, byte[] clientCid)
     {
@@ -3621,6 +3735,20 @@ public class QuicSession
 
         ClientToServerCidMap[clientCid] = serverCid;
         ServerToClientCidMap[serverCid] = clientCid;
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            try
+            {
+                ServerSocket?.Close();
+                ServerSocket?.Dispose();
+            }
+            catch { }
+            _disposed = true;
+        }
     }
 }
 
@@ -3785,7 +3913,7 @@ public static class EncryptionBypass
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Protocol\PacketDecryptor.cs =====
 
-// FILE: Protocol/PacketDecryptor.cs - ENHANCED WITH AUTO-EXTRACTION AND VALIDATION
+// FILE: Protocol/PacketDecryptor.cs - FIXED: Key limits and deduplication
 using System.Security.Cryptography;
 using System.Text;
 
@@ -3820,12 +3948,43 @@ public static class PacketDecryptor
         public string Source { get; set; } = "";
         public IntPtr? MemoryAddress { get; set; }
         public DateTime DiscoveredAt { get; set; } = DateTime.Now;
+        public int UseCount { get; set; } = 0; // Track successful uses
     }
 
-    public static List<EncryptionKey> DiscoveredKeys { get; } = new();
+    // FIXED: Thread-safe backing fields with strict limits
+    private static readonly List<EncryptionKey> _discoveredKeys = new();
+    private static readonly ReaderWriterLockSlim _keysLock = new(LockRecursionPolicy.SupportsRecursion);
+    private static int _successfulDecryptions = 0;
+    private static int _failedDecryptions = 0;
+
+    // FIXED: Hard limits to prevent memory/performance issues
+    private const int MAX_KEYS = 50; // Maximum keys to store
+    private const int MAX_KEYS_PER_SOURCE = 10; // Max per file/source
+
+    // Public accessors
+    public static IReadOnlyList<EncryptionKey> DiscoveredKeys
+    {
+        get
+        {
+            _keysLock.EnterReadLock();
+            try { return _discoveredKeys.ToList(); }
+            finally { _keysLock.ExitReadLock(); }
+        }
+    }
+
     public static event Action<EncryptionKey>? OnKeyDiscovered;
-    public static int SuccessfulDecryptions { get; private set; }
-    public static int FailedDecryptions { get; private set; }
+
+    public static int SuccessfulDecryptions
+    {
+        get => Interlocked.CompareExchange(ref _successfulDecryptions, 0, 0);
+        private set => Interlocked.Exchange(ref _successfulDecryptions, value);
+    }
+
+    public static int FailedDecryptions
+    {
+        get => Interlocked.CompareExchange(ref _failedDecryptions, 0, 0);
+        private set => Interlocked.Exchange(ref _failedDecryptions, value);
+    }
 
     // Auto-extraction settings
     public static bool AutoExtractFromMemory { get; set; } = true;
@@ -3838,91 +3997,130 @@ public static class PacketDecryptor
             return new DecryptionResult { Success = false, ErrorMessage = "Data too short" };
         }
 
-        // Try each discovered key with validation
-        foreach (var key in DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt))
+        // FIXED: Get keys sorted by success rate (most used first)
+        List<EncryptionKey> keysCopy;
+        _keysLock.EnterReadLock();
+        try
+        {
+            // Only try top 10 most successful keys for performance
+            keysCopy = _discoveredKeys
+                .OrderByDescending(k => k.UseCount)
+                .ThenByDescending(k => k.DiscoveredAt)
+                .Take(10)
+                .ToList();
+        }
+        finally
+        {
+            _keysLock.ExitReadLock();
+        }
+
+        if (keysCopy.Count == 0)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = "No keys available" };
+        }
+
+        // Try each key with validation
+        foreach (var key in keysCopy)
         {
             var result = TryDecryptWithKey(encryptedData, key, associatedData);
 
-            // Validate decrypted data looks reasonable
             if (result.Success && result.DecryptedData != null)
             {
                 if (IsValidDecryptedData(result.DecryptedData))
                 {
-                    SuccessfulDecryptions++;
+                    // Increment use count for this key
+                    _keysLock.EnterWriteLock();
+                    try
+                    {
+                        key.UseCount++;
+                    }
+                    finally
+                    {
+                        _keysLock.ExitWriteLock();
+                    }
+
+                    Interlocked.Increment(ref _successfulDecryptions);
                     return result;
-                }
-                else
-                {
-                    result.Success = false;
-                    result.ErrorMessage = "Key produced invalid data";
                 }
             }
         }
 
-        // Try common/default keys as last resort
-        var defaultResult = TryCommonKeys(encryptedData, associatedData);
-        if (defaultResult.Success)
-        {
-            SuccessfulDecryptions++;
-            return defaultResult;
-        }
-
-        FailedDecryptions++;
+        Interlocked.Increment(ref _failedDecryptions);
         return new DecryptionResult { Success = false, ErrorMessage = "No valid decryption key found" };
     }
 
-    // NEW: QUIC-specific decryption handling
     public static DecryptionResult TryDecryptQUIC(byte[] packetData, EncryptionKey key)
     {
-        if (packetData.Length < 21) // Minimum QUIC packet size
+        const int TAG_LENGTH = 16;
+        const int NONCE_LENGTH = 12;
+        const int MIN_PACKET_SIZE = 21;
+
+        if (packetData == null || packetData.Length < MIN_PACKET_SIZE)
             return new DecryptionResult { Success = false, ErrorMessage = "Packet too small for QUIC" };
+
+        if (key?.Key == null || (key.Key.Length != 32 && key.Key.Length != 16))
+            return new DecryptionResult { Success = false, ErrorMessage = "Invalid key" };
 
         try
         {
             bool isLongHeader = (packetData[0] & 0x80) != 0;
             int headerLen;
-            byte[]? headerBytes = null;
 
             if (isLongHeader)
             {
-                // Long header: type(1) + version(4) + DCID len(1) + DCID + SCID len(1) + SCID + len(2) + PN
-                if (packetData.Length < 7) return new DecryptionResult { Success = false };
+                if (packetData.Length < 7)
+                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid long header" };
+
                 int dcidLen = packetData[5];
+                if (packetData.Length < 6 + dcidLen + 1)
+                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid DCID length" };
+
                 int scidLen = packetData[6 + dcidLen];
-                headerLen = 7 + dcidLen + scidLen + 2 + 4; // Approximate
-                if (headerLen > packetData.Length) headerLen = 16; // Fallback
+                headerLen = 7 + dcidLen + scidLen + 2 + 4;
+
+                if (headerLen > packetData.Length - TAG_LENGTH)
+                    headerLen = Math.Min(16, packetData.Length - TAG_LENGTH);
             }
             else
             {
-                // Short header: type(1) + DCID (4-8 bytes typically) + PN (1-4 bytes)
-                headerLen = 1 + 8; // Assume 8-byte DCID for Hytale
+                headerLen = Math.Min(1 + 8, packetData.Length - TAG_LENGTH);
             }
 
-            headerLen = Math.Min(headerLen, packetData.Length - 16);
-            headerBytes = packetData[..headerLen];
+            headerLen = Math.Max(1, Math.Min(headerLen, packetData.Length - TAG_LENGTH));
 
-            var ciphertext = packetData[headerLen..^16];
-            var tag = packetData[^16..];
+            byte[] headerBytes = new byte[headerLen];
+            Buffer.BlockCopy(packetData, 0, headerBytes, 0, headerLen);
 
-            // Build nonce from IV + packet number (simplified)
-            var nonce = new byte[12];
-            Array.Copy(key.IV, 0, nonce, 0, 12);
+            int ciphertextLength = packetData.Length - headerLen - TAG_LENGTH;
+            if (ciphertextLength < 1)
+                return new DecryptionResult { Success = false, ErrorMessage = "No ciphertext" };
 
-            // XOR packet number into nonce last bytes if available
+            byte[] ciphertext = new byte[ciphertextLength];
+            Buffer.BlockCopy(packetData, headerLen, ciphertext, 0, ciphertextLength);
+
+            byte[] tag = new byte[TAG_LENGTH];
+            Buffer.BlockCopy(packetData, packetData.Length - TAG_LENGTH, tag, 0, TAG_LENGTH);
+
+            byte[] nonce = new byte[NONCE_LENGTH];
+            if (key.IV != null && key.IV.Length >= NONCE_LENGTH)
+            {
+                Buffer.BlockCopy(key.IV, 0, nonce, 0, NONCE_LENGTH);
+            }
+
             if (headerLen >= 4 && packetData.Length > headerLen)
             {
                 for (int i = 0; i < 4 && i < (packetData.Length - headerLen); i++)
                 {
-                    nonce[8 + i] ^= packetData[headerLen - 4 + i];
+                    if (8 + i < NONCE_LENGTH)
+                        nonce[8 + i] ^= packetData[headerLen - 4 + i];
                 }
             }
 
-            using var aes = new AesGcm(key.Key, 16);
-            var plaintext = new byte[ciphertext.Length];
+            using var aes = new AesGcm(key.Key, TAG_LENGTH);
+            byte[] plaintext = new byte[ciphertextLength];
 
             aes.Decrypt(nonce, ciphertext, tag, plaintext, headerBytes);
 
-            // Validate result
             if (!IsValidDecryptedData(plaintext))
             {
                 return new DecryptionResult { Success = false, ErrorMessage = "Decrypted data validation failed" };
@@ -3943,6 +4141,10 @@ public static class PacketDecryptor
                 }
             };
         }
+        catch (CryptographicException ex)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = $"Decryption failed: {ex.Message}" };
+        }
         catch (Exception ex)
         {
             return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
@@ -3953,8 +4155,9 @@ public static class PacketDecryptor
     {
         try
         {
-            // Try QUIC-specific handling first for UDP packets
-            if (data.Length > 0 && (data[0] & 0x80) != 0 || data.Length > 1000)
+            bool looksLikeQuic = (data.Length > 0 && (data[0] & 0x80) != 0) || data.Length > 1000;
+
+            if (looksLikeQuic)
             {
                 var quicResult = TryDecryptQUIC(data, key);
                 if (quicResult.Success) return quicResult;
@@ -3979,22 +4182,33 @@ public static class PacketDecryptor
 
     private static DecryptionResult DecryptAESGCM(byte[] data, byte[] key, byte[] iv, byte[]? associatedData)
     {
+        const int NONCE_LENGTH = 12;
+        const int TAG_LENGTH = 16;
+
         try
         {
-            // Check minimum size: nonce(12) + ciphertext(1+) + tag(16)
-            if (data.Length < 29)
+            if (data.Length < NONCE_LENGTH + 1 + TAG_LENGTH)
                 return new DecryptionResult { Success = false, ErrorMessage = "Data too short for AES-GCM" };
 
-            using var aes = new AesGcm(key, 16);
+            if (key.Length != 16 && key.Length != 32)
+                return new DecryptionResult { Success = false, ErrorMessage = "Invalid key length" };
 
-            var nonce = data[..12];
-            var ciphertext = data[12..^16];
-            var tag = data[^16..];
-            var plaintext = new byte[ciphertext.Length];
+            using var aes = new AesGcm(key, TAG_LENGTH);
+
+            byte[] nonce = new byte[NONCE_LENGTH];
+            Buffer.BlockCopy(data, 0, nonce, 0, NONCE_LENGTH);
+
+            int ciphertextLength = data.Length - NONCE_LENGTH - TAG_LENGTH;
+            byte[] ciphertext = new byte[ciphertextLength];
+            Buffer.BlockCopy(data, NONCE_LENGTH, ciphertext, 0, ciphertextLength);
+
+            byte[] tag = new byte[TAG_LENGTH];
+            Buffer.BlockCopy(data, data.Length - TAG_LENGTH, tag, 0, TAG_LENGTH);
+
+            byte[] plaintext = new byte[ciphertextLength];
 
             aes.Decrypt(nonce, ciphertext, tag, plaintext, associatedData);
 
-            // Validate it looks like valid data
             if (!IsValidDecryptedData(plaintext))
             {
                 return new DecryptionResult { Success = false, ErrorMessage = "Validation failed" };
@@ -4004,7 +4218,7 @@ public static class PacketDecryptor
             {
                 Success = true,
                 DecryptedData = plaintext,
-                DetectedType = EncryptionType.AES256GCM,
+                DetectedType = key.Length == 32 ? EncryptionType.AES256GCM : EncryptionType.AES128GCM,
                 Metadata =
                 {
                     ["algorithm"] = "AES-GCM",
@@ -4013,39 +4227,31 @@ public static class PacketDecryptor
                 }
             };
         }
-        catch
+        catch (CryptographicException)
         {
-            return new DecryptionResult { Success = false };
+            return new DecryptionResult { Success = false, ErrorMessage = "Authentication failed" };
+        }
+        catch (Exception ex)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
         }
     }
 
     private static DecryptionResult DecryptChaCha20(byte[] data, byte[] key, byte[] iv, byte[]? associatedData)
     {
-        try
+        return new DecryptionResult
         {
-            // ChaCha20-Poly1305: nonce(12) + ciphertext + tag(16)
-            if (data.Length < 29 || key.Length != 32)
-                return new DecryptionResult { Success = false, ErrorMessage = "Invalid ChaCha20 data" };
-
-            // Note: .NET 5+ doesn't have built-in ChaCha20, would need BouncyCastle
-            // For now, return failure but mark as potential ChaCha20
-            return new DecryptionResult
-            {
-                Success = false,
-                ErrorMessage = "ChaCha20 requires BouncyCastle library"
-            };
-        }
-        catch
-        {
-            return new DecryptionResult { Success = false };
-        }
+            Success = false,
+            ErrorMessage = "ChaCha20 requires BouncyCastle library"
+        };
     }
 
     private static DecryptionResult DecryptXOR(byte[] data, byte[] key)
     {
-        if (key.Length == 0) return new DecryptionResult { Success = false, ErrorMessage = "Empty XOR key" };
+        if (key == null || key.Length == 0)
+            return new DecryptionResult { Success = false, ErrorMessage = "Empty XOR key" };
 
-        var result = new byte[data.Length];
+        byte[] result = new byte[data.Length];
         for (int i = 0; i < data.Length; i++)
         {
             result[i] = (byte)(data[i] ^ key[i % key.Length]);
@@ -4069,8 +4275,6 @@ public static class PacketDecryptor
 
     private static DecryptionResult TryCommonKeys(byte[] data, byte[]? associatedData)
     {
-        // Try all-zero keys (debug builds sometimes use these)
-        var zeroKey16 = new byte[16];
         var zeroKey32 = new byte[32];
 
         var result = TryDecryptWithKey(data, new EncryptionKey
@@ -4083,7 +4287,6 @@ public static class PacketDecryptor
 
         if (result.Success) return result;
 
-        // Try common debug keys
         var debugKeys = new[]
         {
             "HYTALE_DEBUG_KEY_32_BYTES_LONG!!",
@@ -4117,41 +4320,79 @@ public static class PacketDecryptor
         return new DecryptionResult { Success = false };
     }
 
-    // NEW: Validate decrypted data looks like valid protocol data
     private static bool IsValidDecryptedData(byte[] data)
     {
         if (data.Length < 2) return false;
 
-        // Check for reasonable entropy (not too random, not too structured)
         double entropy = CalculateEntropy(data);
-        if (entropy > 7.9) return false; // Still looks encrypted
+        if (entropy > 7.9) return false;
 
-        // Look for common QUIC/Hytale frame types
         byte firstByte = data[0];
 
-        // Valid QUIC short header frame types
-        bool hasValidFrame = firstByte <= 0x20 || // Common frames
-                            (firstByte >= 0x40 && firstByte <= 0x7F) || // ACK frames
-                            (firstByte >= 0x80 && firstByte <= 0xBF); // Stream frames
+        bool hasValidFrame = firstByte <= 0x20 ||
+                            (firstByte >= 0x40 && firstByte <= 0x7F) ||
+                            (firstByte >= 0x80 && firstByte <= 0xBF);
 
-        // Or check for printable strings (protocol often contains strings)
         bool hasStrings = ContainsPrintableStrings(data, 4);
-
-        // Or reasonable structure (not all zeros, not all same byte)
         bool hasStructure = data.Any(b => b != 0) && data.Distinct().Count() > 4;
 
         return hasValidFrame || hasStrings || (entropy < 6.0 && hasStructure);
     }
 
+    // FIXED: Smart deduplication and limits
     public static void AddKey(EncryptionKey key)
     {
-        if (key.Key == null || key.Key.Length == 0) return;
+        if (key?.Key == null || key.Key.Length == 0) return;
 
-        // Check for duplicates
-        if (!DiscoveredKeys.Any(k => k.Key.SequenceEqual(key.Key)))
+        _keysLock.EnterWriteLock();
+        try
         {
-            DiscoveredKeys.Add(key);
-            OnKeyDiscovered?.Invoke(key);
+            // Check for exact duplicate
+            foreach (var existing in _discoveredKeys)
+            {
+                if (existing.Key.SequenceEqual(key.Key))
+                {
+                    // Update source if new info
+                    if (!existing.Source.Contains(key.Source))
+                    {
+                        existing.Source += $", {key.Source}";
+                    }
+                    return; // Don't add duplicate
+                }
+            }
+
+            // Check per-source limit
+            var sourceCount = _discoveredKeys.Count(k => k.Source.StartsWith(key.Source.Split(':')[0]));
+            if (sourceCount >= MAX_KEYS_PER_SOURCE)
+            {
+                // Remove oldest from this source
+                var oldest = _discoveredKeys
+                    .Where(k => k.Source.StartsWith(key.Source.Split(':')[0]))
+                    .OrderBy(k => k.DiscoveredAt)
+                    .First();
+                _discoveredKeys.Remove(oldest);
+            }
+
+            // Check global limit
+            if (_discoveredKeys.Count >= MAX_KEYS)
+            {
+                // Remove least used key
+                var leastUsed = _discoveredKeys.OrderBy(k => k.UseCount).ThenBy(k => k.DiscoveredAt).First();
+                _discoveredKeys.Remove(leastUsed);
+            }
+
+            _discoveredKeys.Add(key);
+
+            // Invoke outside lock
+            var handler = OnKeyDiscovered;
+            _keysLock.ExitWriteLock();
+            handler?.Invoke(key);
+            return;
+        }
+        finally
+        {
+            if (_keysLock.IsWriteLockHeld)
+                _keysLock.ExitWriteLock();
         }
     }
 
@@ -4167,20 +4408,11 @@ public static class PacketDecryptor
         });
     }
 
-    // AUTO-EXTRACTION: Scan for TLS secrets in memory
     public static void AutoExtractKeysFromMemory(IntPtr processHandle)
     {
         if (!AutoExtractFromMemory) return;
-
-        try
-        {
-            // This is called from MemoryTab - actual scanning happens there
-            // This method is for external triggers
-        }
-        catch { }
     }
 
-    // AUTO-EXTRACTION: Load from SSLKEYLOGFILE
     public static void AutoExtractFromSSLLogFile(string path)
     {
         if (!AutoExtractFromSSLLog || !File.Exists(path)) return;
@@ -4190,7 +4422,6 @@ public static class PacketDecryptor
             var lines = File.ReadAllLines(path);
             foreach (var line in lines)
             {
-                // Parse: CLIENT_TRAFFIC_SECRET_0 <client_random> <secret_hex>
                 var parts = line.Split(' ');
                 if (parts.Length >= 3 &&
                     (parts[0].Contains("TRAFFIC_SECRET") || parts[0].Contains("HANDSHAKE_TRAFFIC_SECRET")))
@@ -4209,7 +4440,7 @@ public static class PacketDecryptor
                             });
                         }
                     }
-                    catch (FormatException) { /* Invalid hex */ }
+                    catch (FormatException) { }
                 }
             }
         }
@@ -4218,9 +4449,17 @@ public static class PacketDecryptor
 
     public static void ClearKeys()
     {
-        DiscoveredKeys.Clear();
-        SuccessfulDecryptions = 0;
-        FailedDecryptions = 0;
+        _keysLock.EnterWriteLock();
+        try
+        {
+            _discoveredKeys.Clear();
+            Interlocked.Exchange(ref _successfulDecryptions, 0);
+            Interlocked.Exchange(ref _failedDecryptions, 0);
+        }
+        finally
+        {
+            _keysLock.ExitWriteLock();
+        }
     }
 
     public static EncryptionType DetectEncryptionType(byte[] packetData)
@@ -4228,19 +4467,17 @@ public static class PacketDecryptor
         if (packetData == null || packetData.Length < 4)
             return EncryptionType.None;
 
-        // Check for QUIC long header (0x80-0xFF first byte)
         if ((packetData[0] & 0x80) != 0)
         {
-            return EncryptionType.AES256GCM; // QUIC uses AES-GCM or ChaCha20
+            return EncryptionType.AES256GCM;
         }
 
-        // High entropy check
         double entropy = CalculateEntropy(packetData);
         if (entropy > 7.8)
             return EncryptionType.AES256GCM;
 
         if (entropy > 6.5)
-            return EncryptionType.XOR; // Weak obfuscation
+            return EncryptionType.XOR;
 
         return EncryptionType.None;
     }
@@ -4254,7 +4491,7 @@ public static class PacketDecryptor
 
     private static double CalculateEntropy(byte[] data)
     {
-        if (data.Length == 0) return 0;
+        if (data == null || data.Length == 0) return 0;
 
         var freq = new int[256];
         foreach (var b in data) freq[b]++;
@@ -4271,6 +4508,8 @@ public static class PacketDecryptor
 
     private static bool ContainsPrintableStrings(byte[] data, int minLength = 4)
     {
+        if (data == null) return false;
+
         int currentLength = 0;
         foreach (var b in data)
         {
@@ -4289,7 +4528,16 @@ public static class PacketDecryptor
 
     public static string GetStats()
     {
-        return $"Keys: {DiscoveredKeys.Count}, Success: {SuccessfulDecryptions}, Failed: {FailedDecryptions}";
+        int keys, success, failed;
+
+        _keysLock.EnterReadLock();
+        try { keys = _discoveredKeys.Count; }
+        finally { _keysLock.ExitReadLock(); }
+
+        success = SuccessfulDecryptions;
+        failed = FailedDecryptions;
+
+        return $"Keys: {keys}, Success: {success}, Failed: {failed}";
     }
 }
 
@@ -4878,6 +5126,21 @@ public class PacketPattern
     public bool IsBurst { get; set; }
     public double RatePerSecond { get; set; }
 }
+
+
+===== FILE: C:\Users\benja\source\repos\HyForce\Protocol\QuicKeyDerivation.cs =====
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace HyForce.Protocol
+{
+    internal class QuicKeyDerivation
+    {
+    }
+}
+
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Protocol\RegistrySyncParser.cs =====
@@ -5494,6 +5757,7 @@ public class ConnectTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\DecryptionTab.cs =====
 
+// FILE: Tabs/DecryptionTab.cs - FIXED: UI freezing with many keys
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
@@ -5509,22 +5773,24 @@ public class DecryptionTab : ITab
 
     private readonly AppState _state;
     private string _manualKey = "";
-    private int _selectedKeyType = 1; // Default to AES-256
+    private int _selectedKeyType = 1;
     private string _testData = "";
     private bool _autoDecrypt = true;
 
-    // NEW: UI state
     private int _selectedKeyIndex = -1;
     private bool _showKeyDetails = false;
     private float _lastRefreshTime = 0;
     private string _statusMessage = "";
     private float _statusTime = 0;
 
+    // FIXED: Cache key list to prevent constant re-allocation
+    private List<PacketDecryptor.EncryptionKey> _cachedKeys = new();
+    private DateTime _lastKeyCacheTime = DateTime.MinValue;
+    private const int MAX_UI_KEYS = 20; // Only show top 20 in UI
+
     public DecryptionTab(AppState state)
     {
         _state = state;
-
-        // Subscribe to key updates
         _state.OnKeysUpdated += OnKeysUpdated;
     }
 
@@ -5532,6 +5798,21 @@ public class DecryptionTab : ITab
     {
         _statusMessage = "Keys updated!";
         _statusTime = (float)ImGui.GetTime();
+        _lastKeyCacheTime = DateTime.MinValue; // Invalidate cache
+    }
+
+    private void UpdateKeyCache()
+    {
+        // Refresh cache every 2 seconds max
+        if (DateTime.Now - _lastKeyCacheTime > TimeSpan.FromSeconds(2))
+        {
+            _cachedKeys = PacketDecryptor.DiscoveredKeys
+                .OrderByDescending(k => k.UseCount)
+                .ThenByDescending(k => k.DiscoveredAt)
+                .Take(MAX_UI_KEYS * 2) // Get more than we show
+                .ToList();
+            _lastKeyCacheTime = DateTime.Now;
+        }
     }
 
     public void Render()
@@ -5579,11 +5860,10 @@ public class DecryptionTab : ITab
 
         ImGui.BeginGroup();
 
-        // Status indicator with icon
+        // Draw status circle
         var drawList = ImGui.GetWindowDrawList();
         var pos = ImGui.GetCursorScreenPos();
 
-        // Draw status circle
         drawList.AddCircleFilled(pos + new Vector2(10, 12), 8,
             ImGui.ColorConvertFloat4ToU32(color));
         ImGui.Dummy(new Vector2(25, 24));
@@ -5610,13 +5890,14 @@ public class DecryptionTab : ITab
 
         ImGui.EndGroup();
 
-        // Refresh button - aligned right
+        // Refresh button
         ImGui.SameLine(ImGui.GetContentRegionAvail().X - 120);
 
         ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.6f, 0.9f, 1f));
         if (ImGui.Button("Refresh Keys", new Vector2(110, 28)))
         {
             _state.RefreshAllKeys();
+            _lastKeyCacheTime = DateTime.MinValue;
         }
         ImGui.PopStyleColor();
 
@@ -5655,18 +5936,22 @@ public class DecryptionTab : ITab
         {
             PacketDecryptor.ClearKeys();
             _state.AddInGameLog("[DECRYPTION] All keys cleared");
+            _lastKeyCacheTime = DateTime.MinValue;
         }
 
         ImGui.Spacing();
         ImGui.Separator();
 
-        // Enhanced key list with details
-        ImGui.TextColored(Theme.ColAccent, $"Discovered Keys ({PacketDecryptor.DiscoveredKeys.Count})");
+        // FIXED: Use cached keys with limit
+        UpdateKeyCache();
+
+        int totalKeys = PacketDecryptor.DiscoveredKeys.Count;
+        ImGui.TextColored(Theme.ColAccent, $"Discovered Keys (showing {_cachedKeys.Count} of {totalKeys})");
 
         ImGui.BeginChild("##key_list", new Vector2(0, 200), ImGuiChildFlags.Borders);
 
         int index = 0;
-        foreach (var key in PacketDecryptor.DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt))
+        foreach (var key in _cachedKeys)
         {
             ImGui.PushID(index++);
 
@@ -5675,14 +5960,14 @@ public class DecryptionTab : ITab
             // Key header with type and time
             var timeAgo = DateTime.Now - key.DiscoveredAt;
             string timeStr = timeAgo.TotalMinutes < 1 ? "now" : $"{timeAgo.TotalMinutes:F0}m";
+            string useStr = key.UseCount > 0 ? $" (used {key.UseCount}x)" : "";
 
             ImGui.BeginGroup();
 
-            // Selection highlight
             if (isSelected)
                 ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColAccent);
 
-            ImGui.Text($"{key.Type} [{timeStr}]");
+            ImGui.Text($"{key.Type} [{timeStr}]{useStr}");
 
             if (isSelected)
                 ImGui.PopStyleColor();
@@ -5728,7 +6013,7 @@ public class DecryptionTab : ITab
             ImGui.PopID();
         }
 
-        if (PacketDecryptor.DiscoveredKeys.Count == 0)
+        if (_cachedKeys.Count == 0)
         {
             ImGui.TextColored(Theme.ColTextMuted, "No keys discovered yet");
             ImGui.Spacing();
@@ -5738,12 +6023,18 @@ public class DecryptionTab : ITab
             ImGui.BulletText("Manually entered above");
         }
 
+        // Show message if there are more keys
+        if (totalKeys > _cachedKeys.Count)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, $"... and {totalKeys - _cachedKeys.Count} more keys");
+        }
+
         ImGui.EndChild();
 
         // Key details panel if selected
-        if (_selectedKeyIndex >= 0 && _selectedKeyIndex < PacketDecryptor.DiscoveredKeys.Count)
+        if (_selectedKeyIndex >= 0 && _selectedKeyIndex < _cachedKeys.Count)
         {
-            var selectedKey = PacketDecryptor.DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt).ElementAt(_selectedKeyIndex);
+            var selectedKey = _cachedKeys[_selectedKeyIndex];
             RenderKeyDetails(selectedKey);
         }
     }
@@ -5768,6 +6059,7 @@ public class DecryptionTab : ITab
         ImGui.Text($"Size: {key.Key.Length * 8} bits ({key.Key.Length} bytes)");
         ImGui.Text($"Source: {key.Source}");
         ImGui.Text($"Discovered: {key.DiscoveredAt:HH:mm:ss}");
+        ImGui.Text($"Use Count: {key.UseCount}");
 
         if (key.MemoryAddress.HasValue)
         {
@@ -5830,6 +6122,7 @@ public class DecryptionTab : ITab
 
         if (ImGui.Button("Clear Stats", new Vector2(100, 28)))
         {
+            // Note: Would need to add a method to reset stats
             _state.AddInGameLog("[DECRYPTION] Stats reset not implemented yet");
         }
 
@@ -5926,6 +6219,7 @@ public class DecryptionTab : ITab
             PacketDecryptor.AddKey(key);
             _state.AddInGameLog($"[DECRYPTION] Added manual {key.Type} key ({keyBytes.Length} bytes)");
             _manualKey = "";
+            _lastKeyCacheTime = DateTime.MinValue;
         }
         catch (Exception ex)
         {
@@ -5946,10 +6240,10 @@ public class DecryptionTab : ITab
 
                 // Show preview
                 string preview = Encoding.UTF8.GetString(result.DecryptedData.Take(100).ToArray());
-                preview = new string(preview.Where(c => !char.IsControl(c)).ToArray()); // Remove control chars
+                preview = new string(preview.Where(c => !char.IsControl(c)).ToArray());
                 _state.AddInGameLog($"  Preview: {preview}");
 
-                // Show entropy of decrypted data
+                // Show entropy
                 double entropy = CalculateEntropy(result.DecryptedData);
                 _state.AddInGameLog($"  Entropy: {entropy:F2} (lower = more structured)");
             }
@@ -6020,8 +6314,6 @@ public class DecryptionTab : ITab
         try { TextCopy.ClipboardService.SetText(text); } catch { }
     }
 }
-
-
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\ITab.cs =====
@@ -6495,11 +6787,12 @@ public class LogTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\MemoryTab.cs =====
 
-// FILE: Tabs/MemoryTab.cs - ENHANCED AUTOMATIC KEY EXTRACTION
+// FILE: Tabs/MemoryTab.cs - FIXED: Memory leaks, buffer overflows, and validation
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
+using System.Buffers;
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -6554,6 +6847,10 @@ public class MemoryTab : ITab
     private int _consecutiveEmptyScans = 0;
     private const int MaxEmptyScans = 10;
 
+    // FIXED: Smaller chunk size to prevent memory pressure
+    private const int MAX_SCAN_CHUNK = 256 * 1024; // 256KB instead of 5MB
+    private const int MAX_RESULTS = 10000; // Limit results to prevent UI freeze
+
     // Windows API
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
     [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesRead);
@@ -6574,7 +6871,7 @@ public class MemoryTab : ITab
 
     private void OnQuickScanRequested()
     {
-        if (_isAttached)
+        if (_isAttached && _processHandle != IntPtr.Zero)
         {
             ScanForTLSKeys();
         }
@@ -7029,7 +7326,7 @@ public class MemoryTab : ITab
 
     private async void ScanForTLSKeys()
     {
-        if (!_isAttached || _hytaleProcess == null) return;
+        if (!_isAttached || _hytaleProcess == null || _processHandle == IntPtr.Zero) return;
 
         _state.AddInGameLog("[AUTO-KEY] Starting automatic TLS key extraction...");
         _scanCts = new CancellationTokenSource();
@@ -7098,32 +7395,38 @@ public class MemoryTab : ITab
 
             try
             {
-                const int chunkSize = 0x100000;
                 long offset = 0;
-
                 while (offset < region.Size)
                 {
-                    int toRead = (int)Math.Min(chunkSize, region.Size - offset);
-                    byte[] buffer = new byte[toRead];
+                    int toRead = (int)Math.Min(MAX_SCAN_CHUNK, region.Size - offset);
 
-                    if (!ReadProcessMemory(_processHandle, region.BaseAddress + (int)offset,
-                        buffer, toRead, out int read)) break;
-
-                    for (int i = 0; i < buffer.Length - 8; i += 8)
+                    // FIXED: Use ArrayPool to prevent GC pressure
+                    byte[]? buffer = ArrayPool<byte>.Shared.Rent(toRead);
+                    try
                     {
-                        long potentialPtr = BitConverter.ToInt64(buffer, i);
+                        if (!ReadProcessMemory(_processHandle, region.BaseAddress + (int)offset,
+                            buffer, toRead, out int read)) break;
 
-                        if (IsValidHeapPointer((IntPtr)potentialPtr))
+                        for (int i = 0; i < read - 8; i += 8)
                         {
-                            if (VerifySSLContext((IntPtr)potentialPtr))
+                            long potentialPtr = BitConverter.ToInt64(buffer, i);
+
+                            if (IsValidHeapPointer((IntPtr)potentialPtr))
                             {
-                                contexts.Add((IntPtr)potentialPtr);
-                                if (contexts.Count >= 10) return contexts;
+                                if (VerifySSLContext((IntPtr)potentialPtr))
+                                {
+                                    contexts.Add((IntPtr)potentialPtr);
+                                    if (contexts.Count >= 10) return contexts;
+                                }
                             }
                         }
-                    }
 
-                    offset += toRead;
+                        offset += toRead;
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
                 }
             }
             catch { }
@@ -7263,16 +7566,25 @@ public class MemoryTab : ITab
             {
                 if (IsImageRegion(region)) continue;
 
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 2_000_000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
+                // FIXED: Use ArrayPool and smaller chunks
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
+                {
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
 
-                regionsScanned++;
+                    regionsScanned++;
 
-                totalKeysFound += ScanForAESKeys(buffer, region.BaseAddress, token);
-                totalKeysFound += ScanForChaChaKeys(buffer, region.BaseAddress, token);
+                    totalKeysFound += ScanForAESKeys(buffer, read, region.BaseAddress, token);
+                    totalKeysFound += ScanForChaChaKeys(buffer, read, region.BaseAddress, token);
 
-                if (totalKeysFound >= 5) break;
+                    if (totalKeysFound >= 5) break;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
 
                 if (regionsScanned % 5 == 0)
                     Thread.Sleep(10);
@@ -7283,11 +7595,11 @@ public class MemoryTab : ITab
         _state.AddInGameLog($"[AUTO-KEY] Scanned {regionsScanned} regions, found {totalKeysFound} keys");
     }
 
-    private int ScanForAESKeys(byte[] buffer, IntPtr baseAddr, CancellationToken token)
+    private int ScanForAESKeys(byte[] buffer, int length, IntPtr baseAddr, CancellationToken token)
     {
         int found = 0;
 
-        for (int i = 0; i < buffer.Length - 32; i += 16)
+        for (int i = 0; i < length - 32; i += 16)
         {
             if (token.IsCancellationRequested) break;
 
@@ -7301,7 +7613,7 @@ public class MemoryTab : ITab
             if (keyBytes.All(b => b == 0)) continue;
             if (keyBytes.Distinct().Count() < 15) continue;
 
-            bool hasContext = CheckForTLSContext(buffer, i);
+            bool hasContext = CheckForTLSContext(buffer, i, length);
 
             var key = new PacketDecryptor.EncryptionKey
             {
@@ -7322,11 +7634,11 @@ public class MemoryTab : ITab
         return found;
     }
 
-    private int ScanForChaChaKeys(byte[] buffer, IntPtr baseAddr, CancellationToken token)
+    private int ScanForChaChaKeys(byte[] buffer, int length, IntPtr baseAddr, CancellationToken token)
     {
         int found = 0;
 
-        for (int i = 0; i < buffer.Length - 32; i += 4)
+        for (int i = 0; i < length - 32; i += 4)
         {
             if (token.IsCancellationRequested) break;
 
@@ -7361,10 +7673,10 @@ public class MemoryTab : ITab
         return (addr & 0xFFFFF) == 0 && region.Size > 0x100000;
     }
 
-    private bool CheckForTLSContext(byte[] buffer, int keyOffset)
+    private bool CheckForTLSContext(byte[] buffer, int keyOffset, int bufferLength)
     {
         int searchStart = Math.Max(0, keyOffset - 256);
-        int searchEnd = Math.Min(buffer.Length, keyOffset + 256);
+        int searchEnd = Math.Min(bufferLength, keyOffset + 256);
 
         for (int i = searchStart; i < searchEnd - 2; i++)
         {
@@ -7411,32 +7723,51 @@ public class MemoryTab : ITab
         {
             try
             {
-                byte[] buffer = new byte[Math.Min((int)region.Size, 500000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
-
-                for (int i = 0; i < buffer.Length - 32; i += 32)
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
                 {
-                    double entropy = CalculateEntropy(buffer, i, 32);
-                    if (entropy > 7.8 && entropy < 7.99)
-                    {
-                        var keyBytes = new byte[32];
-                        Array.Copy(buffer, i, keyBytes, 0, 32);
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
 
-                        if (!PacketDecryptor.DiscoveredKeys.Any(k => k.Key.SequenceEqual(keyBytes)))
+                    for (int i = 0; i < read - 32; i += 32)
+                    {
+                        double entropy = CalculateEntropy(buffer, i, 32);
+                        if (entropy > 7.8 && entropy < 7.99)
                         {
-                            var key = new PacketDecryptor.EncryptionKey
+                            var keyBytes = new byte[32];
+                            Array.Copy(buffer, i, keyBytes, 0, 32);
+
+                            // Check for duplicates using thread-safe method
+                            bool isDuplicate = false;
+                            foreach (var existingKey in PacketDecryptor.DiscoveredKeys)
                             {
-                                Key = keyBytes,
-                                IV = new byte[12],
-                                Type = PacketDecryptor.EncryptionType.AES256GCM,
-                                Source = "Background scan",
-                                MemoryAddress = region.BaseAddress + i
-                            };
-                            PacketDecryptor.AddKey(key);
-                            newKeys++;
+                                if (existingKey.Key.SequenceEqual(keyBytes))
+                                {
+                                    isDuplicate = true;
+                                    break;
+                                }
+                            }
+
+                            if (!isDuplicate)
+                            {
+                                var key = new PacketDecryptor.EncryptionKey
+                                {
+                                    Key = keyBytes,
+                                    IV = new byte[12],
+                                    Type = PacketDecryptor.EncryptionType.AES256GCM,
+                                    Source = "Background scan",
+                                    MemoryAddress = region.BaseAddress + i
+                                };
+                                PacketDecryptor.AddKey(key);
+                                newKeys++;
+                            }
                         }
                     }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
             catch { }
@@ -7519,20 +7850,26 @@ public class MemoryTab : ITab
 
             try
             {
-                int bufferSize = (int)Math.Min(region.Size, 5_000_000);
-                byte[] buffer = new byte[bufferSize];
-
-                if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
                 {
-                    switch (_selectedScanType)
+                    if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
                     {
-                        case 0: ScanExactValue(buffer, region.BaseAddress, _scanValue); break;
-                        case 1: ScanPattern(buffer, region.BaseAddress, _scanPattern); break;
-                        case 2: ScanString(buffer, region.BaseAddress, _scanValue); break;
-                        case 3: ScanFloatRange(buffer, region.BaseAddress, _scanValue); break;
+                        switch (_selectedScanType)
+                        {
+                            case 0: ScanExactValue(buffer, read, region.BaseAddress, _scanValue); break;
+                            case 1: ScanPattern(buffer, read, region.BaseAddress, _scanPattern); break;
+                            case 2: ScanString(buffer, read, region.BaseAddress, _scanValue); break;
+                            case 3: ScanFloatRange(buffer, read, region.BaseAddress, _scanValue); break;
+                        }
                     }
+                    scannedRegions++;
                 }
-                scannedRegions++;
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
 
                 if (scannedRegions % 10 == 0)
                 {
@@ -7582,12 +7919,14 @@ public class MemoryTab : ITab
         ).ToList();
     }
 
-    private void ScanExactValue(byte[] buffer, IntPtr baseAddr, string value)
+    private void ScanExactValue(byte[] buffer, int length, IntPtr baseAddr, string value)
     {
+        if (_scanResults.Count >= MAX_RESULTS) return;
+
         if (int.TryParse(value, out int intVal))
         {
             byte[] searchBytes = BitConverter.GetBytes(intVal);
-            for (int i = 0; i < buffer.Length - 4; i += 4)
+            for (int i = 0; i < length - 4; i += 4)
             {
                 if (buffer[i] == searchBytes[0] && buffer[i + 1] == searchBytes[1] &&
                     buffer[i + 2] == searchBytes[2] && buffer[i + 3] == searchBytes[3])
@@ -7598,6 +7937,7 @@ public class MemoryTab : ITab
                         Type = ScanValueType.Int32,
                         ValuePreview = intVal.ToString()
                     });
+                    if (_scanResults.Count >= MAX_RESULTS) return;
                 }
             }
         }
@@ -7605,7 +7945,7 @@ public class MemoryTab : ITab
         if (float.TryParse(value, out float floatVal))
         {
             byte[] searchBytes = BitConverter.GetBytes(floatVal);
-            for (int i = 0; i < buffer.Length - 4; i++)
+            for (int i = 0; i < length - 4; i++)
             {
                 if (buffer[i] == searchBytes[0] && buffer[i + 1] == searchBytes[1] &&
                     buffer[i + 2] == searchBytes[2] && buffer[i + 3] == searchBytes[3])
@@ -7616,13 +7956,16 @@ public class MemoryTab : ITab
                         Type = ScanValueType.Float,
                         ValuePreview = floatVal.ToString("F4")
                     });
+                    if (_scanResults.Count >= MAX_RESULTS) return;
                 }
             }
         }
     }
 
-    private void ScanPattern(byte[] buffer, IntPtr baseAddr, string pattern)
+    private void ScanPattern(byte[] buffer, int length, IntPtr baseAddr, string pattern)
     {
+        if (_scanResults.Count >= MAX_RESULTS) return;
+
         var patternBytes = new List<byte?>();
         foreach (var part in pattern.Split(' ', StringSplitOptions.RemoveEmptyEntries))
         {
@@ -7634,7 +7977,7 @@ public class MemoryTab : ITab
 
         if (patternBytes.Count == 0) return;
 
-        for (int i = 0; i < buffer.Length - patternBytes.Count; i++)
+        for (int i = 0; i < length - patternBytes.Count; i++)
         {
             bool match = true;
             for (int j = 0; j < patternBytes.Count; j++)
@@ -7654,15 +7997,18 @@ public class MemoryTab : ITab
                     Type = ScanValueType.Bytes,
                     ValuePreview = $"Pattern +{i:X}"
                 });
+                if (_scanResults.Count >= MAX_RESULTS) return;
             }
         }
     }
 
-    private void ScanString(byte[] buffer, IntPtr baseAddr, string str)
+    private void ScanString(byte[] buffer, int length, IntPtr baseAddr, string str)
     {
+        if (_scanResults.Count >= MAX_RESULTS) return;
+
         var strBytes = Encoding.UTF8.GetBytes(str);
 
-        for (int i = 0; i < buffer.Length - strBytes.Length; i++)
+        for (int i = 0; i < length - strBytes.Length; i++)
         {
             bool match = true;
             for (int j = 0; j < strBytes.Length; j++)
@@ -7682,19 +8028,22 @@ public class MemoryTab : ITab
                     Type = ScanValueType.String,
                     ValuePreview = $"\"{str}\""
                 });
+                if (_scanResults.Count >= MAX_RESULTS) return;
             }
         }
     }
 
-    private void ScanFloatRange(byte[] buffer, IntPtr baseAddr, string range)
+    private void ScanFloatRange(byte[] buffer, int length, IntPtr baseAddr, string range)
     {
+        if (_scanResults.Count >= MAX_RESULTS) return;
+
         var parts = range.Split('-');
         if (parts.Length != 2) return;
 
         if (!float.TryParse(parts[0], out float min)) return;
         if (!float.TryParse(parts[1], out float max)) return;
 
-        for (int i = 0; i < buffer.Length - 4; i += 4)
+        for (int i = 0; i < length - 4; i += 4)
         {
             float val = BitConverter.ToSingle(buffer, i);
             if (val >= min && val <= max && !float.IsNaN(val) && !float.IsInfinity(val))
@@ -7705,13 +8054,14 @@ public class MemoryTab : ITab
                     Type = ScanValueType.Float,
                     ValuePreview = val.ToString("F4")
                 });
+                if (_scanResults.Count >= MAX_RESULTS) return;
             }
         }
     }
 
     private async void QuickScanPlayer()
     {
-        if (!_isAttached) return;
+        if (!_isAttached || _processHandle == IntPtr.Zero) return;
 
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
@@ -7751,16 +8101,24 @@ public class MemoryTab : ITab
 
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 1_000_000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
-
-                ScanExactValue(buffer, region.BaseAddress, "100");
-                scanned++;
-
-                if (scanned % 5 == 0)
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
                 {
-                    Thread.Sleep(1);
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
+
+                    ScanExactValue(buffer, read, region.BaseAddress, "100");
+                    scanned++;
+
+                    if (scanned % 5 == 0)
+                    {
+                        Thread.Sleep(1);
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
             catch { }
@@ -7798,17 +8156,25 @@ public class MemoryTab : ITab
         {
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 5_000_000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
-
-                for (int i = 0; i < buffer.Length - 8; i += 8)
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
                 {
-                    long val = BitConverter.ToInt64(buffer, i);
-                    if ((IntPtr)val == target)
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
+
+                    for (int i = 0; i < read - 8; i += 8)
                     {
-                        _pointerMap[target].Add(region.BaseAddress + i);
+                        long val = BitConverter.ToInt64(buffer, i);
+                        if ((IntPtr)val == target)
+                        {
+                            _pointerMap[target].Add(region.BaseAddress + i);
+                        }
                     }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
             catch { }
@@ -7840,10 +8206,14 @@ public class MemoryTab : ITab
         return regions;
     }
 
+    // FIXED: Added validation
     private byte[]? ReadMemoryBytes(IntPtr address, int size)
     {
+        if (_processHandle == IntPtr.Zero || address == IntPtr.Zero || size <= 0 || size > 4096)
+            return null;
+
         byte[] buffer = new byte[size];
-        if (ReadProcessMemory(_processHandle, address, buffer, size, out int read))
+        if (ReadProcessMemory(_processHandle, address, buffer, size, out int read) && read == size)
             return buffer;
         return null;
     }
@@ -7873,6 +8243,8 @@ public class MemoryTab : ITab
 
     private void WriteMemoryValue(IntPtr address, string value)
     {
+        if (_processHandle == IntPtr.Zero) return;
+
         byte[]? bytes = null;
 
         if (int.TryParse(value, out int intVal))
@@ -8064,7 +8436,18 @@ public class MemoryTab : ITab
                                         Source = $"SSLLog:{Path.GetFileName(file)}"
                                     };
 
-                                    if (!PacketDecryptor.DiscoveredKeys.Any(k => k.Key.SequenceEqual(key.Key)))
+                                    // Check for duplicates
+                                    bool isDuplicate = false;
+                                    foreach (var existing in PacketDecryptor.DiscoveredKeys)
+                                    {
+                                        if (existing.Key.SequenceEqual(key.Key))
+                                        {
+                                            isDuplicate = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if (!isDuplicate)
                                     {
                                         PacketDecryptor.AddKey(key);
                                         newKeys++;
