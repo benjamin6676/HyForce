@@ -330,6 +330,8 @@ public class PacketFeedTab : ITab
         }
     }
 
+    // In PacketFeedTab.cs, replace the RenderDeepEncryptionAnalysis method with this:
+
     private void RenderDeepEncryptionAnalysis(PacketLogEntry pkt)
     {
         ImGui.Separator();
@@ -354,6 +356,28 @@ public class PacketFeedTab : ITab
             }
         }
         catch { }
+
+        // FIXED: Show QUIC header type
+        if (pkt.QuicInfo != null)
+        {
+            ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1),
+                $"QUIC Header: {pkt.QuicInfo.HeaderType}");
+
+            if (!pkt.QuicInfo.IsLongHeader)
+            {
+                ImGui.TextColored(new Vector4(1, 0.6f, 0.2f, 1),
+                    "⚠️ Short Header - Post-handshake data (main game traffic)");
+                ImGui.TextColored(Theme.ColTextMuted,
+                    "Wireshark can decrypt this if you have the TLS keys");
+            }
+            else
+            {
+                ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.4f, 1),
+                    "✓ Long Header - Handshake/Initial traffic");
+            }
+
+            ImGui.Text($"Packet Number Length: {pkt.QuicInfo.PacketNumberLength} bytes");
+        }
 
         // Entropy display
         ImGui.Text($"Full Packet Entropy: {fullEntropy:F2}");
@@ -395,36 +419,15 @@ public class PacketFeedTab : ITab
 
         ImGui.TextColored(verdictColor, $"Verdict: {verdict}");
 
-        // Pattern detection
-        if (bytes != null)
+        // FIXED: Add note about Wireshark vs HyForce
+        if (pkt.QuicInfo != null && !pkt.QuicInfo.IsLongHeader)
         {
-            ImGui.Separator();
-            ImGui.TextColored(new Vector4(0.6f, 0.8f, 1, 1), "Pattern Analysis");
-
-            bool hasRepeating = bytes.GroupBy(b => b).Any(g => g.Count() > bytes.Length / 4);
-            bool hasNulls = bytes.Any(b => b == 0);
-            bool hasAscii = bytes.Any(b => b >= 32 && b <= 126);
-            int uniqueBytes = bytes.Distinct().Count();
-
-            ImGui.Text($"Unique bytes: {uniqueBytes}/{bytes.Length} ({100.0 * uniqueBytes / bytes.Length:F1}%)");
-            ImGui.Text($"Repeating patterns: {(hasRepeating ? "YES" : "No")}");
-            ImGui.Text($"Null bytes: {(hasNulls ? "YES" : "No")}");
-            ImGui.Text($"ASCII content: {(hasAscii ? "YES" : "No")}");
-
-            // Check for known opcodes in raw data
-            if (bytes.Length >= 2)
-            {
-                for (int i = 0; i < Math.Min(10, bytes.Length - 1); i++)
-                {
-                    ushort testOpcode = (ushort)((bytes[i] << 8) | bytes[i + 1]);
-                    var info = OpcodeRegistry.GetInfo(testOpcode, pkt.Direction);
-                    if (info != null)
-                    {
-                        ImGui.TextColored(new Vector4(0.2f, 1, 0.4f, 1),
-                            $"Possible opcode at offset {i}: 0x{testOpcode:X4} = {info.Name}");
-                    }
-                }
-            }
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1),
+                "Why Wireshark sees this but HyForce doesn't:");
+            ImGui.BulletText("Wireshark has your SSLKEYLOGFILE with TLS secrets");
+            ImGui.BulletText("HyForce needs those same secrets imported via Memory tab");
+            ImGui.BulletText("Short headers use 1-RTT keys derived from handshake");
         }
     }
 

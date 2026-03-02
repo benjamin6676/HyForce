@@ -126,16 +126,15 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // UDP-ONLY INFO
-        ImGui.TextColored(Theme.ColAccent, "Mode: UDP-ONLY (QUIC Handshake Preserved)");
-        ImGui.TextWrapped("Hytale uses QUIC over UDP. Handshake is now preserved.");
+        // REMOVED: UDP-ONLY INFO - Now supports both TCP and UDP properly
+        ImGui.TextColored(Theme.ColAccent, "Mode: TCP + UDP (Full Proxy)");
+        ImGui.TextWrapped("Hytale uses QUIC over UDP for gameplay and TCP for registry sync.");
         ImGui.Spacing();
 
-        ImGui.Text("Listen Port (UDP):");
-        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1), $"127.0.0.1:{_state.ListenPort}");
-        ImGui.TextWrapped("Connect Hytale to this address (auto-copied when starting)");
-
-        ImGui.Spacing();
+        ImGui.Text("Listen Ports:");
+        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1), $"UDP (Gameplay): 127.0.0.1:{_state.ListenPort}");
+        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1), $"TCP (Registry): 127.0.0.1:{_state.ListenPort + 1}");
+        ImGui.TextWrapped("Connect Hytale to the UDP port (auto-copied when starting)");
 
         if (!_state.IsRunning)
         {

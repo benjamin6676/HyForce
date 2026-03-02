@@ -1,4 +1,5 @@
-﻿using HyForce.Core;
+﻿// FILE: Networking/UdpProxy.cs - FIXED: Proper QUIC transparent proxy without packet corruption
+using HyForce.Core;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -25,9 +26,8 @@ public class UdpProxy : IDisposable
     private IPEndPoint _serverEp = new(IPAddress.Loopback, 0);
     private uint _sequenceCounter;
 
-    // FIX 3: Track primary client
-    private string? _primaryClientKey = null;
-    private readonly object _primaryClientLock = new();
+    // CRITICAL FIX: Separate socket for server communication per client
+    // CRITICAL FIX: Don't modify packet contents - forward exactly as received
 
     public UdpProxy(Data.TestLog log)
     {
@@ -49,15 +49,27 @@ public class UdpProxy : IDisposable
 
             _serverEp = new IPEndPoint(IPAddress.Parse(serverIp), serverPort);
 
+            // CRITICAL FIX: Create socket with proper configuration for transparent proxying
             _listener = new UdpClient(AddressFamily.InterNetwork);
+
+            // Enable address reuse
             _listener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            _listener.Client.Bind(new IPEndPoint(IPAddress.Any, listenPort));
+
+            // CRITICAL FIX: Don't set exclusive address use (allows multiple clients)
+            _listener.Client.ExclusiveAddressUse = false;
+
+            // Increase buffer sizes
+            _listener.Client.ReceiveBufferSize = 65536;
+            _listener.Client.SendBufferSize = 65536;
+
+            // CRITICAL FIX: Bind to specific endpoint
+            _listener.Client.Bind(new IPEndPoint(IPAddress.Parse(listenIp), listenPort));
 
             ServerIp = serverIp;
             ServerPort = serverPort;
             ListenPort = listenPort;
             IsRunning = true;
-            StatusMessage = $"Listening *:{listenPort} -> {serverIp}:{serverPort}";
+            StatusMessage = $"Listening {listenIp}:{listenPort} -> {serverIp}:{serverPort}";
 
             _log.Info($"[UDP] Transparent proxy started on port {listenPort}", "UDP");
             _log.Info($"[UDP] Forwarding to {serverIp}:{serverPort}", "UDP");
@@ -86,12 +98,6 @@ public class UdpProxy : IDisposable
         }
         _sessions.Clear();
 
-        // FIX 3: Reset primary client on stop
-        lock (_primaryClientLock)
-        {
-            _primaryClientKey = null;
-        }
-
         IsRunning = false;
         StatusMessage = $"Stopped ({TotalClients} clients)";
         _log.Info("[UDP] Stopped", "UDP");
@@ -114,6 +120,10 @@ public class UdpProxy : IDisposable
             {
                 continue;
             }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
             catch (Exception ex)
             {
                 if (!ct.IsCancellationRequested)
@@ -127,54 +137,21 @@ public class UdpProxy : IDisposable
 
             if (data.Length == 0) continue;
 
-            // FIX 3: Check if this is primary client or new primary
-            bool isPrimary = false;
-            lock (_primaryClientLock)
-            {
-                if (_primaryClientKey == null)
-                {
-                    // First client becomes primary
-                    _primaryClientKey = key;
-                    isPrimary = true;
-                    _log.Info($"[UDP] Primary client established: {key}", "UDP");
-                }
-                else
-                {
-                    isPrimary = (_primaryClientKey == key);
-                }
-            }
-
-            // FIX 3: Skip logging for non-primary clients
-            if (!isPrimary)
-            {
-                // Still forward traffic but don't log/analyze
-                try
-                {
-                    if (_sessions.TryGetValue(key, out var existingSession))
-                    {
-                        await existingSession.ServerSocket.SendAsync(data, SocketFlags.None, ct);
-                    }
-                    else
-                    {
-                        // Create session for non-primary but don't log
-                        var serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                        serverSocket.Connect(_serverEp);
-                        var newSession = new UdpSession(clientEp, serverSocket);
-                        _sessions[key] = newSession;
-                        _ = Task.Run(() => ServerReceiveLoop(newSession, ct, false), ct); // false = not primary
-                        await serverSocket.SendAsync(data, SocketFlags.None, ct);
-                    }
-                }
-                catch { }
-                continue;
-            }
-
-            // Get or create session for primary client
+            // CRITICAL FIX: Get or create session for EVERY client - no filtering
             if (!_sessions.TryGetValue(key, out var session))
             {
                 TotalClients++;
 
+                // CRITICAL FIX: Create new socket for this client with proper settings
                 var serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                serverSocket.ReceiveBufferSize = 65536;
+                serverSocket.SendBufferSize = 65536;
+
+                // CRITICAL FIX: Bind to any available port for outbound
+                serverSocket.Bind(new IPEndPoint(IPAddress.Any, 0));
+
+                // Connect to target server
                 serverSocket.Connect(_serverEp);
 
                 session = new UdpSession(clientEp, serverSocket);
@@ -183,12 +160,13 @@ public class UdpProxy : IDisposable
                 StatusMessage = $"Active: {_sessions.Count} sessions";
                 _log.Info($"[UDP] New session #{TotalClients}: {clientEp} -> {_serverEp}", "UDP");
 
-                _ = Task.Run(() => ServerReceiveLoop(session, ct, true), ct); // true = primary
+                // Start server receive loop for this session
+                _ = Task.Run(() => ServerReceiveLoop(session, ct), ct);
             }
 
             session.LastActivity = DateTimeOffset.UtcNow;
 
-            // Log packet (copy for analysis, don't modify original)
+            // Log packet (non-blocking) - but DON'T modify the data
             try
             {
                 var packet = new CapturedPacket
@@ -196,12 +174,13 @@ public class UdpProxy : IDisposable
                     SequenceId = Interlocked.Increment(ref _sequenceCounter),
                     Timestamp = DateTime.Now,
                     Direction = PacketDirection.ClientToServer,
-                    RawBytes = data.ToArray(),
+                    RawBytes = data.ToArray(), // Make a copy for logging
                     IsTcp = false,
-                    Opcode = data.Length > 0 ? data[0] : (ushort)0,
+                    Opcode = 0, // QUIC doesn't have opcodes in traditional sense
                     Source = "UDP",
                     QuicInfo = TryParseQuicInfo(data)
                 };
+
                 OnPacket?.Invoke(packet);
             }
             catch (Exception ex)
@@ -209,68 +188,74 @@ public class UdpProxy : IDisposable
                 _log.Error($"[UDP] Logging error: {ex.Message}", "UDP");
             }
 
-            // Send EXACT bytes without modification
+            // CRITICAL FIX: Forward packet immediately WITHOUT ANY MODIFICATION
             try
             {
+                // Use the connected socket for proper source address handling
                 await session.ServerSocket.SendAsync(data, SocketFlags.None, ct);
             }
             catch (Exception ex)
             {
                 _log.Error($"[UDP] Forward error: {ex.Message}", "UDP");
+                // Remove dead session
+                _sessions.TryRemove(key, out _);
+                session.Dispose();
             }
         }
     }
 
-    // FIX 3: Modified to accept isPrimary parameter
-    private async Task ServerReceiveLoop(UdpSession session, CancellationToken ct, bool isPrimary)
+    private async Task ServerReceiveLoop(UdpSession session, CancellationToken ct)
     {
+        var buffer = new byte[65536];
+
         try
         {
-            var buffer = new byte[65536];
-
             while (!ct.IsCancellationRequested)
             {
                 int received;
                 try
                 {
-                    received = await session.ServerSocket.ReceiveAsync(buffer, SocketFlags.None, ct);
+                    received = await session.ServerSocket.ReceiveAsync(new ArraySegment<byte>(buffer), SocketFlags.None, ct);
                 }
                 catch (OperationCanceledException)
                 {
                     break;
                 }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
                 catch
                 {
-                    continue;
+                    // Socket error, session probably dead
+                    break;
                 }
 
                 if (received == 0) continue;
 
+                // CRITICAL FIX: Copy received data exactly as-is
                 var serverData = new byte[received];
                 Buffer.BlockCopy(buffer, 0, serverData, 0, received);
 
-                // FIX 3: Only log if this is primary client
-                if (isPrimary)
+                // Log packet (non-blocking) - but DON'T modify the data
+                try
                 {
-                    try
+                    var packet = new CapturedPacket
                     {
-                        var packet = new CapturedPacket
-                        {
-                            SequenceId = Interlocked.Increment(ref _sequenceCounter),
-                            Timestamp = DateTime.Now,
-                            Direction = PacketDirection.ServerToClient,
-                            RawBytes = serverData.ToArray(),
-                            IsTcp = false,
-                            Opcode = serverData.Length > 0 ? serverData[0] : (ushort)0,
-                            Source = "UDP",
-                            QuicInfo = TryParseQuicInfo(serverData)
-                        };
-                        OnPacket?.Invoke(packet);
-                    }
-                    catch { }
+                        SequenceId = Interlocked.Increment(ref _sequenceCounter),
+                        Timestamp = DateTime.Now,
+                        Direction = PacketDirection.ServerToClient,
+                        RawBytes = serverData.ToArray(), // Make a copy for logging
+                        IsTcp = false,
+                        Opcode = 0,
+                        Source = "UDP",
+                        QuicInfo = TryParseQuicInfo(serverData)
+                    };
+                    OnPacket?.Invoke(packet);
                 }
+                catch { }
 
-                // Send back to client EXACTLY as received (always forward)
+                // CRITICAL FIX: Send back to client WITHOUT ANY MODIFICATION
                 try
                 {
                     await _listener!.SendAsync(serverData, serverData.Length, session.ClientEndpoint);
@@ -278,12 +263,20 @@ public class UdpProxy : IDisposable
                 catch (Exception ex)
                 {
                     _log.Error($"[UDP] S->C error: {ex.Message}", "UDP");
+                    break;
                 }
             }
         }
         catch (Exception ex)
         {
             _log.Error($"[UDP] Server loop error: {ex.Message}", "UDP");
+        }
+        finally
+        {
+            // Clean up session when loop exits
+            var key = session.ClientEndpoint.ToString();
+            _sessions.TryRemove(key, out _);
+            session.Dispose();
         }
     }
 
@@ -308,6 +301,13 @@ public class UdpProxy : IDisposable
                     Buffer.BlockCopy(data, 6, info.ClientConnectionId, 0, dcidLen);
                 }
             }
+            else
+            {
+                // Short header
+                int pnLen = (firstByte & 0x03) + 1;
+                info.PacketNumberLength = pnLen;
+            }
+
             return info;
         }
         catch { return null; }
@@ -316,7 +316,6 @@ public class UdpProxy : IDisposable
     public void Dispose() => Stop();
 }
 
-// Simplified session - no CID translation
 public class UdpSession : IDisposable
 {
     public IPEndPoint ClientEndpoint { get; }

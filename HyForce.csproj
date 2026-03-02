@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <!-- ImGui.NET for UI -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
     <PackageReference Include="ImGui.NET" Version="1.91.6.1" />
     
     <!-- Veldrid for rendering -->

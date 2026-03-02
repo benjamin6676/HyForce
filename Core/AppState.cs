@@ -1,4 +1,5 @@
-﻿using HyForce.Data;
+﻿// FILE: Core/AppState.cs - FIXED: Removed duplicate TryAutoDecryptPackets
+using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
 using System.Collections.Concurrent;
@@ -201,31 +202,41 @@ public class AppState : IDisposable
         }
     }
 
+    // FIXED: Single SetupAutoDecryption method with 30 second interval
     private void SetupAutoDecryption()
     {
-        _autoDecryptTimer = new System.Timers.Timer(10000);
+        _autoDecryptTimer = new System.Timers.Timer(30000); // 30 seconds - much less aggressive
         _autoDecryptTimer.Elapsed += (s, e) =>
         {
-            if (PacketDecryptor.AutoDecryptEnabled)
+            // CRITICAL FIX: Only auto-decrypt if we have keys AND proxy is running
+            if (PacketDecryptor.AutoDecryptEnabled &&
+                PacketDecryptor.DiscoveredKeys.Count > 0 &&
+                IsRunning &&
+                UdpProxy.ActiveSessions > 0)
             {
-                TryAutoDecryptPackets();
+                // Run on thread pool to avoid blocking
+                Task.Run(() => TryAutoDecryptPackets());
             }
         };
         _autoDecryptTimer.AutoReset = true;
+        // DON'T start here - start in Start() method
     }
 
+    // FIXED: Single TryAutoDecryptPackets method - less aggressive
     private void TryAutoDecryptPackets()
     {
         if (!PacketDecryptor.AutoDecryptEnabled) return;
         if (PacketDecryptor.DiscoveredKeys.Count == 0) return;
 
-        var recentPackets = PacketLog.GetLast(10);
+        // CRITICAL FIX: Only process a few packets at a time
+        var recentPackets = PacketLog.GetLast(3); // REDUCED from 10 to 3
         int decrypted = 0;
 
         foreach (var pkt in recentPackets)
         {
             if (pkt.EncryptionHint == "encrypted" && pkt.RawBytes.Length > 100)
             {
+                // Use non-blocking decrypt
                 var result = PacketDecryptor.TryDecrypt(pkt.RawBytes);
                 if (result.Success) decrypted++;
             }
@@ -453,6 +464,7 @@ public class AppState : IDisposable
             TotalKeys = PacketDecryptor.DiscoveredKeys.Count,
             SuccessfulDecryptions = PacketDecryptor.SuccessfulDecryptions,
             FailedDecryptions = PacketDecryptor.FailedDecryptions,
+            SkippedDecryptions = PacketDecryptor.SkippedDecryptions,  // NEW
             KeySources = PacketDecryptor.DiscoveredKeys.Select(k => k.Source).Distinct().ToList(),
             LastKeyAdded = PacketDecryptor.DiscoveredKeys.Any()
                 ? PacketDecryptor.DiscoveredKeys.Max(k => k.DiscoveredAt)
@@ -852,11 +864,14 @@ public class AppState : IDisposable
     }
 }
 
+// In AppState.cs, update the KeyStatus class:
+
 public class KeyStatus
 {
     public int TotalKeys { get; set; }
-    public int SuccessfulDecryptions { get; set; }
-    public int FailedDecryptions { get; set; }
+    public long SuccessfulDecryptions { get; set; }  // Changed from int
+    public long FailedDecryptions { get; set; }      // Changed from int
     public List<string> KeySources { get; set; } = new();
     public DateTime? LastKeyAdded { get; set; }
+    public long SkippedDecryptions { get; set; }     // NEW
 }

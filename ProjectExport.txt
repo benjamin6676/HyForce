@@ -1468,6 +1468,7 @@ public class AppState : IDisposable
             TotalKeys = PacketDecryptor.DiscoveredKeys.Count,
             SuccessfulDecryptions = PacketDecryptor.SuccessfulDecryptions,
             FailedDecryptions = PacketDecryptor.FailedDecryptions,
+            SkippedDecryptions = PacketDecryptor.SkippedDecryptions,  // NEW
             KeySources = PacketDecryptor.DiscoveredKeys.Select(k => k.Source).Distinct().ToList(),
             LastKeyAdded = PacketDecryptor.DiscoveredKeys.Any()
                 ? PacketDecryptor.DiscoveredKeys.Max(k => k.DiscoveredAt)
@@ -1867,13 +1868,16 @@ public class AppState : IDisposable
     }
 }
 
+// In AppState.cs, update the KeyStatus class:
+
 public class KeyStatus
 {
     public int TotalKeys { get; set; }
-    public int SuccessfulDecryptions { get; set; }
-    public int FailedDecryptions { get; set; }
+    public long SuccessfulDecryptions { get; set; }  // Changed from int
+    public long FailedDecryptions { get; set; }      // Changed from int
     public List<string> KeySources { get; set; } = new();
     public DateTime? LastKeyAdded { get; set; }
+    public long SkippedDecryptions { get; set; }     // NEW
 }
 
 
@@ -3179,6 +3183,7 @@ public enum PacketDirection
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Networking\QuicHeaderInfo.cs =====
 
+// FILE: Networking/QuicHeaderInfo.cs - FIXED: Added short header support fields
 namespace HyForce.Networking;
 
 public class QuicHeaderInfo
@@ -3187,11 +3192,25 @@ public class QuicHeaderInfo
     public uint Version { get; set; }
     public byte[] ClientConnectionId { get; set; } = Array.Empty<byte>();
     public byte[]? ServerConnectionId { get; set; }
-    public byte[]? DestinationConnectionId { get; set; }  // ADDED
-    public byte[]? SourceConnectionId { get; set; }       // ADDED
+    public byte[]? DestinationConnectionId { get; set; }
+    public byte[]? SourceConnectionId { get; set; }
     public int PacketNumberLength { get; set; }
-    public ulong PacketNumber { get; set; }               // ADDED
-    public string HeaderType => IsLongHeader ? "Long" : "Short";  // ADDED
+    public ulong PacketNumber { get; set; }
+
+    // FIXED: Added short header specific fields
+    public bool SpinBit { get; set; }
+    public bool KeyPhase { get; set; }
+    public int ReservedBits { get; set; }
+
+    public string HeaderType => IsLongHeader ? "Long" : "Short";
+
+    // FIXED: Helper to get DCID length (important for short headers)
+    public int GetDestinationConnectionIdLength()
+    {
+        if (IsLongHeader)
+            return ClientConnectionId.Length;
+        return DestinationConnectionId?.Length ?? 0;
+    }
 }
 
 
@@ -3546,6 +3565,7 @@ public class TcpSession : IDisposable
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Networking\UdpProxy.cs =====
 
+// FILE: Networking/UdpProxy.cs - FIXED: Proper transparent proxy without filtering
 using HyForce.Core;
 using System.Collections.Concurrent;
 using System.Net;
@@ -3573,9 +3593,7 @@ public class UdpProxy : IDisposable
     private IPEndPoint _serverEp = new(IPAddress.Loopback, 0);
     private uint _sequenceCounter;
 
-    // FIX 3: Track primary client
-    private string? _primaryClientKey = null;
-    private readonly object _primaryClientLock = new();
+    // CRITICAL FIX: Removed primary client filter - was breaking multi-packet protocols
 
     public UdpProxy(Data.TestLog log)
     {
@@ -3597,8 +3615,20 @@ public class UdpProxy : IDisposable
 
             _serverEp = new IPEndPoint(IPAddress.Parse(serverIp), serverPort);
 
+            // CRITICAL FIX: Create socket with proper configuration for transparent proxying
             _listener = new UdpClient(AddressFamily.InterNetwork);
+
+            // Enable address reuse
             _listener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+
+            // CRITICAL FIX: Don't set exclusive address use (allows multiple clients)
+            _listener.Client.ExclusiveAddressUse = false;
+
+            // Increase buffer sizes
+            _listener.Client.ReceiveBufferSize = 65536;
+            _listener.Client.SendBufferSize = 65536;
+
+            // Bind to listen endpoint
             _listener.Client.Bind(new IPEndPoint(IPAddress.Any, listenPort));
 
             ServerIp = serverIp;
@@ -3634,12 +3664,6 @@ public class UdpProxy : IDisposable
         }
         _sessions.Clear();
 
-        // FIX 3: Reset primary client on stop
-        lock (_primaryClientLock)
-        {
-            _primaryClientKey = null;
-        }
-
         IsRunning = false;
         StatusMessage = $"Stopped ({TotalClients} clients)";
         _log.Info("[UDP] Stopped", "UDP");
@@ -3662,6 +3686,10 @@ public class UdpProxy : IDisposable
             {
                 continue;
             }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
             catch (Exception ex)
             {
                 if (!ct.IsCancellationRequested)
@@ -3675,54 +3703,21 @@ public class UdpProxy : IDisposable
 
             if (data.Length == 0) continue;
 
-            // FIX 3: Check if this is primary client or new primary
-            bool isPrimary = false;
-            lock (_primaryClientLock)
-            {
-                if (_primaryClientKey == null)
-                {
-                    // First client becomes primary
-                    _primaryClientKey = key;
-                    isPrimary = true;
-                    _log.Info($"[UDP] Primary client established: {key}", "UDP");
-                }
-                else
-                {
-                    isPrimary = (_primaryClientKey == key);
-                }
-            }
-
-            // FIX 3: Skip logging for non-primary clients
-            if (!isPrimary)
-            {
-                // Still forward traffic but don't log/analyze
-                try
-                {
-                    if (_sessions.TryGetValue(key, out var existingSession))
-                    {
-                        await existingSession.ServerSocket.SendAsync(data, SocketFlags.None, ct);
-                    }
-                    else
-                    {
-                        // Create session for non-primary but don't log
-                        var serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                        serverSocket.Connect(_serverEp);
-                        var newSession = new UdpSession(clientEp, serverSocket);
-                        _sessions[key] = newSession;
-                        _ = Task.Run(() => ServerReceiveLoop(newSession, ct, false), ct); // false = not primary
-                        await serverSocket.SendAsync(data, SocketFlags.None, ct);
-                    }
-                }
-                catch { }
-                continue;
-            }
-
-            // Get or create session for primary client
+            // CRITICAL FIX: Get or create session for EVERY client - no filtering
             if (!_sessions.TryGetValue(key, out var session))
             {
                 TotalClients++;
 
+                // CRITICAL FIX: Create new socket for this client with proper settings
                 var serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                serverSocket.ReceiveBufferSize = 65536;
+                serverSocket.SendBufferSize = 65536;
+
+                // CRITICAL FIX: Bind to any available port for outbound
+                serverSocket.Bind(new IPEndPoint(IPAddress.Any, 0));
+
+                // Connect to target server
                 serverSocket.Connect(_serverEp);
 
                 session = new UdpSession(clientEp, serverSocket);
@@ -3731,12 +3726,13 @@ public class UdpProxy : IDisposable
                 StatusMessage = $"Active: {_sessions.Count} sessions";
                 _log.Info($"[UDP] New session #{TotalClients}: {clientEp} -> {_serverEp}", "UDP");
 
-                _ = Task.Run(() => ServerReceiveLoop(session, ct, true), ct); // true = primary
+                // Start server receive loop for this session
+                _ = Task.Run(() => ServerReceiveLoop(session, ct), ct);
             }
 
             session.LastActivity = DateTimeOffset.UtcNow;
 
-            // Log packet (copy for analysis, don't modify original)
+            // Log packet (non-blocking)
             try
             {
                 var packet = new CapturedPacket
@@ -3746,10 +3742,11 @@ public class UdpProxy : IDisposable
                     Direction = PacketDirection.ClientToServer,
                     RawBytes = data.ToArray(),
                     IsTcp = false,
-                    Opcode = data.Length > 0 ? data[0] : (ushort)0,
+                    Opcode = 0, // QUIC doesn't have opcodes in traditional sense
                     Source = "UDP",
                     QuicInfo = TryParseQuicInfo(data)
                 };
+
                 OnPacket?.Invoke(packet);
             }
             catch (Exception ex)
@@ -3757,7 +3754,7 @@ public class UdpProxy : IDisposable
                 _log.Error($"[UDP] Logging error: {ex.Message}", "UDP");
             }
 
-            // Send EXACT bytes without modification
+            // CRITICAL FIX: Forward packet immediately
             try
             {
                 await session.ServerSocket.SendAsync(data, SocketFlags.None, ct);
@@ -3765,60 +3762,65 @@ public class UdpProxy : IDisposable
             catch (Exception ex)
             {
                 _log.Error($"[UDP] Forward error: {ex.Message}", "UDP");
+                // Remove dead session
+                _sessions.TryRemove(key, out _);
+                session.Dispose();
             }
         }
     }
 
-    // FIX 3: Modified to accept isPrimary parameter
-    private async Task ServerReceiveLoop(UdpSession session, CancellationToken ct, bool isPrimary)
+    private async Task ServerReceiveLoop(UdpSession session, CancellationToken ct)
     {
+        var buffer = new byte[65536];
+
         try
         {
-            var buffer = new byte[65536];
-
             while (!ct.IsCancellationRequested)
             {
                 int received;
                 try
                 {
-                    received = await session.ServerSocket.ReceiveAsync(buffer, SocketFlags.None, ct);
+                    received = await session.ServerSocket.ReceiveAsync(new ArraySegment<byte>(buffer), SocketFlags.None, ct);
                 }
                 catch (OperationCanceledException)
                 {
                     break;
                 }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
                 catch
                 {
-                    continue;
+                    // Socket error, session probably dead
+                    break;
                 }
 
                 if (received == 0) continue;
 
+                // Copy received data
                 var serverData = new byte[received];
                 Buffer.BlockCopy(buffer, 0, serverData, 0, received);
 
-                // FIX 3: Only log if this is primary client
-                if (isPrimary)
+                // Log packet
+                try
                 {
-                    try
+                    var packet = new CapturedPacket
                     {
-                        var packet = new CapturedPacket
-                        {
-                            SequenceId = Interlocked.Increment(ref _sequenceCounter),
-                            Timestamp = DateTime.Now,
-                            Direction = PacketDirection.ServerToClient,
-                            RawBytes = serverData.ToArray(),
-                            IsTcp = false,
-                            Opcode = serverData.Length > 0 ? serverData[0] : (ushort)0,
-                            Source = "UDP",
-                            QuicInfo = TryParseQuicInfo(serverData)
-                        };
-                        OnPacket?.Invoke(packet);
-                    }
-                    catch { }
+                        SequenceId = Interlocked.Increment(ref _sequenceCounter),
+                        Timestamp = DateTime.Now,
+                        Direction = PacketDirection.ServerToClient,
+                        RawBytes = serverData.ToArray(),
+                        IsTcp = false,
+                        Opcode = 0,
+                        Source = "UDP",
+                        QuicInfo = TryParseQuicInfo(serverData)
+                    };
+                    OnPacket?.Invoke(packet);
                 }
+                catch { }
 
-                // Send back to client EXACTLY as received (always forward)
+                // Send back to client
                 try
                 {
                     await _listener!.SendAsync(serverData, serverData.Length, session.ClientEndpoint);
@@ -3826,12 +3828,20 @@ public class UdpProxy : IDisposable
                 catch (Exception ex)
                 {
                     _log.Error($"[UDP] S->C error: {ex.Message}", "UDP");
+                    break;
                 }
             }
         }
         catch (Exception ex)
         {
             _log.Error($"[UDP] Server loop error: {ex.Message}", "UDP");
+        }
+        finally
+        {
+            // Clean up session when loop exits
+            var key = session.ClientEndpoint.ToString();
+            _sessions.TryRemove(key, out _);
+            session.Dispose();
         }
     }
 
@@ -3856,6 +3866,13 @@ public class UdpProxy : IDisposable
                     Buffer.BlockCopy(data, 6, info.ClientConnectionId, 0, dcidLen);
                 }
             }
+            else
+            {
+                // Short header
+                int pnLen = (firstByte & 0x03) + 1;
+                info.PacketNumberLength = pnLen;
+            }
+
             return info;
         }
         catch { return null; }
@@ -3864,7 +3881,6 @@ public class UdpProxy : IDisposable
     public void Dispose() => Stop();
 }
 
-// Simplified session - no CID translation
 public class UdpSession : IDisposable
 {
     public IPEndPoint ClientEndpoint { get; }
@@ -4056,9 +4072,11 @@ public static class EncryptionBypass
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Protocol\PacketDecryptor.cs =====
 
+// FILE: Protocol/PacketDecryptor.cs - FIXED: Non-blocking async decryption with proper cancellation
 using System.Security.Cryptography;
 using System.Text;
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 
 namespace HyForce.Protocol;
 
@@ -4088,74 +4106,276 @@ public static class PacketDecryptor
         public string ErrorMessage { get; set; } = "";
         public Dictionary<string, object> Metadata { get; set; } = new();
         public ulong PacketNumber { get; set; }
+        public TimeSpan Duration { get; set; }
     }
 
     public class EncryptionKey
     {
         public byte[] Key { get; set; } = Array.Empty<byte>();
         public byte[] IV { get; set; } = Array.Empty<byte>();
+        public byte[]? HeaderProtectionKey { get; set; }
         public EncryptionType Type { get; set; }
         public string Source { get; set; } = "";
         public IntPtr? MemoryAddress { get; set; }
         public DateTime DiscoveredAt { get; set; } = DateTime.Now;
         public int UseCount { get; set; }
         public byte[]? Secret { get; set; }
+        public ulong HighestReceivedPN { get; set; }
     }
 
     private static readonly List<EncryptionKey> _discoveredKeys = new();
     private static readonly ReaderWriterLockSlim _keysLock = new(LockRecursionPolicy.SupportsRecursion);
-    private static int _successfulDecryptions = 0;
-    private static int _failedDecryptions = 0;
+    private static long _successfulDecryptions = 0;
+    private static long _failedDecryptions = 0;
+    private static long _skippedDecryptions = 0; // NEW: Track skipped due to throttling
 
+    // FIXED: Auto-decrypt now uses a background worker with proper queue
     public static bool AutoDecryptEnabled { get; set; } = false;
-    private static DateTime _lastDecryptAttempt = DateTime.MinValue;
-    private static readonly TimeSpan _decryptCooldown = TimeSpan.FromSeconds(1);
-    private const int MAX_KEYS = 20;
 
-    // RFC 9001 QUIC-TLS labels
+    // FIXED: Throttling settings
+    public static int MaxDecryptsPerSecond { get; set; } = 10; // Limit decrypt attempts
+    private static readonly RateLimiter _rateLimiter = new RateLimiter(10, TimeSpan.FromSeconds(1));
+
+    // FIXED: Background processing channel
+    private static Channel<DecryptJob>? _decryptChannel;
+    private static CancellationTokenSource? _autoDecryptCts;
+    private static Task? _autoDecryptWorker;
+
+    // Statistics for UI
+    public static long QueueLength => _decryptChannel?.Reader.Count ?? 0;
+    public static bool IsProcessing { get; private set; }
+
+    // RFC 9001 labels
     private static readonly byte[] QUIC_CLIENT_HANDSHAKE_LABEL = Encoding.ASCII.GetBytes("client hs");
     private static readonly byte[] QUIC_SERVER_HANDSHAKE_LABEL = Encoding.ASCII.GetBytes("server hs");
     private static readonly byte[] QUIC_CLIENT_TRAFFIC_LABEL = Encoding.ASCII.GetBytes("client in");
     private static readonly byte[] QUIC_SERVER_TRAFFIC_LABEL = Encoding.ASCII.GetBytes("server in");
     private static readonly byte[] QUIC_KEY_LABEL = Encoding.ASCII.GetBytes("quic key");
     private static readonly byte[] QUIC_IV_LABEL = Encoding.ASCII.GetBytes("quic iv");
+    private static readonly byte[] QUIC_HP_LABEL = Encoding.ASCII.GetBytes("quic hp");
     private static readonly byte[] TLS13_LABEL_PREFIX = Encoding.ASCII.GetBytes("tls13 ");
 
-    public static DecryptionResult TryDecrypt(byte[] encryptedData, byte[]? associatedData = null)
+    private const int AES_GCM_TAG_LENGTH = 16;
+    private const int MAX_PN_BRUTE_FORCE = 100; // REDUCED from 2000 to prevent lag
+
+    // FIXED: Job struct for channel
+    private readonly struct DecryptJob
+    {
+        public byte[] Data { get; }
+        public TaskCompletionSource<DecryptionResult> Completion { get; }
+        public DateTime Enqueued { get; }
+
+        public DecryptJob(byte[] data)
+        {
+            Data = data;
+            Completion = new TaskCompletionSource<DecryptionResult>();
+            Enqueued = DateTime.Now;
+        }
+    }
+
+    // FIXED: Start/stop auto-decrypt worker
+    public static void StartAutoDecrypt()
+    {
+        if (_autoDecryptWorker != null) return; // Already running
+
+        _autoDecryptCts = new CancellationTokenSource();
+        _decryptChannel = Channel.CreateUnbounded<DecryptJob>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false
+        });
+
+        _autoDecryptWorker = Task.Run(() => AutoDecryptWorker(_autoDecryptCts.Token));
+        AutoDecryptEnabled = true;
+    }
+
+    public static void StopAutoDecrypt()
+    {
+        AutoDecryptEnabled = false;
+        _autoDecryptCts?.Cancel();
+
+        // Complete the channel to stop the worker
+        _decryptChannel?.Writer.Complete();
+
+        // Wait for worker to finish (with timeout)
+        if (_autoDecryptWorker != null)
+        {
+            try
+            {
+                _autoDecryptWorker.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch { }
+        }
+
+        _autoDecryptWorker = null;
+        _autoDecryptCts = null;
+        _decryptChannel = null;
+    }
+
+    // FIXED: Background worker that processes decrypt jobs
+    private static async Task AutoDecryptWorker(CancellationToken ct)
+    {
+        if (_decryptChannel == null) return;
+
+        IsProcessing = true;
+        try
+        {
+            await foreach (var job in _decryptChannel.Reader.ReadAllAsync(ct))
+            {
+                // FIXED: Check cancellation at start of loop
+                if (ct.IsCancellationRequested)
+                {
+                    job.Completion.TrySetCanceled();
+                    continue;
+                }
+
+                if (!_rateLimiter.TryAcquire())
+                {
+                    Interlocked.Increment(ref _skippedDecryptions);
+                    job.Completion.TrySetResult(new DecryptionResult
+                    {
+                        Success = false,
+                        ErrorMessage = "Rate limited"
+                    });
+                    continue;
+                }
+
+                // FIXED: Run decryption with proper exception handling
+                try
+                {
+                    var result = await Task.Run(() => TryDecryptInternal(job.Data, ct), ct);
+                    job.Completion.TrySetResult(result);
+                }
+                catch (OperationCanceledException)
+                {
+                    job.Completion.TrySetCanceled();
+                }
+                catch (Exception ex)
+                {
+                    job.Completion.TrySetResult(new DecryptionResult
+                    {
+                        Success = false,
+                        ErrorMessage = ex.Message
+                    });
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown, ignore
+        }
+        catch (ChannelClosedException)
+        {
+            // Normal shutdown, ignore
+        }
+        finally
+        {
+            IsProcessing = false;
+        }
+    }
+
+    // BACKWARD COMPATIBILITY: Old synchronous TryDecrypt - now non-blocking
+    public static DecryptionResult TryDecrypt(byte[] encryptedData)
     {
         if (!AutoDecryptEnabled)
             return new DecryptionResult { Success = false, ErrorMessage = "Auto-decrypt disabled" };
 
-        if (DateTime.Now - _lastDecryptAttempt < _decryptCooldown)
-            return new DecryptionResult { Success = false, ErrorMessage = "Throttled" };
+        // If auto-decrypt is running, enqueue and return immediately with pending status
+        if (_decryptChannel != null)
+        {
+            var job = new DecryptJob(encryptedData);
+            var written = _decryptChannel.Writer.TryWrite(job);
 
-        _lastDecryptAttempt = DateTime.Now;
+            if (!written)
+            {
+                Interlocked.Increment(ref _skippedDecryptions);
+                return new DecryptionResult
+                {
+                    Success = false,
+                    ErrorMessage = "Queue full"
+                };
+            }
 
-        if (encryptedData == null || encryptedData.Length < 20)
-            return new DecryptionResult { Success = false, ErrorMessage = "Data too short" };
+            // Return immediately - don't wait for result (non-blocking)
+            // The result will be processed in background
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = "Queued for background processing"
+            };
+        }
 
-        return TryDecryptInternal(encryptedData);
+        // Fallback to manual decrypt if auto-decrypt not started
+        return TryDecryptManual(encryptedData);
     }
 
-    public static DecryptionResult TryDecryptManual(byte[] encryptedData)
+    // FIXED: Manual decrypt - synchronous but with timeout
+    public static DecryptionResult TryDecryptManual(byte[] encryptedData, int timeoutMs = 5000)
     {
         if (encryptedData == null || encryptedData.Length < 20)
             return new DecryptionResult { Success = false, ErrorMessage = "Data too short" };
 
-        return TryDecryptInternal(encryptedData);
+        var cts = new CancellationTokenSource(timeoutMs);
+        try
+        {
+            // Run on thread pool with timeout
+            var task = Task.Run(() => TryDecryptInternal(encryptedData, cts.Token), cts.Token);
+
+            if (task.Wait(timeoutMs))
+            {
+                return task.Result;
+            }
+            else
+            {
+                cts.Cancel();
+                return new DecryptionResult { Success = false, ErrorMessage = "Timeout" };
+            }
+        }
+        catch (Exception ex)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
+        }
+        finally
+        {
+            cts.Dispose();
+        }
     }
 
-    private static DecryptionResult TryDecryptInternal(byte[] encryptedData)
+    // FIXED: Async manual decrypt for UI
+    public static async Task<DecryptionResult> TryDecryptManualAsync(byte[] encryptedData, int timeoutMs = 5000, CancellationToken ct = default)
     {
+        if (encryptedData == null || encryptedData.Length < 20)
+            return new DecryptionResult { Success = false, ErrorMessage = "Data too short" };
+
+        using var timeoutCts = new CancellationTokenSource(timeoutMs);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, ct);
+
+        try
+        {
+            return await Task.Run(() => TryDecryptInternal(encryptedData, linkedCts.Token), linkedCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = "Cancelled or timeout" };
+        }
+        catch (Exception ex)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
+        }
+    }
+
+    private static DecryptionResult TryDecryptInternal(byte[] encryptedData, CancellationToken ct)
+    {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
         List<EncryptionKey> keysCopy;
         _keysLock.EnterReadLock();
         try
         {
             keysCopy = _discoveredKeys
-                .Where(k => k.Key.Length >= 16)
+                .Where(k => k.Key.Length >= 16 && k.IV.Length == 12)
                 .OrderByDescending(k => k.UseCount)
-                .ThenByDescending(k => k.DiscoveredAt)
-                .Take(5)
+                .Take(3) // Limit keys tried
                 .ToList();
         }
         finally
@@ -4164,193 +4384,255 @@ public static class PacketDecryptor
         }
 
         if (keysCopy.Count == 0)
-            return new DecryptionResult { Success = false, ErrorMessage = "No valid keys available" };
+        {
+            stopwatch.Stop();
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = "No valid keys",
+                Duration = stopwatch.Elapsed
+            };
+        }
 
-        // Try each key with brute-force packet number search
         foreach (var key in keysCopy)
         {
+            ct.ThrowIfCancellationRequested();
+
             try
             {
-                // FIX 1: Use brute-force PN search first (0-5000 range)
-                var result = TryDecryptWithBruteForcePN(encryptedData, key);
-
+                var result = TryDecryptQuicPacket(encryptedData, key, ct);
                 if (result.Success && result.DecryptedData != null && IsValidDecryptedData(result.DecryptedData))
                 {
-                    _keysLock.EnterWriteLock();
-                    try { key.UseCount++; }
-                    finally { _keysLock.ExitWriteLock(); }
-
+                    UpdateKeyStats(key, result.PacketNumber);
                     Interlocked.Increment(ref _successfulDecryptions);
+                    result.Duration = stopwatch.Elapsed;
                     return result;
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch { }
         }
 
         Interlocked.Increment(ref _failedDecryptions);
-        return new DecryptionResult { Success = false, ErrorMessage = "No valid key found" };
+        stopwatch.Stop();
+        return new DecryptionResult
+        {
+            Success = false,
+            ErrorMessage = "Decryption failed",
+            Duration = stopwatch.Elapsed
+        };
     }
 
-    // FIX 1: Brute-force packet number search (0-5000)
-    private static DecryptionResult TryDecryptWithBruteForcePN(byte[] packetData, EncryptionKey key)
+    private static DecryptionResult TryDecryptQuicPacket(byte[] packetData, EncryptionKey key, CancellationToken ct)
     {
-        const int MAX_PN = 5000;
-
-        // Try common packet numbers first (0-100 are most common)
-        for (ulong pn = 0; pn < 100; pn++)
-        {
-            var result = TryDecryptQUIC(packetData, key, pn);
-            if (result.Success) return result;
-        }
-
-        // Try packet numbers 100-5000
-        for (ulong pn = 100; pn < MAX_PN; pn++)
-        {
-            var result = TryDecryptQUIC(packetData, key, pn);
-            if (result.Success)
-            {
-                Console.WriteLine($"[DECRYPT] Success with packet number {pn}");
-                return result;
-            }
-        }
-
-        return new DecryptionResult { Success = false, ErrorMessage = "Brute force failed" };
-    }
-
-    // FIX 1: RFC 9001 compliant QUIC decryption with correct nonce construction
-    private static DecryptionResult TryDecryptQUIC(byte[] packetData, EncryptionKey key, ulong packetNumber)
-    {
-        const int TAG_LENGTH = 16;
-        const int NONCE_LENGTH = 12;
-
         try
         {
             if (packetData.Length < 20)
-                return new DecryptionResult { Success = false, ErrorMessage = "Packet too small" };
+                return new DecryptionResult { Success = false, ErrorMessage = "Packet too short" };
 
-            // Parse header
-            byte firstByte = packetData[0];
-            bool isLongHeader = (firstByte & 0x80) != 0;
+            bool isLongHeader = (packetData[0] & 0x80) != 0;
 
             int headerLen;
-            byte[] headerBytes;
-            byte[] payload;
 
             if (isLongHeader)
             {
-                // Long header parsing
-                if (packetData.Length < 7)
+                headerLen = EstimateLongHeaderLength(packetData);
+                if (headerLen <= 0 || headerLen >= packetData.Length - 16)
                     return new DecryptionResult { Success = false, ErrorMessage = "Invalid long header" };
-
-                int offset = 5; // After flags + version
-                int dcidLen = packetData[offset];
-                offset += 1 + dcidLen;
-                if (packetData.Length <= offset)
-                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid DCID" };
-
-                int scidLen = packetData[offset];
-                offset += 1 + scidLen;
-                if (packetData.Length <= offset + 2)
-                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid SCID" };
-
-                offset += 2;
-
-                headerLen = Math.Min(offset + 4, packetData.Length - TAG_LENGTH - 1);
-                if (headerLen < 1)
-                    return new DecryptionResult { Success = false, ErrorMessage = "Header too short" };
-
-                headerBytes = new byte[headerLen];
-                Buffer.BlockCopy(packetData, 0, headerBytes, 0, headerLen);
-
-                int payloadLen = packetData.Length - headerLen - TAG_LENGTH;
-                if (payloadLen < 0)
-                    return new DecryptionResult { Success = false, ErrorMessage = "Negative payload" };
-
-                payload = new byte[payloadLen];
-                Buffer.BlockCopy(packetData, headerLen, payload, 0, payloadLen);
             }
             else
             {
-                // Short header
-                int dcidLen = 8;
-                headerLen = 1 + dcidLen + 2;
+                // Short header: try common DCID lengths
+                int pnLen = (packetData[0] & 0x03) + 1;
+                int[] dcidLengths = { 8, 4, 0, 16, 12 };
 
-                if (packetData.Length < headerLen + TAG_LENGTH)
-                    return new DecryptionResult { Success = false, ErrorMessage = "Short packet" };
-
-                headerBytes = new byte[headerLen];
-                Buffer.BlockCopy(packetData, 0, headerBytes, 0, headerLen);
-
-                int payloadLen = packetData.Length - headerLen - TAG_LENGTH;
-                payload = new byte[payloadLen];
-                Buffer.BlockCopy(packetData, headerLen, payload, 0, payloadLen);
-            }
-
-            // FIX 1: RFC 9001 compliant nonce construction
-            // "The 62 bits of the reconstructed QUIC packet number in network byte order 
-            //  are left-padded with zeros to the size of the IV. The exclusive OR of the 
-            //  padded packet number and the IV forms the AEAD nonce."
-
-            byte[] nonce = new byte[NONCE_LENGTH];
-            Buffer.BlockCopy(key.IV, 0, nonce, 0, NONCE_LENGTH);
-
-            // Left-pad packet number (62 bits) to 96 bits (12 bytes)
-            // Packet number goes in the LAST bytes, big-endian
-            // We use bytes 4-11 (8 bytes) for the 62-bit packet number
-            // Bytes 0-3 remain as IV (32 bits of padding)
-
-            byte[] pnBytes = new byte[8];
-            pnBytes[0] = (byte)(packetNumber >> 56);
-            pnBytes[1] = (byte)(packetNumber >> 48);
-            pnBytes[2] = (byte)(packetNumber >> 40);
-            pnBytes[3] = (byte)(packetNumber >> 32);
-            pnBytes[4] = (byte)(packetNumber >> 24);
-            pnBytes[5] = (byte)(packetNumber >> 16);
-            pnBytes[6] = (byte)(packetNumber >> 8);
-            pnBytes[7] = (byte)(packetNumber);
-
-            // XOR with IV starting at byte 4 (leaving 4 bytes = 32 bits padding)
-            for (int i = 0; i < 8; i++)
-            {
-                nonce[4 + i] ^= pnBytes[i];
-            }
-
-            // Extract authentication tag
-            byte[] tag = new byte[TAG_LENGTH];
-            Buffer.BlockCopy(packetData, packetData.Length - TAG_LENGTH, tag, 0, TAG_LENGTH);
-
-            // Decrypt
-            using var aes = new AesGcm(key.Key, TAG_LENGTH);
-            byte[] plaintext = new byte[payload.Length];
-            aes.Decrypt(nonce, payload, tag, plaintext, headerBytes);
-
-            // Validate
-            if (!IsValidDecryptedData(plaintext))
-                return new DecryptionResult { Success = false, ErrorMessage = "Validation failed" };
-
-            return new DecryptionResult
-            {
-                Success = true,
-                DecryptedData = plaintext,
-                DetectedType = EncryptionType.AES128GCM,
-                PacketNumber = packetNumber,
-                Metadata = new Dictionary<string, object>
+                foreach (int dcidLen in dcidLengths)
                 {
-                    ["algorithm"] = "AES-128-GCM",
-                    ["original_size"] = packetData.Length,
-                    ["decrypted_size"] = plaintext.Length,
-                    ["header_type"] = isLongHeader ? "Long" : "Short",
-                    ["packet_number"] = packetNumber
+                    // FIXED: Check cancellation without throwing
+                    if (ct.IsCancellationRequested)
+                        return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
+
+                    headerLen = 1 + dcidLen + pnLen;
+                    if (headerLen >= packetData.Length - 16) continue;
+
+                    var result = TryDecryptWithHeaderLen(packetData, key, headerLen, pnLen, isLongHeader, ct);
+                    if (result.Success) return result;
                 }
-            };
+
+                return new DecryptionResult { Success = false, ErrorMessage = "Short header decrypt failed" };
+            }
+
+            // For long headers, try different packet number lengths
+            for (int pnLen = 1; pnLen <= 4; pnLen++)
+            {
+                // FIXED: Check cancellation without throwing
+                if (ct.IsCancellationRequested)
+                    return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
+
+                var result = TryDecryptWithHeaderLen(packetData, key, headerLen, pnLen, isLongHeader, ct);
+                if (result.Success) return result;
+            }
+
+            return new DecryptionResult { Success = false, ErrorMessage = "All decrypt attempts failed" };
         }
-        catch (CryptographicException)
+        catch (OperationCanceledException)
         {
-            return new DecryptionResult { Success = false, ErrorMessage = "Auth failed" };
+            // FIXED: Catch and return instead of crashing
+            return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
         }
         catch (Exception ex)
         {
             return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
+        }
+    }
+
+    private static DecryptionResult TryDecryptWithHeaderLen(byte[] packetData, EncryptionKey key, int headerLen, int pnLen, bool isLongHeader, CancellationToken ct)
+    {
+        try
+        {
+            int payloadLen = packetData.Length - headerLen - AES_GCM_TAG_LENGTH;
+            if (payloadLen <= 0) return new DecryptionResult { Success = false };
+
+            byte[] header = new byte[headerLen];
+            Buffer.BlockCopy(packetData, 0, header, 0, headerLen);
+
+            byte[] payload = new byte[payloadLen];
+            Buffer.BlockCopy(packetData, headerLen, payload, 0, payloadLen);
+
+            byte[] tag = new byte[AES_GCM_TAG_LENGTH];
+            Buffer.BlockCopy(packetData, packetData.Length - AES_GCM_TAG_LENGTH, tag, 0, AES_GCM_TAG_LENGTH);
+
+            // Determine packet number from header
+            ulong basePacketNumber = 0;
+            int pnOffset = headerLen - pnLen;
+            if (pnOffset >= 0 && pnOffset + pnLen <= headerLen)
+            {
+                for (int i = 0; i < pnLen && i < 8; i++)
+                {
+                    basePacketNumber = (basePacketNumber << 8) | header[pnOffset + i];
+                }
+            }
+
+            // Build candidate packet numbers
+            var pnCandidates = new List<ulong> { basePacketNumber };
+
+            if (key.HighestReceivedPN > 0)
+            {
+                for (ulong i = 0; i < 5; i++)
+                    pnCandidates.Add(key.HighestReceivedPN + i);
+            }
+
+            for (ulong i = 0; i < Math.Min(50UL, (ulong)MAX_PN_BRUTE_FORCE); i++)
+                if (!pnCandidates.Contains(i)) pnCandidates.Add(i);
+
+            foreach (var pn in pnCandidates.Take(20))
+            {
+                // FIXED: Check cancellation without throwing
+                if (ct.IsCancellationRequested)
+                    return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
+
+                try
+                {
+                    byte[] nonce = ConstructQUICNonce(key.IV, pn);
+
+                    using var aes = new AesGcm(key.Key, AES_GCM_TAG_LENGTH);
+                    byte[] plaintext = new byte[payloadLen];
+                    aes.Decrypt(nonce, payload, tag, plaintext, header);
+
+                    if (IsValidDecryptedData(plaintext))
+                    {
+                        return new DecryptionResult
+                        {
+                            Success = true,
+                            DecryptedData = plaintext,
+                            DetectedType = key.Key.Length == 16 ? EncryptionType.AES128GCM : EncryptionType.AES256GCM,
+                            PacketNumber = pn,
+                            Metadata = new Dictionary<string, object>
+                            {
+                                ["algorithm"] = key.Key.Length == 16 ? "AES-128-GCM" : "AES-256-GCM",
+                                ["packet_number"] = pn,
+                                ["header_type"] = isLongHeader ? "long" : "short",
+                                ["header_length"] = headerLen
+                            }
+                        };
+                    }
+                }
+                catch (CryptographicException) { /* Expected for wrong PN */ }
+                catch { }
+            }
+
+            return new DecryptionResult { Success = false };
+        }
+        catch (OperationCanceledException)
+        {
+            // FIXED: Catch and return instead of crashing
+            return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
+        }
+        catch
+        {
+            return new DecryptionResult { Success = false };
+        }
+    }
+
+    private static int EstimateLongHeaderLength(byte[] data)
+    {
+        if (data.Length < 7) return -1;
+
+        int offset = 6; // flags + version + dcid len byte
+
+        byte dcidLen = data[5];
+        offset += dcidLen;
+
+        if (offset >= data.Length) return -1;
+
+        byte scidLen = data[offset];
+        offset += 1 + scidLen;
+
+        if (offset >= data.Length) return -1;
+
+        offset += 2; // Length field
+
+        return offset + 1;
+    }
+
+    private static byte[] ConstructQUICNonce(byte[] iv, ulong packetNumber)
+    {
+        byte[] nonce = new byte[12];
+        Buffer.BlockCopy(iv, 0, nonce, 0, Math.Min(iv.Length, 12));
+
+        byte[] pnBytes = new byte[8];
+        pnBytes[0] = (byte)(packetNumber >> 56);
+        pnBytes[1] = (byte)(packetNumber >> 48);
+        pnBytes[2] = (byte)(packetNumber >> 40);
+        pnBytes[3] = (byte)(packetNumber >> 32);
+        pnBytes[4] = (byte)(packetNumber >> 24);
+        pnBytes[5] = (byte)(packetNumber >> 16);
+        pnBytes[6] = (byte)(packetNumber >> 8);
+        pnBytes[7] = (byte)(packetNumber);
+
+        for (int i = 0; i < 8; i++)
+        {
+            nonce[4 + i] ^= pnBytes[i];
+        }
+
+        return nonce;
+    }
+
+    private static void UpdateKeyStats(EncryptionKey key, ulong packetNumber)
+    {
+        _keysLock.EnterWriteLock();
+        try
+        {
+            key.UseCount++;
+            if (packetNumber > key.HighestReceivedPN)
+                key.HighestReceivedPN = packetNumber;
+        }
+        finally
+        {
+            _keysLock.ExitWriteLock();
         }
     }
 
@@ -4361,15 +4643,17 @@ public static class PacketDecryptor
         try
         {
             byte[] label;
-            int keyLength = 16; // AES-128-GCM
+            int keyLength = 16;
 
             switch (key.Type)
             {
                 case EncryptionType.QUIC_ClientHandshake:
                     label = QUIC_CLIENT_HANDSHAKE_LABEL;
+                    keyLength = 16;
                     break;
                 case EncryptionType.QUIC_ServerHandshake:
                     label = QUIC_SERVER_HANDSHAKE_LABEL;
+                    keyLength = 16;
                     break;
                 case EncryptionType.QUIC_Client1RTT:
                 case EncryptionType.QUIC_Client0RTT:
@@ -4385,35 +4669,39 @@ public static class PacketDecryptor
 
             key.Key = HkdfExpandLabel(key.Secret, QUIC_KEY_LABEL, Array.Empty<byte>(), keyLength);
             key.IV = HkdfExpandLabel(key.Secret, QUIC_IV_LABEL, Array.Empty<byte>(), 12);
-
-            Console.WriteLine($"[KEY-DERIVE] {key.Type}: Key={BitConverter.ToString(key.Key)[..16]}..., IV={BitConverter.ToString(key.IV)}");
+            key.HeaderProtectionKey = HkdfExpandLabel(key.Secret, QUIC_HP_LABEL, Array.Empty<byte>(), keyLength);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[KEY-DERIVE] Failed: {ex.Message}");
             key.Key = Array.Empty<byte>();
             key.IV = Array.Empty<byte>();
+            key.HeaderProtectionKey = null;
         }
     }
 
     private static byte[] HkdfExpandLabel(byte[] secret, byte[] label, byte[] context, int length)
     {
         var fullLabel = new List<byte>();
-        fullLabel.Add((byte)(length >> 8));
-        fullLabel.Add((byte)(length & 0xFF));
-        fullLabel.Add((byte)(TLS13_LABEL_PREFIX.Length + label.Length));
         fullLabel.AddRange(TLS13_LABEL_PREFIX);
         fullLabel.AddRange(label);
-        fullLabel.Add((byte)context.Length);
-        fullLabel.AddRange(context);
-        return HkdfExpand(secret, fullLabel.ToArray(), length);
+
+        var hkdfLabel = new List<byte>();
+        hkdfLabel.Add((byte)(length >> 8));
+        hkdfLabel.Add((byte)(length & 0xFF));
+        hkdfLabel.Add((byte)fullLabel.Count);
+        hkdfLabel.AddRange(fullLabel);
+        hkdfLabel.Add((byte)context.Length);
+        hkdfLabel.AddRange(context);
+
+        return HkdfExpand(secret, hkdfLabel.ToArray(), length);
     }
 
     private static byte[] HkdfExpand(byte[] prk, byte[] info, int length)
     {
         var result = new List<byte>();
         var counter = 1;
-        var previous = Array.Empty<byte>();
+        byte[] previous = Array.Empty<byte>();
 
         using var hmac = new HMACSHA256(prk);
 
@@ -4439,13 +4727,11 @@ public static class PacketDecryptor
         if (data.Length < 2) return false;
 
         double entropy = CalculateEntropy(data);
-
         bool hasPrintable = data.Any(b => b >= 32 && b <= 126);
         bool reasonableLength = data.Length >= 4 && data.Length < 10000;
         bool reasonableEntropy = entropy > 2.0 && entropy < 7.8;
-        bool hasOpcodePattern = data.Length >= 2 && data[0] < 0x50;
 
-        return reasonableLength && reasonableEntropy && (hasPrintable || hasOpcodePattern);
+        return reasonableLength && reasonableEntropy && hasPrintable;
     }
 
     private static double CalculateEntropy(byte[] data)
@@ -4481,7 +4767,7 @@ public static class PacketDecryptor
                 }
             }
 
-            if (_discoveredKeys.Count >= MAX_KEYS)
+            if (_discoveredKeys.Count >= 20)
             {
                 var leastUsed = _discoveredKeys.OrderBy(k => k.UseCount).First();
                 _discoveredKeys.Remove(leastUsed);
@@ -4505,6 +4791,7 @@ public static class PacketDecryptor
             _discoveredKeys.Clear();
             Interlocked.Exchange(ref _successfulDecryptions, 0);
             Interlocked.Exchange(ref _failedDecryptions, 0);
+            Interlocked.Exchange(ref _skippedDecryptions, 0);
         }
         finally
         {
@@ -4523,20 +4810,23 @@ public static class PacketDecryptor
                 {
                     Key = k.Key.ToArray(),
                     IV = k.IV.ToArray(),
+                    HeaderProtectionKey = k.HeaderProtectionKey?.ToArray(),
                     Type = k.Type,
                     Source = k.Source,
                     MemoryAddress = k.MemoryAddress,
                     DiscoveredAt = k.DiscoveredAt,
                     UseCount = k.UseCount,
-                    Secret = k.Secret?.ToArray()
+                    Secret = k.Secret?.ToArray(),
+                    HighestReceivedPN = k.HighestReceivedPN
                 }).ToList();
             }
             finally { _keysLock.ExitReadLock(); }
         }
     }
 
-    public static int SuccessfulDecryptions => Interlocked.CompareExchange(ref _successfulDecryptions, 0, 0);
-    public static int FailedDecryptions => Interlocked.CompareExchange(ref _failedDecryptions, 0, 0);
+    public static long SuccessfulDecryptions => Interlocked.Read(ref _successfulDecryptions);
+    public static long FailedDecryptions => Interlocked.Read(ref _failedDecryptions);
+    public static long SkippedDecryptions => Interlocked.Read(ref _skippedDecryptions);
 
     public static event Action<EncryptionKey>? OnKeyDiscovered;
 
@@ -4544,6 +4834,43 @@ public static class PacketDecryptor
     {
         if (data.Length < 16) return false;
         return CalculateEntropy(data) > 7.5;
+    }
+}
+
+// FIXED: Rate limiter helper class
+public class RateLimiter
+{
+    private readonly int _maxPerPeriod;
+    private readonly TimeSpan _period;
+    private readonly Queue<DateTime> _timestamps = new();
+    private readonly object _lock = new();
+
+    public RateLimiter(int maxPerPeriod, TimeSpan period)
+    {
+        _maxPerPeriod = maxPerPeriod;
+        _period = period;
+    }
+
+    public bool TryAcquire()
+    {
+        lock (_lock)
+        {
+            var now = DateTime.Now;
+
+            // Remove old timestamps
+            while (_timestamps.Count > 0 && now - _timestamps.Peek() > _period)
+            {
+                _timestamps.Dequeue();
+            }
+
+            if (_timestamps.Count < _maxPerPeriod)
+            {
+                _timestamps.Enqueue(now);
+                return true;
+            }
+
+            return false;
+        }
     }
 }
 
@@ -6046,16 +6373,15 @@ public class ConnectTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // UDP-ONLY INFO
-        ImGui.TextColored(Theme.ColAccent, "Mode: UDP-ONLY (QUIC Handshake Preserved)");
-        ImGui.TextWrapped("Hytale uses QUIC over UDP. Handshake is now preserved.");
+        // REMOVED: UDP-ONLY INFO - Now supports both TCP and UDP properly
+        ImGui.TextColored(Theme.ColAccent, "Mode: TCP + UDP (Full Proxy)");
+        ImGui.TextWrapped("Hytale uses QUIC over UDP for gameplay and TCP for registry sync.");
         ImGui.Spacing();
 
-        ImGui.Text("Listen Port (UDP):");
-        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1), $"127.0.0.1:{_state.ListenPort}");
-        ImGui.TextWrapped("Connect Hytale to this address (auto-copied when starting)");
-
-        ImGui.Spacing();
+        ImGui.Text("Listen Ports:");
+        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1), $"UDP (Gameplay): 127.0.0.1:{_state.ListenPort}");
+        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1), $"TCP (Registry): 127.0.0.1:{_state.ListenPort + 1}");
+        ImGui.TextWrapped("Connect Hytale to the UDP port (auto-copied when starting)");
 
         if (!_state.IsRunning)
         {
@@ -7036,6 +7362,18 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
     private void CopyToClipboard(string text)
     {
         try { TextCopy.ClipboardService.SetText(text); } catch { }
+    }
+
+    public void ShowKeyDiagnostics()
+    {
+        foreach (var key in PacketDecryptor.DiscoveredKeys)
+        {
+            bool hasHP = key.HeaderProtectionKey != null && key.HeaderProtectionKey.Length > 0;
+            bool hasIV = key.IV != null && key.IV.Length == 12;
+            bool hasKey = key.Key != null && (key.Key.Length == 16 || key.Key.Length == 32);
+
+            Console.WriteLine($"Key {key.Type}: Key={hasKey}, IV={hasIV}, HP={hasHP}");
+        }
     }
 }
 
@@ -9334,6 +9672,8 @@ public class PacketFeedTab : ITab
         }
     }
 
+    // In PacketFeedTab.cs, replace the RenderDeepEncryptionAnalysis method with this:
+
     private void RenderDeepEncryptionAnalysis(PacketLogEntry pkt)
     {
         ImGui.Separator();
@@ -9358,6 +9698,28 @@ public class PacketFeedTab : ITab
             }
         }
         catch { }
+
+        // FIXED: Show QUIC header type
+        if (pkt.QuicInfo != null)
+        {
+            ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1),
+                $"QUIC Header: {pkt.QuicInfo.HeaderType}");
+
+            if (!pkt.QuicInfo.IsLongHeader)
+            {
+                ImGui.TextColored(new Vector4(1, 0.6f, 0.2f, 1),
+                    "?? Short Header - Post-handshake data (main game traffic)");
+                ImGui.TextColored(Theme.ColTextMuted,
+                    "Wireshark can decrypt this if you have the TLS keys");
+            }
+            else
+            {
+                ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.4f, 1),
+                    "? Long Header - Handshake/Initial traffic");
+            }
+
+            ImGui.Text($"Packet Number Length: {pkt.QuicInfo.PacketNumberLength} bytes");
+        }
 
         // Entropy display
         ImGui.Text($"Full Packet Entropy: {fullEntropy:F2}");
@@ -9399,36 +9761,15 @@ public class PacketFeedTab : ITab
 
         ImGui.TextColored(verdictColor, $"Verdict: {verdict}");
 
-        // Pattern detection
-        if (bytes != null)
+        // FIXED: Add note about Wireshark vs HyForce
+        if (pkt.QuicInfo != null && !pkt.QuicInfo.IsLongHeader)
         {
-            ImGui.Separator();
-            ImGui.TextColored(new Vector4(0.6f, 0.8f, 1, 1), "Pattern Analysis");
-
-            bool hasRepeating = bytes.GroupBy(b => b).Any(g => g.Count() > bytes.Length / 4);
-            bool hasNulls = bytes.Any(b => b == 0);
-            bool hasAscii = bytes.Any(b => b >= 32 && b <= 126);
-            int uniqueBytes = bytes.Distinct().Count();
-
-            ImGui.Text($"Unique bytes: {uniqueBytes}/{bytes.Length} ({100.0 * uniqueBytes / bytes.Length:F1}%)");
-            ImGui.Text($"Repeating patterns: {(hasRepeating ? "YES" : "No")}");
-            ImGui.Text($"Null bytes: {(hasNulls ? "YES" : "No")}");
-            ImGui.Text($"ASCII content: {(hasAscii ? "YES" : "No")}");
-
-            // Check for known opcodes in raw data
-            if (bytes.Length >= 2)
-            {
-                for (int i = 0; i < Math.Min(10, bytes.Length - 1); i++)
-                {
-                    ushort testOpcode = (ushort)((bytes[i] << 8) | bytes[i + 1]);
-                    var info = OpcodeRegistry.GetInfo(testOpcode, pkt.Direction);
-                    if (info != null)
-                    {
-                        ImGui.TextColored(new Vector4(0.2f, 1, 0.4f, 1),
-                            $"Possible opcode at offset {i}: 0x{testOpcode:X4} = {info.Name}");
-                    }
-                }
-            }
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1),
+                "Why Wireshark sees this but HyForce doesn't:");
+            ImGui.BulletText("Wireshark has your SSLKEYLOGFILE with TLS secrets");
+            ImGui.BulletText("HyForce needs those same secrets imported via Memory tab");
+            ImGui.BulletText("Short headers use 1-RTT keys derived from handshake");
         }
     }
 

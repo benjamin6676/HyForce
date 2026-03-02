@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/DecryptionTab.cs - FIXED: UI freezing with many keys + QUIC Key Derivation Info
+﻿// FILE: Tabs/DecryptionTab.cs - FIXED: Removed duplicate toggle, moved manual decrypt up, added paste support
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
@@ -16,7 +16,6 @@ public class DecryptionTab : ITab
     private string _manualKey = "";
     private int _selectedKeyType = 1;
     private string _testData = "";
-    private bool _autoDecrypt = true;
 
     private int _selectedKeyIndex = -1;
     private bool _showKeyDetails = false;
@@ -61,6 +60,20 @@ public class DecryptionTab : ITab
 
     public void Render()
     {
+        var avail = ImGui.GetContentRegionAvail();
+
+        ImGui.Spacing();
+        ImGui.Text("  PACKET DECRYPTION  -  Manage Encryption Keys");
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        // Show status message if recent
+        if (!string.IsNullOrEmpty(_statusMessage) && ImGui.GetTime() - _statusTime < 3.0)
+        {
+            ImGui.TextColored(Theme.ColSuccess, _statusMessage);
+        }
+
+        // FIXED: Only ONE auto-decrypt toggle at the top (removed duplicate)
         bool autoDecrypt = PacketDecryptor.AutoDecryptEnabled;
         if (ImGui.Checkbox("Enable Auto-Decrypt (may cause lag)", ref autoDecrypt))
         {
@@ -71,12 +84,14 @@ public class DecryptionTab : ITab
                 _state.AddInGameLog("[DECRYPTION] Auto-decrypt disabled");
         }
 
-        var avail = ImGui.GetContentRegionAvail();
+        ImGui.Spacing();
+        ImGui.Separator();
+
+        // FIXED: Manual decrypt section moved UP (visible without scrolling)
+        RenderManualDecryptSection();
 
         ImGui.Spacing();
-        ImGui.Text("  PACKET DECRYPTION  -  Manage Encryption Keys");
         ImGui.Separator();
-        ImGui.Spacing();
 
         // NEW: Show the fix explanation panel
         if (_showFixExplanation)
@@ -84,12 +99,6 @@ public class DecryptionTab : ITab
             RenderFixExplanation();
             ImGui.Spacing();
             ImGui.Separator();
-        }
-
-        // Show status message if recent
-        if (!string.IsNullOrEmpty(_statusMessage) && ImGui.GetTime() - _statusTime < 3.0)
-        {
-            ImGui.TextColored(Theme.ColSuccess, _statusMessage);
         }
 
         // Key status header with refresh button
@@ -102,15 +111,69 @@ public class DecryptionTab : ITab
         float leftWidth = avail.X * 0.5f - 8;
         float rightWidth = avail.X * 0.5f - 8;
 
-        ImGui.BeginChild("##left_panel", new Vector2(leftWidth, avail.Y - 100), ImGuiChildFlags.Borders);
+        ImGui.BeginChild("##left_panel", new Vector2(leftWidth, avail.Y - 280), ImGuiChildFlags.Borders);
         RenderKeyManagement(leftWidth);
         ImGui.EndChild();
 
         ImGui.SameLine();
 
-        ImGui.BeginChild("##right_panel", new Vector2(rightWidth, avail.Y - 100), ImGuiChildFlags.Borders);
+        ImGui.BeginChild("##right_panel", new Vector2(rightWidth, avail.Y - 280), ImGuiChildFlags.Borders);
         RenderStatsAndTesting(rightWidth);
         ImGui.EndChild();
+    }
+
+    /// <summary>
+    /// FIXED: New method for manual decrypt section at the TOP
+    /// </summary>
+    private void RenderManualDecryptSection()
+    {
+        ImGui.TextColored(Theme.ColAccent, "Manual Decryption");
+
+        // FIXED: Input with proper paste support
+        ImGui.Text("Test Data (hex):");
+
+        float inputWidth = ImGui.GetContentRegionAvail().X - 70;
+        ImGui.SetNextItemWidth(inputWidth);
+        ImGui.InputTextMultiline("##testData", ref _testData, 4096, new Vector2(inputWidth, 60));
+
+        ImGui.SameLine();
+
+        // FIXED: Proper paste button that works
+        if (ImGui.Button("Paste", new Vector2(60, 60)))
+        {
+            try
+            {
+                string? clipboard = TextCopy.ClipboardService.GetText();
+                if (!string.IsNullOrEmpty(clipboard))
+                {
+                    // Clean up the clipboard content - remove spaces and dashes, keep only hex chars
+                    string cleaned = new string(clipboard.Where(c => char.IsLetterOrDigit(c)).ToArray());
+                    if (cleaned.Length > 0)
+                    {
+                        _testData = cleaned;
+                        _state.AddInGameLog("[DECRYPTION] Pasted from clipboard");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _state.AddInGameLog($"[DECRYPTION] Paste failed: {ex.Message}");
+            }
+        }
+
+        // Decrypt button right below
+        ImGui.Spacing();
+        if (ImGui.Button("Decrypt Test Data", new Vector2(150, 28)))
+        {
+            TestDecrypt();
+        }
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Clear", new Vector2(80, 28)))
+        {
+            _testData = "";
+        }
     }
 
     /// <summary>
@@ -254,8 +317,6 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
             ImGui.SetTooltip("Rescan export directory for key files");
 
         ImGui.EndGroup();
-
-        ImGui.Checkbox("Auto-decrypt incoming packets", ref _autoDecrypt);
 
         // Show key sources if available
         if (status.KeySources.Any())
@@ -485,33 +546,6 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
         ImGui.Spacing();
         ImGui.Separator();
 
-        // Test decryption
-        ImGui.TextColored(Theme.ColAccent, "Test Decryption");
-        ImGui.InputTextMultiline("Test Data (hex)", ref _testData, 4096, new Vector2(-1, 100));
-
-        if (ImGui.Button("Test Decrypt", new Vector2(120, 28)))
-        {
-            TestDecrypt();
-        }
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("Clear Stats", new Vector2(100, 28)))
-        {
-            // Note: Would need to add a method to reset stats
-            _state.AddInGameLog("[DECRYPTION] Stats reset not implemented yet");
-        }
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("Verify Keys", new Vector2(100, 28)))
-        {
-            VerifyKeys();
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-
         // Quick actions
         ImGui.TextColored(Theme.ColAccent, "Quick Actions");
 
@@ -709,5 +743,17 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
     private void CopyToClipboard(string text)
     {
         try { TextCopy.ClipboardService.SetText(text); } catch { }
+    }
+
+    public void ShowKeyDiagnostics()
+    {
+        foreach (var key in PacketDecryptor.DiscoveredKeys)
+        {
+            bool hasHP = key.HeaderProtectionKey != null && key.HeaderProtectionKey.Length > 0;
+            bool hasIV = key.IV != null && key.IV.Length == 12;
+            bool hasKey = key.Key != null && (key.Key.Length == 16 || key.Key.Length == 32);
+
+            Console.WriteLine($"Key {key.Type}: Key={hasKey}, IV={hasIV}, HP={hasHP}");
+        }
     }
 }
