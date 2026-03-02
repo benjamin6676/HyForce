@@ -1,19 +1,21 @@
-﻿// FILE: Networking/TcpSession.cs
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 
 namespace HyForce.Networking;
 
-public class TcpSession
+public class TcpSession : IDisposable
 {
-    public TcpClient Client { get; }      // ADDED public getter
-    public TcpClient? Server { get; }     // ADDED public getter
+    public TcpClient Client { get; }
+    public TcpClient? Server { get; }
     private readonly NetworkStream? _clientStream;
     private readonly NetworkStream? _serverStream;
     private readonly CancellationTokenSource _cts = new();
     private readonly string _targetHost;
     private readonly int _targetPort;
     private readonly Data.TestLog _log;
+
+    // CRITICAL FIX: Proper dispose tracking
+    private bool _disposed = false;
 
     public IPEndPoint? RemoteEndPoint => Client.Client.RemoteEndPoint as IPEndPoint;
     public bool IsConnected => Client.Connected && (Server?.Connected ?? false);
@@ -84,5 +86,36 @@ public class TcpSession
         _serverStream?.Close();
         Client?.Close();
         Server?.Close();
+    }
+
+    // CRITICAL FIX: Proper IDisposable implementation
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!_disposed)
+        {
+            if (disposing)
+            {
+                // Dispose managed resources
+                _cts?.Cancel();
+                _cts?.Dispose();
+                _clientStream?.Dispose();
+                _serverStream?.Dispose();
+                Client?.Dispose();
+                Server?.Dispose();
+            }
+
+            _disposed = true;
+        }
+    }
+
+    ~TcpSession()
+    {
+        Dispose(false);
     }
 }

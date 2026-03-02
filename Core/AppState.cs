@@ -1,5 +1,4 @@
-﻿// FILE: Core/AppState.cs - FIXED: File locking issues with SSL key log
-using HyForce.Data;
+﻿using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
 using System.Collections.Concurrent;
@@ -35,7 +34,7 @@ public class AppState : IDisposable
     public List<string> InGameLog { get; } = new();
     public const int MaxInGameLogLines = 1000;
 
-    public string ExportDirectory { get; set; } = @"C:\Users\benja\source\repos\HyForce\Exported logs";
+    public string ExportDirectory { get; set; } = @"C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs";
 
     public event PacketReceivedHandler? OnPacketReceived;
     public event Action? OnSecurityEvent;
@@ -56,6 +55,9 @@ public class AppState : IDisposable
     private readonly Queue<string> _pendingKeyFiles = new();
     private readonly System.Timers.Timer _retryTimer;
 
+    // CRITICAL FIX: Cached delegate for proper event unsubscription
+    private readonly PacketReceivedHandler _packetHandlerDelegate;
+
     public AppState()
     {
         Log = new TestLog();
@@ -63,15 +65,14 @@ public class AppState : IDisposable
         PacketLog = new PacketLog(10000);
         Database = new PlayerItemDatabase();
 
-        UdpProxy.OnPacket += HandlePacket;
+        // CRITICAL FIX: Cache delegate to allow proper removal
+        _packetHandlerDelegate = HandlePacket;
+        UdpProxy.OnPacket += _packetHandlerDelegate;
+
         Directory.CreateDirectory(ExportDirectory);
 
         SetupAutoDecryption();
-
-        // NEW: Setup file watcher for SSL keys
         SetupSSLKeyWatcher();
-
-        // NEW: Immediate scan for existing keys
         ScanAndLoadExistingKeys();
 
         // FIXED: Setup retry timer for locked files
@@ -329,70 +330,78 @@ public class AppState : IDisposable
         QueueKeyFileLoad(path);
     }
 
-    // FIXED: Internal method with proper file sharing
-    // In Core/AppState.cs - Replace the existing TryLoadKeysFromFileInternal method with this:
-
     // FIXED: Internal method with proper QUIC key derivation
     private bool TryLoadKeysFromFileInternal(string path)
     {
         // Strip retry marker for actual path
         string actualPath = path.Split("|retry")[0];
+        int retryCount = 0;
+        const int MAX_RETRIES = 5;
 
-        try
+        while (retryCount < MAX_RETRIES)
         {
-            if (!File.Exists(actualPath)) return true; // Done, file gone
-
-            int keysAdded = 0;
-            int linesProcessed = 0;
-
-            // FIXED: Use FileStream with FileShare.ReadWrite to allow concurrent access
-            using (var fs = new FileStream(actualPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var reader = new StreamReader(fs))
+            try
             {
-                string? line;
-                while ((line = reader.ReadLine()) != null)
-                {
-                    linesProcessed++;
+                if (!File.Exists(actualPath)) return true; // Done, file gone
 
-                    // Parse SSLKEYLOGFILE format and derive QUIC keys
-                    if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
-                        line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
-                        line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
-                        line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
-                        line.StartsWith("EXPORTER_SECRET"))
+                int keysAdded = 0;
+                int linesProcessed = 0;
+
+                // CRITICAL FIX: Use FileShare.ReadWrite to allow concurrent access
+                using (var fs = new FileStream(actualPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var reader = new StreamReader(fs))
+                {
+                    string? line;
+                    while ((line = reader.ReadLine()) != null)
                     {
-                        // Use the new method that properly derives QUIC keys
-                        PacketDecryptor.AddKeyFromSSLLog(line, actualPath);
-                        keysAdded++;
+                        linesProcessed++;
+
+                        // Parse SSLKEYLOGFILE format and derive QUIC keys
+                        if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
+                            line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
+                            line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
+                            line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
+                            line.StartsWith("EXPORTER_SECRET"))
+                        {
+                            // Use the new method that properly derives QUIC keys
+                            PacketDecryptor.AddKeyFromSSLLog(line, actualPath);
+                            keysAdded++;
+                        }
                     }
                 }
-            }
 
-            if (keysAdded > 0)
-            {
-                AddInGameLog($"[KEYS] Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}");
-                AddInGameLog($"[KEYS] QUIC keys auto-derived using RFC 9001 HKDF-Expand-Label");
-                Log.Success($"Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}", "Keys");
-                OnKeysUpdated?.Invoke(); // Notify UI
-                return true; // Success
+                if (keysAdded > 0)
+                {
+                    AddInGameLog($"[KEYS] Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}");
+                    AddInGameLog($"[KEYS] QUIC keys auto-derived using RFC 9001 HKDF-Expand-Label");
+                    Log.Success($"Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}", "Keys");
+                    OnKeysUpdated?.Invoke(); // Notify UI
+                    return true; // Success
+                }
+                else if (linesProcessed > 0)
+                {
+                    AddInGameLog($"[KEYS] No valid TLS secrets found in {Path.GetFileName(actualPath)} ({linesProcessed} lines)");
+                    return true; // Success, just no keys
+                }
+                return true; // Empty file
             }
-            else if (linesProcessed > 0)
+            catch (IOException ex) when (IsFileLocked(ex))
             {
-                AddInGameLog($"[KEYS] No valid TLS secrets found in {Path.GetFileName(actualPath)} ({linesProcessed} lines)");
-                return true; // Success, just no keys
+                retryCount++;
+                if (retryCount >= MAX_RETRIES)
+                {
+                    AddInGameLog($"[KEYS] File locked after {MAX_RETRIES} attempts: {Path.GetFileName(actualPath)}");
+                    return false;
+                }
+                Thread.Sleep(100 * retryCount); // Exponential backoff
             }
-            return true; // Empty file
+            catch (Exception ex)
+            {
+                AddInGameLog($"[KEYS] Failed to load keys: {ex.Message}");
+                return true; // Don't retry on other errors
+            }
         }
-        catch (IOException ex) when (IsFileLocked(ex))
-        {
-            // File is locked, will retry
-            return false;
-        }
-        catch (Exception ex)
-        {
-            AddInGameLog($"[KEYS] Failed to load keys: {ex.Message}");
-            return true; // Don't retry on other errors
-        }
+        return false;
     }
 
     private static bool IsFileLocked(IOException exception)
@@ -796,11 +805,15 @@ public class AppState : IDisposable
 
     public void Dispose()
     {
+        // CRITICAL FIX: Remove cached delegate instead of instance method
+        UdpProxy.OnPacket -= _packetHandlerDelegate;
+
         Stop();
-        UdpProxy.OnPacket -= HandlePacket;
         _autoDecryptTimer?.Dispose();
         _sslKeyWatcher?.Dispose();
         _retryTimer?.Dispose();
+
+        GC.SuppressFinalize(this);
     }
 }
 

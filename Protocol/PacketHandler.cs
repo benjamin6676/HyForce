@@ -1,5 +1,4 @@
-﻿// FILE: Protocol/PacketHandler.cs - ENHANCED PACKET PROCESSING
-using HyForce.Core;
+﻿using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
 using System.Buffers.Binary;
@@ -48,9 +47,10 @@ public class PacketHandler
         {
             decryptResult = PacketDecryptor.TryDecrypt(packet.RawBytes);
 
-            if (decryptResult.Success)
+            // CRITICAL FIX: Check for null before accessing Success property
+            if (decryptResult?.Success == true && decryptResult.DecryptedData != null)
             {
-                dataToProcess = decryptResult.DecryptedData!;
+                dataToProcess = decryptResult.DecryptedData;
                 wasDecrypted = true;
 
                 _state.AddInGameLog($"[DECRYPT] {packet.Opcode:X4} decrypted ({dataToProcess.Length} bytes)");

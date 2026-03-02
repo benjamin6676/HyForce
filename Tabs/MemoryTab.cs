@@ -1,5 +1,4 @@
-﻿// FILE: Tabs/MemoryTab.cs - FIXED: Memory leaks, buffer overflows, and LocalPlayer scan
-using HyForce.Core;
+﻿using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
@@ -271,6 +270,7 @@ public class MemoryTab : ITab
                 ImGui.EndPopup();
             }
 
+            ImGui.Separator();
             ImGui.PopID();
         }
         ImGui.EndChild();
@@ -460,7 +460,12 @@ public class MemoryTab : ITab
         // Scan 1: Look for health value (100 as float and int)
         foreach (var region in regions.Take(50))
         {
-            if (token.IsCancellationRequested) break;
+            // CRITICAL FIX: Check cancellation frequently
+            if (token.IsCancellationRequested)
+            {
+                _state.AddInGameLog("[MEMORY] Scan cancelled by user");
+                break;
+            }
 
             try
             {
@@ -530,7 +535,7 @@ public class MemoryTab : ITab
                                 {
                                     Address = region.BaseAddress + i,
                                     Type = ScanValueType.String,
-                                    ValuePreview = $"\"{name}\""
+                                    ValuePreview = $"\\{ name }\\"
                                 });
                                 foundName++;
                             }
@@ -1048,7 +1053,7 @@ public class MemoryTab : ITab
                 {
                     Address = baseAddr + i,
                     Type = ScanValueType.String,
-                    ValuePreview = $"\"{str}\""
+                    ValuePreview = $"{ str }"
                 });
                 if (_scanResults.Count >= MAX_RESULTS) return;
             }
@@ -1104,10 +1109,18 @@ public class MemoryTab : ITab
         return regions;
     }
 
+    // CRITICAL FIX: Added bounds checking to prevent buffer overflow
     private byte[]? ReadMemoryBytes(IntPtr address, int size)
     {
-        if (_processHandle == IntPtr.Zero || address == IntPtr.Zero || size <= 0 || size > 4096)
+        if (_processHandle == IntPtr.Zero || address == IntPtr.Zero)
             return null;
+
+        // CRITICAL FIX: Validate size to prevent overflow
+        if (size <= 0 || size > 4096)
+        {
+            _state.AddInGameLog($"[MEMORY] Invalid read size: {size}");
+            return null;
+        }
 
         byte[] buffer = new byte[size];
         if (ReadProcessMemory(_processHandle, address, buffer, size, out int read) && read == size)

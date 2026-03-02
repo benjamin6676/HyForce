@@ -1,5 +1,4 @@
-﻿// FILE: App/ImGuiController.cs - FIXED: Memory leak in clipboard callbacks
-using System.Numerics;
+﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using Veldrid;
 using ImGuiNET;
@@ -104,7 +103,7 @@ public class ImGuiController : IDisposable
                 _clipboardPtr = IntPtr.Zero;
             }
 
-            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
+            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\\0");
             _clipboardPtr = Marshal.AllocHGlobal(bytes.Length);
             Marshal.Copy(bytes, 0, _clipboardPtr, bytes.Length);
             return _clipboardPtr;
@@ -497,17 +496,21 @@ void main()
                 Marshal.FreeHGlobal(_clipboardPtr);
                 _clipboardPtr = IntPtr.Zero;
             }
+            _clipboardBuffer = "";
         }
 
-        _vertexBuffer?.Dispose();
-        _indexBuffer?.Dispose();
-        _projMatrixBuffer?.Dispose();
-        _fontTexture?.Dispose();
-        _fontTextureView?.Dispose();
-        _vertexShader?.Dispose();
-        _fragmentShader?.Dispose();
-        _pipeline?.Dispose();
-        _mainResourceLayout?.Dispose();
+        // Dispose resources in reverse order of creation
         _mainResourceSet?.Dispose();
+        _mainResourceLayout?.Dispose();
+        _pipeline?.Dispose();
+        _fragmentShader?.Dispose();
+        _vertexShader?.Dispose();
+        _fontTextureView?.Dispose();
+        _fontTexture?.Dispose();
+        _projMatrixBuffer?.Dispose();
+        _indexBuffer?.Dispose();
+        _vertexBuffer?.Dispose();
+
+        GC.SuppressFinalize(this);
     }
 }

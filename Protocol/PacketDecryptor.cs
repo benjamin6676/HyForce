@@ -1,5 +1,4 @@
-﻿// FILE: Protocol/PacketDecryptor.cs - FIXED: Proper QUIC key derivation from TLS secrets
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 using System.Collections.Concurrent;
 
@@ -159,8 +158,10 @@ public static class PacketDecryptor
 
         try
         {
-            // Determine which label to use based on key type
             byte[] label;
+            int keyLength = 16; // AES-128-GCM default
+
+            // CRITICAL FIX: Only derive for QUIC types
             switch (key.Type)
             {
                 case EncryptionType.QUIC_ClientHandshake:
@@ -170,21 +171,29 @@ public static class PacketDecryptor
                     label = QUIC_SERVER_HANDSHAKE_LABEL;
                     break;
                 case EncryptionType.QUIC_Client1RTT:
+                case EncryptionType.QUIC_Client0RTT:
                     label = QUIC_CLIENT_TRAFFIC_LABEL;
                     break;
                 case EncryptionType.QUIC_Server1RTT:
+                case EncryptionType.QUIC_Server0RTT:
                     label = QUIC_SERVER_TRAFFIC_LABEL;
                     break;
                 default:
-                    label = QUIC_CLIENT_TRAFFIC_LABEL;
-                    break;
+                    // Not a QUIC type, skip derivation
+                    return;
             }
 
             // FIXED: Derive 16-byte AES-128-GCM key (QUIC uses 16 bytes, not 32!)
-            key.Key = HkdfExpandLabel(key.Secret, QUIC_KEY_LABEL, Array.Empty<byte>(), 16);
+            key.Key = HkdfExpandLabel(key.Secret, QUIC_KEY_LABEL, Array.Empty<byte>(), keyLength);
 
             // FIXED: Derive 12-byte IV
             key.IV = HkdfExpandLabel(key.Secret, QUIC_IV_LABEL, Array.Empty<byte>(), 12);
+
+            // Verify derivation succeeded
+            if (key.Key.Length != keyLength || key.IV.Length != 12)
+            {
+                throw new CryptographicException("Key derivation produced invalid length");
+            }
 
             Console.WriteLine($"[KEY-DERIVE] Derived {key.Type} keys: Key={BitConverter.ToString(key.Key).Replace("-", "")[..16]}..., IV={BitConverter.ToString(key.IV).Replace("-", "")}");
         }
@@ -465,12 +474,27 @@ public static class PacketDecryptor
         }
     }
 
+    // CRITICAL FIX: Deep copy under lock to prevent race conditions
     public static IReadOnlyList<EncryptionKey> DiscoveredKeys
     {
         get
         {
             _keysLock.EnterReadLock();
-            try { return _discoveredKeys.ToList(); }
+            try
+            {
+                // Return deep copies to prevent external modification
+                return _discoveredKeys.Select(k => new EncryptionKey
+                {
+                    Key = k.Key.ToArray(),
+                    IV = k.IV.ToArray(),
+                    Type = k.Type,
+                    Source = k.Source,
+                    MemoryAddress = k.MemoryAddress,
+                    DiscoveredAt = k.DiscoveredAt,
+                    UseCount = k.UseCount,
+                    Secret = k.Secret?.ToArray()
+                }).ToList();
+            }
             finally { _keysLock.ExitReadLock(); }
         }
     }

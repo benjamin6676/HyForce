@@ -1,5 +1,4 @@
-﻿// FILE: Tabs/ConnectTab.cs - UDP-ONLY MODE WITH AUTO-COPY CONFIRMATION
-using HyForce.Core;
+﻿using HyForce.Core;
 using HyForce.UI;
 using ImGuiNET;
 using System.Numerics;
@@ -181,8 +180,8 @@ public class ConnectTab : ITab
 
             if (ImGui.Button("Copy Config to Clipboard", new Vector2(leftW - 24, 28)))
             {
-                var configText = $"Server: {_state.TargetHost}:{_state.TargetPort}\n" +
-                               $"Mode: UDP-ONLY\n" +
+                var configText = $"Server: {_state.TargetHost}:{_state.TargetPort}\\n" +
+                               $"Mode: UDP-ONLY\\n" +
                                $"Listen: 127.0.0.1:{_state.ListenPort}";
                 CopyToClipboard(configText);
                 _state.AddInGameLog("[DEBUG] Config copied to clipboard");
@@ -240,6 +239,17 @@ public class ConnectTab : ITab
             ImGuiInputTextFlags.CharsDecimal | ImGuiInputTextFlags.AutoSelectAll))
         {
             string val = System.Text.Encoding.ASCII.GetString(buffer).TrimEnd('\0');
+
+            // CRITICAL FIX: Validate port range
+            if (int.TryParse(val, out int port))
+            {
+                if (port < 1 || port > 65535)
+                {
+                    _state.AddInGameLog("[ERROR] Port must be between 1-65535");
+                    return;
+                }
+            }
+
             onChange(val);
         }
 
@@ -256,6 +266,16 @@ public class ConnectTab : ITab
                 var digits = new string(clipboard.Where(char.IsDigit).ToArray());
                 if (!string.IsNullOrEmpty(digits))
                 {
+                    // CRITICAL FIX: Validate pasted port
+                    if (int.TryParse(digits, out int port))
+                    {
+                        if (port < 1 || port > 65535)
+                        {
+                            _state.AddInGameLog("[ERROR] Pasted port must be between 1-65535");
+                            return;
+                        }
+                    }
+
                     Array.Clear(buffer, 0, buffer.Length);
                     var bytes = System.Text.Encoding.ASCII.GetBytes(digits);
                     int copyLength = Math.Min(bytes.Length, buffer.Length - 1);
@@ -322,7 +342,7 @@ public class ConnectTab : ITab
 
             if (ImGui.Button("Copy Debug Info", new Vector2(120, 0)))
             {
-                CopyToClipboard($"Target: {_state.TargetHost}:{_state.TargetPort}\n" +
+                CopyToClipboard($"Target: {_state.TargetHost}:{_state.TargetPort}\\n" +
                               $"UDP: {_state.UdpProxy.StatusMessage}");
             }
         }
@@ -344,7 +364,7 @@ public class ConnectTab : ITab
         if (isRunning)
         {
             ImGui.SameLine();
-            ImGui.TextColored(Theme.ColTextMuted, $"• {sessions} sessions");
+            ImGui.TextColored(Theme.ColTextMuted, $"● {sessions} sessions");
         }
         ImGui.EndGroup();
     }

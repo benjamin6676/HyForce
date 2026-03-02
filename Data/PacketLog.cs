@@ -1,5 +1,4 @@
-﻿// FILE: Data/PacketLog.cs
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using HyForce.Networking;
 using HyForce.Protocol;
 using HyForce.Utils;
@@ -236,6 +235,7 @@ public class PacketLog
         );
     }
 
+    // CRITICAL FIX: Use unchecked context for intentional overflow behavior
     private static uint Fnv1aHash(string str)
     {
         const uint FNV_PRIME = 16777619;
@@ -244,8 +244,12 @@ public class PacketLog
         uint hash = FNV_OFFSET_BASIS;
         foreach (var c in str)
         {
-            hash ^= c;
-            hash *= FNV_PRIME;
+            // CRITICAL FIX: Use unchecked for intentional overflow behavior
+            unchecked
+            {
+                hash ^= c;
+                hash *= FNV_PRIME;
+            }
         }
         return hash;
     }

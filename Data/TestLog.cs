@@ -85,14 +85,36 @@ public class TestLog
         }
     }
 
+    // CRITICAL FIX: Return deep copies to prevent external modification
     public List<LogEntry> GetEntries()
     {
-        lock (_lock) return new List<LogEntry>(_entries);
+        lock (_lock)
+        {
+            return _entries.Select(e => new LogEntry
+            {
+                Timestamp = e.Timestamp,
+                Level = e.Level,
+                Category = e.Category,
+                Message = e.Message,
+                Metadata = e.Metadata?.ToDictionary(kvp => kvp.Key, kvp => kvp.Value)
+            }).ToList();
+        }
     }
 
+    // CRITICAL FIX: Return deep copies to prevent external modification
     public List<LogEntry> GetByLevel(LogLevel level)
     {
-        lock (_lock) return _entries.Where(e => e.Level == level).ToList();
+        lock (_lock)
+        {
+            return _entries.Where(e => e.Level == level).Select(e => new LogEntry
+            {
+                Timestamp = e.Timestamp,
+                Level = e.Level,
+                Category = e.Category,
+                Message = e.Message,
+                Metadata = e.Metadata?.ToDictionary(kvp => kvp.Key, kvp => kvp.Value)
+            }).ToList();
+        }
     }
 
     public string ExportAnalysisLog()
@@ -132,7 +154,7 @@ public class TestLog
     public string GetText()
     {
         lock (_lock)
-            return string.Join("\n", _entries.Select(e =>
+            return string.Join("\\n", _entries.Select(e =>
                 $"[{e.Timestamp:HH:mm:ss}] [{e.Level}] [{e.Category}] {e.Message}"));
     }
 }
