@@ -40,9 +40,26 @@ public class PacketLog
         byte[] raw = pkt.RawBytes;
         if (raw.Length == 0) return;
 
-        ushort opcode = ReadOpcode(raw);
-        string name = OpcodeRegistry.Label(opcode, pkt.Direction);
-        string encHint = ByteUtils.CalculateEntropy(raw) > 7.8 ? "encrypted" : "readable";
+        // FIX: Handle UDP/QUIC properly - don't read opcode from encrypted data
+        ushort opcode;
+        string name;
+        string encHint;
+
+        if (pkt.IsTcp)
+        {
+            // TCP: Can read opcode directly
+            opcode = ReadOpcode(raw);
+            name = OpcodeRegistry.Label(opcode, pkt.Direction);
+            encHint = ByteUtils.CalculateEntropy(raw) > 7.8 ? "encrypted" : "readable";
+        }
+        else
+        {
+            // UDP/QUIC: Payload is encrypted, can't read real opcode
+            // Use first byte as placeholder or 0 for unknown
+            opcode = raw.Length > 0 ? raw[0] : (ushort)0;
+            name = "QUIC_Encrypted";
+            encHint = "encrypted";
+        }
 
         byte[]? decompressed = TryDecompress(raw, out string compr);
         bool compressed = compr != "none" && decompressed != null;
@@ -55,7 +72,7 @@ public class PacketLog
             OpcodeDecimal = opcode,
             OpcodeName = name,
             IsTcp = pkt.IsTcp,
-            RawBytes = raw,
+            RawBytes = raw,  // Store raw bytes for potential decryption
             CompressionMethod = compr,
             CompressedSize = raw.Length,
             DecompressedSize = compressed ? decompressed!.Length : raw.Length,
@@ -73,8 +90,12 @@ public class PacketLog
                 _entries.Dequeue();
         }
 
-        _opcodeCounts.AddOrUpdate(opcode, 1, (_, v) => v + 1);
-        _opcodeLatest[opcode] = entry;
+        // Only count opcodes for TCP (UDP opcodes are meaningless)
+        if (pkt.IsTcp)
+        {
+            _opcodeCounts.AddOrUpdate(opcode, 1, (_, v) => v + 1);
+            _opcodeLatest[opcode] = entry;
+        }
 
         if (pkt.Direction == PacketDirection.ServerToClient)
         {
@@ -98,7 +119,7 @@ public class PacketLog
             Interlocked.Increment(ref _countUdp);
         }
 
-        // Registry parsing with proper checks
+        // Registry parsing only for TCP
         if (pkt.IsTcp && pkt.Direction == PacketDirection.ServerToClient)
         {
             RegistrySyncParser.TryParse(opcode, raw);

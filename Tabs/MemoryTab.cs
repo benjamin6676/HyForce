@@ -74,8 +74,6 @@ public class MemoryTab : ITab
         else
         {
             _state.AddInGameLog("[MEMORY] Attach to process first before scanning!");
-            // Auto-switch to this tab
-            
         }
     }
 
@@ -169,6 +167,12 @@ public class MemoryTab : ITab
 
             ImGui.SameLine();
             ImGui.Checkbox("Auto", ref _autoRefresh);
+
+            ImGui.SameLine();
+            if (ImGui.Button("Enable SSL Keylog", new Vector2(130, 28)))
+            {
+                TryHookSSLKeyLog();
+            }
         }
     }
 
@@ -761,7 +765,7 @@ public class MemoryTab : ITab
         _state.AddInGameLog($"[MEMORY] Quick scan complete: {scanned} regions, {_scanResults.Count} results for value '100'");
     }
 
-    // NEW: Scan for TLS 1.3 keys automatically
+    // NEW: Scan for TLS 1.3 keys automatically - IMPROVED
     private async void ScanForTLSKeys()
     {
         if (!_isAttached) return;
@@ -789,11 +793,60 @@ public class MemoryTab : ITab
         }
     }
 
+    // Add this method to MemoryTab class
+    private void TryHookSSLKeyLog()
+    {
+        _state.AddInGameLog("[KEYS] Trying to enable SSL key logging...");
+
+        // Set environment variable BEFORE Hytale starts
+        string keyLogPath = Path.Combine(_state.ExportDirectory, "sslkeys.log");
+        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath);
+
+        _state.AddInGameLog($"[KEYS] SSLKEYLOGFILE set to: {keyLogPath}");
+        _state.AddInGameLog("[KEYS] RESTART Hytale for this to take effect!");
+
+        // Also check if file already exists
+        if (File.Exists(keyLogPath))
+        {
+            _state.AddInGameLog($"[KEYS] Found existing keylog file!");
+            _state.TryLoadKeysFromFile(keyLogPath);
+        }
+    }
+
     private void DoTLSScan(CancellationToken token)
     {
         int keysFound = 0;
         var regions = GetReadableMemoryRegions().Where(r => r.Size < 50_000_000);
 
+        // First pass: Look for TLS keylog strings
+        foreach (var region in regions.Take(30))
+        {
+            if (token.IsCancellationRequested) break;
+
+            try
+            {
+                byte[] buffer = new byte[(int)Math.Min(region.Size, 2_000_000)];
+                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                    continue;
+
+                // Search for TLS-related strings
+                var strings = ExtractStringsFromBuffer(buffer, 20);
+                foreach (var str in strings)
+                {
+                    if (str.Contains("CLIENT_TRAFFIC_SECRET") ||
+                        str.Contains("SERVER_TRAFFIC_SECRET") ||
+                        str.Contains("EXPORTER_SECRET") ||
+                        str.Contains("QUIC") ||
+                        str.Contains("sslkeylog"))
+                    {
+                        _state.AddInGameLog($"[TLS] Found string: {str.Substring(0, Math.Min(40, str.Length))}");
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // Second pass: Look for 32-byte high entropy blocks (AES-256 keys)
         foreach (var region in regions.Take(20))
         {
             if (token.IsCancellationRequested) break;
@@ -810,7 +863,7 @@ public class MemoryTab : ITab
                     double entropy = CalculateEntropy(buffer, i, 32);
 
                     // TLS secrets have high entropy (>7.5) and specific patterns
-                    if (entropy > 7.8 && entropy < 7.99)
+                    if (entropy > 7.5 && entropy < 7.99)
                     {
                         // Check if surrounded by lower entropy (isolated high entropy = likely key)
                         double before = CalculateEntropy(buffer, Math.Max(0, i - 32), 32);
@@ -821,20 +874,24 @@ public class MemoryTab : ITab
                             var keyBytes = new byte[32];
                             Array.Copy(buffer, i, keyBytes, 0, 32);
 
-                            // Auto-add as decryption key
-                            PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+                            // Verify it's not all zeros or all same byte
+                            if (keyBytes.Any(b => b != 0) && keyBytes.Distinct().Count() > 16)
                             {
-                                Key = keyBytes,
-                                IV = new byte[12],
-                                Type = PacketDecryptor.EncryptionType.AES256GCM,
-                                Source = "Memory Scan (TLS)",
-                                MemoryAddress = region.BaseAddress + i
-                            });
+                                // Auto-add as decryption key
+                                PacketDecryptor.AddKey(new PacketDecryptor.EncryptionKey
+                                {
+                                    Key = keyBytes,
+                                    IV = new byte[12],
+                                    Type = PacketDecryptor.EncryptionType.AES256GCM,
+                                    Source = "Memory Scan (TLS)",
+                                    MemoryAddress = region.BaseAddress + i
+                                });
 
-                            keysFound++;
+                                keysFound++;
 
-                            // Only add first 5 keys to avoid duplicates
-                            if (keysFound >= 5) break;
+                                // Only add first 5 keys to avoid duplicates
+                                if (keysFound >= 5) break;
+                            }
                         }
                     }
                 }
@@ -845,6 +902,32 @@ public class MemoryTab : ITab
         }
 
         _state.AddInGameLog($"[AUTO-DECRYPT] Found {keysFound} potential TLS keys and added to decryption!");
+    }
+
+    // Helper to extract strings from buffer
+    private List<string> ExtractStringsFromBuffer(byte[] data, int minLength)
+    {
+        var results = new List<string>();
+        var sb = new StringBuilder();
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            if (data[i] >= 32 && data[i] <= 126)
+            {
+                sb.Append((char)data[i]);
+            }
+            else
+            {
+                if (sb.Length >= minLength)
+                    results.Add(sb.ToString());
+                sb.Clear();
+            }
+        }
+
+        if (sb.Length >= minLength)
+            results.Add(sb.ToString());
+
+        return results;
     }
 
     private void UseAsDecryptionKey(MemoryResult result)
