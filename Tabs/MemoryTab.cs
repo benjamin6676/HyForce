@@ -1,8 +1,9 @@
-﻿// FILE: Tabs/MemoryTab.cs - ENHANCED AUTOMATIC KEY EXTRACTION
+﻿// FILE: Tabs/MemoryTab.cs - FIXED: Memory leaks, buffer overflows, and validation
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
+using System.Buffers;
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -57,6 +58,10 @@ public class MemoryTab : ITab
     private int _consecutiveEmptyScans = 0;
     private const int MaxEmptyScans = 10;
 
+    // FIXED: Smaller chunk size to prevent memory pressure
+    private const int MAX_SCAN_CHUNK = 256 * 1024; // 256KB instead of 5MB
+    private const int MAX_RESULTS = 10000; // Limit results to prevent UI freeze
+
     // Windows API
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
     [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesRead);
@@ -77,7 +82,7 @@ public class MemoryTab : ITab
 
     private void OnQuickScanRequested()
     {
-        if (_isAttached)
+        if (_isAttached && _processHandle != IntPtr.Zero)
         {
             ScanForTLSKeys();
         }
@@ -532,7 +537,7 @@ public class MemoryTab : ITab
 
     private async void ScanForTLSKeys()
     {
-        if (!_isAttached || _hytaleProcess == null) return;
+        if (!_isAttached || _hytaleProcess == null || _processHandle == IntPtr.Zero) return;
 
         _state.AddInGameLog("[AUTO-KEY] Starting automatic TLS key extraction...");
         _scanCts = new CancellationTokenSource();
@@ -601,32 +606,38 @@ public class MemoryTab : ITab
 
             try
             {
-                const int chunkSize = 0x100000;
                 long offset = 0;
-
                 while (offset < region.Size)
                 {
-                    int toRead = (int)Math.Min(chunkSize, region.Size - offset);
-                    byte[] buffer = new byte[toRead];
+                    int toRead = (int)Math.Min(MAX_SCAN_CHUNK, region.Size - offset);
 
-                    if (!ReadProcessMemory(_processHandle, region.BaseAddress + (int)offset,
-                        buffer, toRead, out int read)) break;
-
-                    for (int i = 0; i < buffer.Length - 8; i += 8)
+                    // FIXED: Use ArrayPool to prevent GC pressure
+                    byte[]? buffer = ArrayPool<byte>.Shared.Rent(toRead);
+                    try
                     {
-                        long potentialPtr = BitConverter.ToInt64(buffer, i);
+                        if (!ReadProcessMemory(_processHandle, region.BaseAddress + (int)offset,
+                            buffer, toRead, out int read)) break;
 
-                        if (IsValidHeapPointer((IntPtr)potentialPtr))
+                        for (int i = 0; i < read - 8; i += 8)
                         {
-                            if (VerifySSLContext((IntPtr)potentialPtr))
+                            long potentialPtr = BitConverter.ToInt64(buffer, i);
+
+                            if (IsValidHeapPointer((IntPtr)potentialPtr))
                             {
-                                contexts.Add((IntPtr)potentialPtr);
-                                if (contexts.Count >= 10) return contexts;
+                                if (VerifySSLContext((IntPtr)potentialPtr))
+                                {
+                                    contexts.Add((IntPtr)potentialPtr);
+                                    if (contexts.Count >= 10) return contexts;
+                                }
                             }
                         }
-                    }
 
-                    offset += toRead;
+                        offset += toRead;
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
                 }
             }
             catch { }
@@ -766,16 +777,25 @@ public class MemoryTab : ITab
             {
                 if (IsImageRegion(region)) continue;
 
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 2_000_000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
+                // FIXED: Use ArrayPool and smaller chunks
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
+                {
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
 
-                regionsScanned++;
+                    regionsScanned++;
 
-                totalKeysFound += ScanForAESKeys(buffer, region.BaseAddress, token);
-                totalKeysFound += ScanForChaChaKeys(buffer, region.BaseAddress, token);
+                    totalKeysFound += ScanForAESKeys(buffer, read, region.BaseAddress, token);
+                    totalKeysFound += ScanForChaChaKeys(buffer, read, region.BaseAddress, token);
 
-                if (totalKeysFound >= 5) break;
+                    if (totalKeysFound >= 5) break;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
 
                 if (regionsScanned % 5 == 0)
                     Thread.Sleep(10);
@@ -786,11 +806,11 @@ public class MemoryTab : ITab
         _state.AddInGameLog($"[AUTO-KEY] Scanned {regionsScanned} regions, found {totalKeysFound} keys");
     }
 
-    private int ScanForAESKeys(byte[] buffer, IntPtr baseAddr, CancellationToken token)
+    private int ScanForAESKeys(byte[] buffer, int length, IntPtr baseAddr, CancellationToken token)
     {
         int found = 0;
 
-        for (int i = 0; i < buffer.Length - 32; i += 16)
+        for (int i = 0; i < length - 32; i += 16)
         {
             if (token.IsCancellationRequested) break;
 
@@ -804,7 +824,7 @@ public class MemoryTab : ITab
             if (keyBytes.All(b => b == 0)) continue;
             if (keyBytes.Distinct().Count() < 15) continue;
 
-            bool hasContext = CheckForTLSContext(buffer, i);
+            bool hasContext = CheckForTLSContext(buffer, i, length);
 
             var key = new PacketDecryptor.EncryptionKey
             {
@@ -825,11 +845,11 @@ public class MemoryTab : ITab
         return found;
     }
 
-    private int ScanForChaChaKeys(byte[] buffer, IntPtr baseAddr, CancellationToken token)
+    private int ScanForChaChaKeys(byte[] buffer, int length, IntPtr baseAddr, CancellationToken token)
     {
         int found = 0;
 
-        for (int i = 0; i < buffer.Length - 32; i += 4)
+        for (int i = 0; i < length - 32; i += 4)
         {
             if (token.IsCancellationRequested) break;
 
@@ -864,10 +884,10 @@ public class MemoryTab : ITab
         return (addr & 0xFFFFF) == 0 && region.Size > 0x100000;
     }
 
-    private bool CheckForTLSContext(byte[] buffer, int keyOffset)
+    private bool CheckForTLSContext(byte[] buffer, int keyOffset, int bufferLength)
     {
         int searchStart = Math.Max(0, keyOffset - 256);
-        int searchEnd = Math.Min(buffer.Length, keyOffset + 256);
+        int searchEnd = Math.Min(bufferLength, keyOffset + 256);
 
         for (int i = searchStart; i < searchEnd - 2; i++)
         {
@@ -914,32 +934,51 @@ public class MemoryTab : ITab
         {
             try
             {
-                byte[] buffer = new byte[Math.Min((int)region.Size, 500000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
-
-                for (int i = 0; i < buffer.Length - 32; i += 32)
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
                 {
-                    double entropy = CalculateEntropy(buffer, i, 32);
-                    if (entropy > 7.8 && entropy < 7.99)
-                    {
-                        var keyBytes = new byte[32];
-                        Array.Copy(buffer, i, keyBytes, 0, 32);
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
 
-                        if (!PacketDecryptor.DiscoveredKeys.Any(k => k.Key.SequenceEqual(keyBytes)))
+                    for (int i = 0; i < read - 32; i += 32)
+                    {
+                        double entropy = CalculateEntropy(buffer, i, 32);
+                        if (entropy > 7.8 && entropy < 7.99)
                         {
-                            var key = new PacketDecryptor.EncryptionKey
+                            var keyBytes = new byte[32];
+                            Array.Copy(buffer, i, keyBytes, 0, 32);
+
+                            // Check for duplicates using thread-safe method
+                            bool isDuplicate = false;
+                            foreach (var existingKey in PacketDecryptor.DiscoveredKeys)
                             {
-                                Key = keyBytes,
-                                IV = new byte[12],
-                                Type = PacketDecryptor.EncryptionType.AES256GCM,
-                                Source = "Background scan",
-                                MemoryAddress = region.BaseAddress + i
-                            };
-                            PacketDecryptor.AddKey(key);
-                            newKeys++;
+                                if (existingKey.Key.SequenceEqual(keyBytes))
+                                {
+                                    isDuplicate = true;
+                                    break;
+                                }
+                            }
+
+                            if (!isDuplicate)
+                            {
+                                var key = new PacketDecryptor.EncryptionKey
+                                {
+                                    Key = keyBytes,
+                                    IV = new byte[12],
+                                    Type = PacketDecryptor.EncryptionType.AES256GCM,
+                                    Source = "Background scan",
+                                    MemoryAddress = region.BaseAddress + i
+                                };
+                                PacketDecryptor.AddKey(key);
+                                newKeys++;
+                            }
                         }
                     }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
             catch { }
@@ -1022,20 +1061,26 @@ public class MemoryTab : ITab
 
             try
             {
-                int bufferSize = (int)Math.Min(region.Size, 5_000_000);
-                byte[] buffer = new byte[bufferSize];
-
-                if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
                 {
-                    switch (_selectedScanType)
+                    if (ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
                     {
-                        case 0: ScanExactValue(buffer, region.BaseAddress, _scanValue); break;
-                        case 1: ScanPattern(buffer, region.BaseAddress, _scanPattern); break;
-                        case 2: ScanString(buffer, region.BaseAddress, _scanValue); break;
-                        case 3: ScanFloatRange(buffer, region.BaseAddress, _scanValue); break;
+                        switch (_selectedScanType)
+                        {
+                            case 0: ScanExactValue(buffer, read, region.BaseAddress, _scanValue); break;
+                            case 1: ScanPattern(buffer, read, region.BaseAddress, _scanPattern); break;
+                            case 2: ScanString(buffer, read, region.BaseAddress, _scanValue); break;
+                            case 3: ScanFloatRange(buffer, read, region.BaseAddress, _scanValue); break;
+                        }
                     }
+                    scannedRegions++;
                 }
-                scannedRegions++;
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
 
                 if (scannedRegions % 10 == 0)
                 {
@@ -1085,12 +1130,14 @@ public class MemoryTab : ITab
         ).ToList();
     }
 
-    private void ScanExactValue(byte[] buffer, IntPtr baseAddr, string value)
+    private void ScanExactValue(byte[] buffer, int length, IntPtr baseAddr, string value)
     {
+        if (_scanResults.Count >= MAX_RESULTS) return;
+
         if (int.TryParse(value, out int intVal))
         {
             byte[] searchBytes = BitConverter.GetBytes(intVal);
-            for (int i = 0; i < buffer.Length - 4; i += 4)
+            for (int i = 0; i < length - 4; i += 4)
             {
                 if (buffer[i] == searchBytes[0] && buffer[i + 1] == searchBytes[1] &&
                     buffer[i + 2] == searchBytes[2] && buffer[i + 3] == searchBytes[3])
@@ -1101,6 +1148,7 @@ public class MemoryTab : ITab
                         Type = ScanValueType.Int32,
                         ValuePreview = intVal.ToString()
                     });
+                    if (_scanResults.Count >= MAX_RESULTS) return;
                 }
             }
         }
@@ -1108,7 +1156,7 @@ public class MemoryTab : ITab
         if (float.TryParse(value, out float floatVal))
         {
             byte[] searchBytes = BitConverter.GetBytes(floatVal);
-            for (int i = 0; i < buffer.Length - 4; i++)
+            for (int i = 0; i < length - 4; i++)
             {
                 if (buffer[i] == searchBytes[0] && buffer[i + 1] == searchBytes[1] &&
                     buffer[i + 2] == searchBytes[2] && buffer[i + 3] == searchBytes[3])
@@ -1119,13 +1167,16 @@ public class MemoryTab : ITab
                         Type = ScanValueType.Float,
                         ValuePreview = floatVal.ToString("F4")
                     });
+                    if (_scanResults.Count >= MAX_RESULTS) return;
                 }
             }
         }
     }
 
-    private void ScanPattern(byte[] buffer, IntPtr baseAddr, string pattern)
+    private void ScanPattern(byte[] buffer, int length, IntPtr baseAddr, string pattern)
     {
+        if (_scanResults.Count >= MAX_RESULTS) return;
+
         var patternBytes = new List<byte?>();
         foreach (var part in pattern.Split(' ', StringSplitOptions.RemoveEmptyEntries))
         {
@@ -1137,7 +1188,7 @@ public class MemoryTab : ITab
 
         if (patternBytes.Count == 0) return;
 
-        for (int i = 0; i < buffer.Length - patternBytes.Count; i++)
+        for (int i = 0; i < length - patternBytes.Count; i++)
         {
             bool match = true;
             for (int j = 0; j < patternBytes.Count; j++)
@@ -1157,15 +1208,18 @@ public class MemoryTab : ITab
                     Type = ScanValueType.Bytes,
                     ValuePreview = $"Pattern +{i:X}"
                 });
+                if (_scanResults.Count >= MAX_RESULTS) return;
             }
         }
     }
 
-    private void ScanString(byte[] buffer, IntPtr baseAddr, string str)
+    private void ScanString(byte[] buffer, int length, IntPtr baseAddr, string str)
     {
+        if (_scanResults.Count >= MAX_RESULTS) return;
+
         var strBytes = Encoding.UTF8.GetBytes(str);
 
-        for (int i = 0; i < buffer.Length - strBytes.Length; i++)
+        for (int i = 0; i < length - strBytes.Length; i++)
         {
             bool match = true;
             for (int j = 0; j < strBytes.Length; j++)
@@ -1185,19 +1239,22 @@ public class MemoryTab : ITab
                     Type = ScanValueType.String,
                     ValuePreview = $"\"{str}\""
                 });
+                if (_scanResults.Count >= MAX_RESULTS) return;
             }
         }
     }
 
-    private void ScanFloatRange(byte[] buffer, IntPtr baseAddr, string range)
+    private void ScanFloatRange(byte[] buffer, int length, IntPtr baseAddr, string range)
     {
+        if (_scanResults.Count >= MAX_RESULTS) return;
+
         var parts = range.Split('-');
         if (parts.Length != 2) return;
 
         if (!float.TryParse(parts[0], out float min)) return;
         if (!float.TryParse(parts[1], out float max)) return;
 
-        for (int i = 0; i < buffer.Length - 4; i += 4)
+        for (int i = 0; i < length - 4; i += 4)
         {
             float val = BitConverter.ToSingle(buffer, i);
             if (val >= min && val <= max && !float.IsNaN(val) && !float.IsInfinity(val))
@@ -1208,13 +1265,14 @@ public class MemoryTab : ITab
                     Type = ScanValueType.Float,
                     ValuePreview = val.ToString("F4")
                 });
+                if (_scanResults.Count >= MAX_RESULTS) return;
             }
         }
     }
 
     private async void QuickScanPlayer()
     {
-        if (!_isAttached) return;
+        if (!_isAttached || _processHandle == IntPtr.Zero) return;
 
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
@@ -1254,16 +1312,24 @@ public class MemoryTab : ITab
 
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 1_000_000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
-
-                ScanExactValue(buffer, region.BaseAddress, "100");
-                scanned++;
-
-                if (scanned % 5 == 0)
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
                 {
-                    Thread.Sleep(1);
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
+
+                    ScanExactValue(buffer, read, region.BaseAddress, "100");
+                    scanned++;
+
+                    if (scanned % 5 == 0)
+                    {
+                        Thread.Sleep(1);
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
             catch { }
@@ -1301,17 +1367,25 @@ public class MemoryTab : ITab
         {
             try
             {
-                byte[] buffer = new byte[(int)Math.Min(region.Size, 5_000_000)];
-                if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, buffer.Length, out int read))
-                    continue;
-
-                for (int i = 0; i < buffer.Length - 8; i += 8)
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
                 {
-                    long val = BitConverter.ToInt64(buffer, i);
-                    if ((IntPtr)val == target)
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
+
+                    for (int i = 0; i < read - 8; i += 8)
                     {
-                        _pointerMap[target].Add(region.BaseAddress + i);
+                        long val = BitConverter.ToInt64(buffer, i);
+                        if ((IntPtr)val == target)
+                        {
+                            _pointerMap[target].Add(region.BaseAddress + i);
+                        }
                     }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
             catch { }
@@ -1343,10 +1417,14 @@ public class MemoryTab : ITab
         return regions;
     }
 
+    // FIXED: Added validation
     private byte[]? ReadMemoryBytes(IntPtr address, int size)
     {
+        if (_processHandle == IntPtr.Zero || address == IntPtr.Zero || size <= 0 || size > 4096)
+            return null;
+
         byte[] buffer = new byte[size];
-        if (ReadProcessMemory(_processHandle, address, buffer, size, out int read))
+        if (ReadProcessMemory(_processHandle, address, buffer, size, out int read) && read == size)
             return buffer;
         return null;
     }
@@ -1376,6 +1454,8 @@ public class MemoryTab : ITab
 
     private void WriteMemoryValue(IntPtr address, string value)
     {
+        if (_processHandle == IntPtr.Zero) return;
+
         byte[]? bytes = null;
 
         if (int.TryParse(value, out int intVal))
@@ -1567,7 +1647,18 @@ public class MemoryTab : ITab
                                         Source = $"SSLLog:{Path.GetFileName(file)}"
                                     };
 
-                                    if (!PacketDecryptor.DiscoveredKeys.Any(k => k.Key.SequenceEqual(key.Key)))
+                                    // Check for duplicates
+                                    bool isDuplicate = false;
+                                    foreach (var existing in PacketDecryptor.DiscoveredKeys)
+                                    {
+                                        if (existing.Key.SequenceEqual(key.Key))
+                                        {
+                                            isDuplicate = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if (!isDuplicate)
                                     {
                                         PacketDecryptor.AddKey(key);
                                         newKeys++;

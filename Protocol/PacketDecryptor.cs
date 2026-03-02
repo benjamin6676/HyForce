@@ -1,4 +1,4 @@
-﻿// FILE: Protocol/PacketDecryptor.cs - ENHANCED WITH AUTO-EXTRACTION AND VALIDATION
+﻿// FILE: Protocol/PacketDecryptor.cs - FIXED: Key limits and deduplication
 using System.Security.Cryptography;
 using System.Text;
 
@@ -33,12 +33,43 @@ public static class PacketDecryptor
         public string Source { get; set; } = "";
         public IntPtr? MemoryAddress { get; set; }
         public DateTime DiscoveredAt { get; set; } = DateTime.Now;
+        public int UseCount { get; set; } = 0; // Track successful uses
     }
 
-    public static List<EncryptionKey> DiscoveredKeys { get; } = new();
+    // FIXED: Thread-safe backing fields with strict limits
+    private static readonly List<EncryptionKey> _discoveredKeys = new();
+    private static readonly ReaderWriterLockSlim _keysLock = new(LockRecursionPolicy.SupportsRecursion);
+    private static int _successfulDecryptions = 0;
+    private static int _failedDecryptions = 0;
+
+    // FIXED: Hard limits to prevent memory/performance issues
+    private const int MAX_KEYS = 50; // Maximum keys to store
+    private const int MAX_KEYS_PER_SOURCE = 10; // Max per file/source
+
+    // Public accessors
+    public static IReadOnlyList<EncryptionKey> DiscoveredKeys
+    {
+        get
+        {
+            _keysLock.EnterReadLock();
+            try { return _discoveredKeys.ToList(); }
+            finally { _keysLock.ExitReadLock(); }
+        }
+    }
+
     public static event Action<EncryptionKey>? OnKeyDiscovered;
-    public static int SuccessfulDecryptions { get; private set; }
-    public static int FailedDecryptions { get; private set; }
+
+    public static int SuccessfulDecryptions
+    {
+        get => Interlocked.CompareExchange(ref _successfulDecryptions, 0, 0);
+        private set => Interlocked.Exchange(ref _successfulDecryptions, value);
+    }
+
+    public static int FailedDecryptions
+    {
+        get => Interlocked.CompareExchange(ref _failedDecryptions, 0, 0);
+        private set => Interlocked.Exchange(ref _failedDecryptions, value);
+    }
 
     // Auto-extraction settings
     public static bool AutoExtractFromMemory { get; set; } = true;
@@ -51,91 +82,130 @@ public static class PacketDecryptor
             return new DecryptionResult { Success = false, ErrorMessage = "Data too short" };
         }
 
-        // Try each discovered key with validation
-        foreach (var key in DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt))
+        // FIXED: Get keys sorted by success rate (most used first)
+        List<EncryptionKey> keysCopy;
+        _keysLock.EnterReadLock();
+        try
+        {
+            // Only try top 10 most successful keys for performance
+            keysCopy = _discoveredKeys
+                .OrderByDescending(k => k.UseCount)
+                .ThenByDescending(k => k.DiscoveredAt)
+                .Take(10)
+                .ToList();
+        }
+        finally
+        {
+            _keysLock.ExitReadLock();
+        }
+
+        if (keysCopy.Count == 0)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = "No keys available" };
+        }
+
+        // Try each key with validation
+        foreach (var key in keysCopy)
         {
             var result = TryDecryptWithKey(encryptedData, key, associatedData);
 
-            // Validate decrypted data looks reasonable
             if (result.Success && result.DecryptedData != null)
             {
                 if (IsValidDecryptedData(result.DecryptedData))
                 {
-                    SuccessfulDecryptions++;
+                    // Increment use count for this key
+                    _keysLock.EnterWriteLock();
+                    try
+                    {
+                        key.UseCount++;
+                    }
+                    finally
+                    {
+                        _keysLock.ExitWriteLock();
+                    }
+
+                    Interlocked.Increment(ref _successfulDecryptions);
                     return result;
-                }
-                else
-                {
-                    result.Success = false;
-                    result.ErrorMessage = "Key produced invalid data";
                 }
             }
         }
 
-        // Try common/default keys as last resort
-        var defaultResult = TryCommonKeys(encryptedData, associatedData);
-        if (defaultResult.Success)
-        {
-            SuccessfulDecryptions++;
-            return defaultResult;
-        }
-
-        FailedDecryptions++;
+        Interlocked.Increment(ref _failedDecryptions);
         return new DecryptionResult { Success = false, ErrorMessage = "No valid decryption key found" };
     }
 
-    // NEW: QUIC-specific decryption handling
     public static DecryptionResult TryDecryptQUIC(byte[] packetData, EncryptionKey key)
     {
-        if (packetData.Length < 21) // Minimum QUIC packet size
+        const int TAG_LENGTH = 16;
+        const int NONCE_LENGTH = 12;
+        const int MIN_PACKET_SIZE = 21;
+
+        if (packetData == null || packetData.Length < MIN_PACKET_SIZE)
             return new DecryptionResult { Success = false, ErrorMessage = "Packet too small for QUIC" };
+
+        if (key?.Key == null || (key.Key.Length != 32 && key.Key.Length != 16))
+            return new DecryptionResult { Success = false, ErrorMessage = "Invalid key" };
 
         try
         {
             bool isLongHeader = (packetData[0] & 0x80) != 0;
             int headerLen;
-            byte[]? headerBytes = null;
 
             if (isLongHeader)
             {
-                // Long header: type(1) + version(4) + DCID len(1) + DCID + SCID len(1) + SCID + len(2) + PN
-                if (packetData.Length < 7) return new DecryptionResult { Success = false };
+                if (packetData.Length < 7)
+                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid long header" };
+
                 int dcidLen = packetData[5];
+                if (packetData.Length < 6 + dcidLen + 1)
+                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid DCID length" };
+
                 int scidLen = packetData[6 + dcidLen];
-                headerLen = 7 + dcidLen + scidLen + 2 + 4; // Approximate
-                if (headerLen > packetData.Length) headerLen = 16; // Fallback
+                headerLen = 7 + dcidLen + scidLen + 2 + 4;
+
+                if (headerLen > packetData.Length - TAG_LENGTH)
+                    headerLen = Math.Min(16, packetData.Length - TAG_LENGTH);
             }
             else
             {
-                // Short header: type(1) + DCID (4-8 bytes typically) + PN (1-4 bytes)
-                headerLen = 1 + 8; // Assume 8-byte DCID for Hytale
+                headerLen = Math.Min(1 + 8, packetData.Length - TAG_LENGTH);
             }
 
-            headerLen = Math.Min(headerLen, packetData.Length - 16);
-            headerBytes = packetData[..headerLen];
+            headerLen = Math.Max(1, Math.Min(headerLen, packetData.Length - TAG_LENGTH));
 
-            var ciphertext = packetData[headerLen..^16];
-            var tag = packetData[^16..];
+            byte[] headerBytes = new byte[headerLen];
+            Buffer.BlockCopy(packetData, 0, headerBytes, 0, headerLen);
 
-            // Build nonce from IV + packet number (simplified)
-            var nonce = new byte[12];
-            Array.Copy(key.IV, 0, nonce, 0, 12);
+            int ciphertextLength = packetData.Length - headerLen - TAG_LENGTH;
+            if (ciphertextLength < 1)
+                return new DecryptionResult { Success = false, ErrorMessage = "No ciphertext" };
 
-            // XOR packet number into nonce last bytes if available
+            byte[] ciphertext = new byte[ciphertextLength];
+            Buffer.BlockCopy(packetData, headerLen, ciphertext, 0, ciphertextLength);
+
+            byte[] tag = new byte[TAG_LENGTH];
+            Buffer.BlockCopy(packetData, packetData.Length - TAG_LENGTH, tag, 0, TAG_LENGTH);
+
+            byte[] nonce = new byte[NONCE_LENGTH];
+            if (key.IV != null && key.IV.Length >= NONCE_LENGTH)
+            {
+                Buffer.BlockCopy(key.IV, 0, nonce, 0, NONCE_LENGTH);
+            }
+
             if (headerLen >= 4 && packetData.Length > headerLen)
             {
                 for (int i = 0; i < 4 && i < (packetData.Length - headerLen); i++)
                 {
-                    nonce[8 + i] ^= packetData[headerLen - 4 + i];
+                    if (8 + i < NONCE_LENGTH)
+                        nonce[8 + i] ^= packetData[headerLen - 4 + i];
                 }
             }
 
-            using var aes = new AesGcm(key.Key, 16);
-            var plaintext = new byte[ciphertext.Length];
+            using var aes = new AesGcm(key.Key, TAG_LENGTH);
+            byte[] plaintext = new byte[ciphertextLength];
 
             aes.Decrypt(nonce, ciphertext, tag, plaintext, headerBytes);
 
-            // Validate result
             if (!IsValidDecryptedData(plaintext))
             {
                 return new DecryptionResult { Success = false, ErrorMessage = "Decrypted data validation failed" };
@@ -156,6 +226,10 @@ public static class PacketDecryptor
                 }
             };
         }
+        catch (CryptographicException ex)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = $"Decryption failed: {ex.Message}" };
+        }
         catch (Exception ex)
         {
             return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
@@ -166,8 +240,9 @@ public static class PacketDecryptor
     {
         try
         {
-            // Try QUIC-specific handling first for UDP packets
-            if (data.Length > 0 && (data[0] & 0x80) != 0 || data.Length > 1000)
+            bool looksLikeQuic = (data.Length > 0 && (data[0] & 0x80) != 0) || data.Length > 1000;
+
+            if (looksLikeQuic)
             {
                 var quicResult = TryDecryptQUIC(data, key);
                 if (quicResult.Success) return quicResult;
@@ -192,22 +267,33 @@ public static class PacketDecryptor
 
     private static DecryptionResult DecryptAESGCM(byte[] data, byte[] key, byte[] iv, byte[]? associatedData)
     {
+        const int NONCE_LENGTH = 12;
+        const int TAG_LENGTH = 16;
+
         try
         {
-            // Check minimum size: nonce(12) + ciphertext(1+) + tag(16)
-            if (data.Length < 29)
+            if (data.Length < NONCE_LENGTH + 1 + TAG_LENGTH)
                 return new DecryptionResult { Success = false, ErrorMessage = "Data too short for AES-GCM" };
 
-            using var aes = new AesGcm(key, 16);
+            if (key.Length != 16 && key.Length != 32)
+                return new DecryptionResult { Success = false, ErrorMessage = "Invalid key length" };
 
-            var nonce = data[..12];
-            var ciphertext = data[12..^16];
-            var tag = data[^16..];
-            var plaintext = new byte[ciphertext.Length];
+            using var aes = new AesGcm(key, TAG_LENGTH);
+
+            byte[] nonce = new byte[NONCE_LENGTH];
+            Buffer.BlockCopy(data, 0, nonce, 0, NONCE_LENGTH);
+
+            int ciphertextLength = data.Length - NONCE_LENGTH - TAG_LENGTH;
+            byte[] ciphertext = new byte[ciphertextLength];
+            Buffer.BlockCopy(data, NONCE_LENGTH, ciphertext, 0, ciphertextLength);
+
+            byte[] tag = new byte[TAG_LENGTH];
+            Buffer.BlockCopy(data, data.Length - TAG_LENGTH, tag, 0, TAG_LENGTH);
+
+            byte[] plaintext = new byte[ciphertextLength];
 
             aes.Decrypt(nonce, ciphertext, tag, plaintext, associatedData);
 
-            // Validate it looks like valid data
             if (!IsValidDecryptedData(plaintext))
             {
                 return new DecryptionResult { Success = false, ErrorMessage = "Validation failed" };
@@ -217,7 +303,7 @@ public static class PacketDecryptor
             {
                 Success = true,
                 DecryptedData = plaintext,
-                DetectedType = EncryptionType.AES256GCM,
+                DetectedType = key.Length == 32 ? EncryptionType.AES256GCM : EncryptionType.AES128GCM,
                 Metadata =
                 {
                     ["algorithm"] = "AES-GCM",
@@ -226,39 +312,31 @@ public static class PacketDecryptor
                 }
             };
         }
-        catch
+        catch (CryptographicException)
         {
-            return new DecryptionResult { Success = false };
+            return new DecryptionResult { Success = false, ErrorMessage = "Authentication failed" };
+        }
+        catch (Exception ex)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
         }
     }
 
     private static DecryptionResult DecryptChaCha20(byte[] data, byte[] key, byte[] iv, byte[]? associatedData)
     {
-        try
+        return new DecryptionResult
         {
-            // ChaCha20-Poly1305: nonce(12) + ciphertext + tag(16)
-            if (data.Length < 29 || key.Length != 32)
-                return new DecryptionResult { Success = false, ErrorMessage = "Invalid ChaCha20 data" };
-
-            // Note: .NET 5+ doesn't have built-in ChaCha20, would need BouncyCastle
-            // For now, return failure but mark as potential ChaCha20
-            return new DecryptionResult
-            {
-                Success = false,
-                ErrorMessage = "ChaCha20 requires BouncyCastle library"
-            };
-        }
-        catch
-        {
-            return new DecryptionResult { Success = false };
-        }
+            Success = false,
+            ErrorMessage = "ChaCha20 requires BouncyCastle library"
+        };
     }
 
     private static DecryptionResult DecryptXOR(byte[] data, byte[] key)
     {
-        if (key.Length == 0) return new DecryptionResult { Success = false, ErrorMessage = "Empty XOR key" };
+        if (key == null || key.Length == 0)
+            return new DecryptionResult { Success = false, ErrorMessage = "Empty XOR key" };
 
-        var result = new byte[data.Length];
+        byte[] result = new byte[data.Length];
         for (int i = 0; i < data.Length; i++)
         {
             result[i] = (byte)(data[i] ^ key[i % key.Length]);
@@ -282,8 +360,6 @@ public static class PacketDecryptor
 
     private static DecryptionResult TryCommonKeys(byte[] data, byte[]? associatedData)
     {
-        // Try all-zero keys (debug builds sometimes use these)
-        var zeroKey16 = new byte[16];
         var zeroKey32 = new byte[32];
 
         var result = TryDecryptWithKey(data, new EncryptionKey
@@ -296,7 +372,6 @@ public static class PacketDecryptor
 
         if (result.Success) return result;
 
-        // Try common debug keys
         var debugKeys = new[]
         {
             "HYTALE_DEBUG_KEY_32_BYTES_LONG!!",
@@ -330,41 +405,79 @@ public static class PacketDecryptor
         return new DecryptionResult { Success = false };
     }
 
-    // NEW: Validate decrypted data looks like valid protocol data
     private static bool IsValidDecryptedData(byte[] data)
     {
         if (data.Length < 2) return false;
 
-        // Check for reasonable entropy (not too random, not too structured)
         double entropy = CalculateEntropy(data);
-        if (entropy > 7.9) return false; // Still looks encrypted
+        if (entropy > 7.9) return false;
 
-        // Look for common QUIC/Hytale frame types
         byte firstByte = data[0];
 
-        // Valid QUIC short header frame types
-        bool hasValidFrame = firstByte <= 0x20 || // Common frames
-                            (firstByte >= 0x40 && firstByte <= 0x7F) || // ACK frames
-                            (firstByte >= 0x80 && firstByte <= 0xBF); // Stream frames
+        bool hasValidFrame = firstByte <= 0x20 ||
+                            (firstByte >= 0x40 && firstByte <= 0x7F) ||
+                            (firstByte >= 0x80 && firstByte <= 0xBF);
 
-        // Or check for printable strings (protocol often contains strings)
         bool hasStrings = ContainsPrintableStrings(data, 4);
-
-        // Or reasonable structure (not all zeros, not all same byte)
         bool hasStructure = data.Any(b => b != 0) && data.Distinct().Count() > 4;
 
         return hasValidFrame || hasStrings || (entropy < 6.0 && hasStructure);
     }
 
+    // FIXED: Smart deduplication and limits
     public static void AddKey(EncryptionKey key)
     {
-        if (key.Key == null || key.Key.Length == 0) return;
+        if (key?.Key == null || key.Key.Length == 0) return;
 
-        // Check for duplicates
-        if (!DiscoveredKeys.Any(k => k.Key.SequenceEqual(key.Key)))
+        _keysLock.EnterWriteLock();
+        try
         {
-            DiscoveredKeys.Add(key);
-            OnKeyDiscovered?.Invoke(key);
+            // Check for exact duplicate
+            foreach (var existing in _discoveredKeys)
+            {
+                if (existing.Key.SequenceEqual(key.Key))
+                {
+                    // Update source if new info
+                    if (!existing.Source.Contains(key.Source))
+                    {
+                        existing.Source += $", {key.Source}";
+                    }
+                    return; // Don't add duplicate
+                }
+            }
+
+            // Check per-source limit
+            var sourceCount = _discoveredKeys.Count(k => k.Source.StartsWith(key.Source.Split(':')[0]));
+            if (sourceCount >= MAX_KEYS_PER_SOURCE)
+            {
+                // Remove oldest from this source
+                var oldest = _discoveredKeys
+                    .Where(k => k.Source.StartsWith(key.Source.Split(':')[0]))
+                    .OrderBy(k => k.DiscoveredAt)
+                    .First();
+                _discoveredKeys.Remove(oldest);
+            }
+
+            // Check global limit
+            if (_discoveredKeys.Count >= MAX_KEYS)
+            {
+                // Remove least used key
+                var leastUsed = _discoveredKeys.OrderBy(k => k.UseCount).ThenBy(k => k.DiscoveredAt).First();
+                _discoveredKeys.Remove(leastUsed);
+            }
+
+            _discoveredKeys.Add(key);
+
+            // Invoke outside lock
+            var handler = OnKeyDiscovered;
+            _keysLock.ExitWriteLock();
+            handler?.Invoke(key);
+            return;
+        }
+        finally
+        {
+            if (_keysLock.IsWriteLockHeld)
+                _keysLock.ExitWriteLock();
         }
     }
 
@@ -380,20 +493,11 @@ public static class PacketDecryptor
         });
     }
 
-    // AUTO-EXTRACTION: Scan for TLS secrets in memory
     public static void AutoExtractKeysFromMemory(IntPtr processHandle)
     {
         if (!AutoExtractFromMemory) return;
-
-        try
-        {
-            // This is called from MemoryTab - actual scanning happens there
-            // This method is for external triggers
-        }
-        catch { }
     }
 
-    // AUTO-EXTRACTION: Load from SSLKEYLOGFILE
     public static void AutoExtractFromSSLLogFile(string path)
     {
         if (!AutoExtractFromSSLLog || !File.Exists(path)) return;
@@ -403,7 +507,6 @@ public static class PacketDecryptor
             var lines = File.ReadAllLines(path);
             foreach (var line in lines)
             {
-                // Parse: CLIENT_TRAFFIC_SECRET_0 <client_random> <secret_hex>
                 var parts = line.Split(' ');
                 if (parts.Length >= 3 &&
                     (parts[0].Contains("TRAFFIC_SECRET") || parts[0].Contains("HANDSHAKE_TRAFFIC_SECRET")))
@@ -422,7 +525,7 @@ public static class PacketDecryptor
                             });
                         }
                     }
-                    catch (FormatException) { /* Invalid hex */ }
+                    catch (FormatException) { }
                 }
             }
         }
@@ -431,9 +534,17 @@ public static class PacketDecryptor
 
     public static void ClearKeys()
     {
-        DiscoveredKeys.Clear();
-        SuccessfulDecryptions = 0;
-        FailedDecryptions = 0;
+        _keysLock.EnterWriteLock();
+        try
+        {
+            _discoveredKeys.Clear();
+            Interlocked.Exchange(ref _successfulDecryptions, 0);
+            Interlocked.Exchange(ref _failedDecryptions, 0);
+        }
+        finally
+        {
+            _keysLock.ExitWriteLock();
+        }
     }
 
     public static EncryptionType DetectEncryptionType(byte[] packetData)
@@ -441,19 +552,17 @@ public static class PacketDecryptor
         if (packetData == null || packetData.Length < 4)
             return EncryptionType.None;
 
-        // Check for QUIC long header (0x80-0xFF first byte)
         if ((packetData[0] & 0x80) != 0)
         {
-            return EncryptionType.AES256GCM; // QUIC uses AES-GCM or ChaCha20
+            return EncryptionType.AES256GCM;
         }
 
-        // High entropy check
         double entropy = CalculateEntropy(packetData);
         if (entropy > 7.8)
             return EncryptionType.AES256GCM;
 
         if (entropy > 6.5)
-            return EncryptionType.XOR; // Weak obfuscation
+            return EncryptionType.XOR;
 
         return EncryptionType.None;
     }
@@ -467,7 +576,7 @@ public static class PacketDecryptor
 
     private static double CalculateEntropy(byte[] data)
     {
-        if (data.Length == 0) return 0;
+        if (data == null || data.Length == 0) return 0;
 
         var freq = new int[256];
         foreach (var b in data) freq[b]++;
@@ -484,6 +593,8 @@ public static class PacketDecryptor
 
     private static bool ContainsPrintableStrings(byte[] data, int minLength = 4)
     {
+        if (data == null) return false;
+
         int currentLength = 0;
         foreach (var b in data)
         {
@@ -502,6 +613,15 @@ public static class PacketDecryptor
 
     public static string GetStats()
     {
-        return $"Keys: {DiscoveredKeys.Count}, Success: {SuccessfulDecryptions}, Failed: {FailedDecryptions}";
+        int keys, success, failed;
+
+        _keysLock.EnterReadLock();
+        try { keys = _discoveredKeys.Count; }
+        finally { _keysLock.ExitReadLock(); }
+
+        success = SuccessfulDecryptions;
+        failed = FailedDecryptions;
+
+        return $"Keys: {keys}, Success: {success}, Failed: {failed}";
     }
 }

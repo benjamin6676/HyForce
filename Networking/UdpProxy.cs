@@ -1,4 +1,5 @@
-﻿using HyForce.Core;
+﻿// FILE: Networking/UdpProxy.cs - FIXED: Proper disposal pattern
+using HyForce.Core;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -16,7 +17,7 @@ public class UdpProxy : IDisposable
     public int ServerPort { get; private set; }
     public int ListenPort { get; private set; }
 
-    public event PacketReceivedHandler? OnPacket;  // CHANGED from PacketHandler
+    public event PacketReceivedHandler? OnPacket;
 
     private readonly Data.TestLog _log;
     private UdpClient? _listener;
@@ -50,7 +51,7 @@ public class UdpProxy : IDisposable
             ServerPort = serverPort;
             ListenPort = listenPort;
             IsRunning = true;
-            StatusMessage = $"Listening 0.0.0.0:{listenPort} ? {serverIp}:{serverPort}";
+            StatusMessage = $"Listening 0.0.0.0:{listenPort} -> {serverIp}:{serverPort}";
 
             _log.Info($"[UDP] Started on 0.0.0.0:{listenPort}", "UDP");
             _log.Info($"[UDP] QUIC-aware with CID translation", "UDP");
@@ -73,9 +74,10 @@ public class UdpProxy : IDisposable
         _listener?.Close();
         _listener = null;
 
+        // FIXED: Proper disposal of sessions
         foreach (var session in _sessions.Values)
         {
-            session.ServerSocket.Close();
+            session.Dispose();
         }
         _sessions.Clear();
 
@@ -201,7 +203,7 @@ public class UdpProxy : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    _log.Error($"[UDP] S?C error: {ex.Message}", "UDP");
+                    _log.Error($"[UDP] S->C error: {ex.Message}", "UDP");
                 }
             }
         }
@@ -263,7 +265,8 @@ public class UdpProxy : IDisposable
     public void Dispose() => Stop();
 }
 
-public class QuicSession
+// FIXED: Implement IDisposable properly
+public class QuicSession : IDisposable
 {
     public IPEndPoint ClientEndpoint { get; }
     public UdpClient ServerSocket { get; }
@@ -273,6 +276,8 @@ public class QuicSession
 
     public Dictionary<byte[], byte[]> ClientToServerCidMap { get; } = new();
     public Dictionary<byte[], byte[]> ServerToClientCidMap { get; } = new();
+
+    private bool _disposed;
 
     public QuicSession(IPEndPoint clientEp, UdpClient serverSocket, byte[] serverCid, byte[] clientCid)
     {
@@ -284,5 +289,19 @@ public class QuicSession
 
         ClientToServerCidMap[clientCid] = serverCid;
         ServerToClientCidMap[serverCid] = clientCid;
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            try
+            {
+                ServerSocket?.Close();
+                ServerSocket?.Dispose();
+            }
+            catch { }
+            _disposed = true;
+        }
     }
 }

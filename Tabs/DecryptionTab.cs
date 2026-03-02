@@ -1,4 +1,5 @@
-﻿using HyForce.Core;
+﻿// FILE: Tabs/DecryptionTab.cs - FIXED: UI freezing with many keys
+using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
@@ -13,22 +14,24 @@ public class DecryptionTab : ITab
 
     private readonly AppState _state;
     private string _manualKey = "";
-    private int _selectedKeyType = 1; // Default to AES-256
+    private int _selectedKeyType = 1;
     private string _testData = "";
     private bool _autoDecrypt = true;
 
-    // NEW: UI state
     private int _selectedKeyIndex = -1;
     private bool _showKeyDetails = false;
     private float _lastRefreshTime = 0;
     private string _statusMessage = "";
     private float _statusTime = 0;
 
+    // FIXED: Cache key list to prevent constant re-allocation
+    private List<PacketDecryptor.EncryptionKey> _cachedKeys = new();
+    private DateTime _lastKeyCacheTime = DateTime.MinValue;
+    private const int MAX_UI_KEYS = 20; // Only show top 20 in UI
+
     public DecryptionTab(AppState state)
     {
         _state = state;
-
-        // Subscribe to key updates
         _state.OnKeysUpdated += OnKeysUpdated;
     }
 
@@ -36,6 +39,21 @@ public class DecryptionTab : ITab
     {
         _statusMessage = "Keys updated!";
         _statusTime = (float)ImGui.GetTime();
+        _lastKeyCacheTime = DateTime.MinValue; // Invalidate cache
+    }
+
+    private void UpdateKeyCache()
+    {
+        // Refresh cache every 2 seconds max
+        if (DateTime.Now - _lastKeyCacheTime > TimeSpan.FromSeconds(2))
+        {
+            _cachedKeys = PacketDecryptor.DiscoveredKeys
+                .OrderByDescending(k => k.UseCount)
+                .ThenByDescending(k => k.DiscoveredAt)
+                .Take(MAX_UI_KEYS * 2) // Get more than we show
+                .ToList();
+            _lastKeyCacheTime = DateTime.Now;
+        }
     }
 
     public void Render()
@@ -83,11 +101,10 @@ public class DecryptionTab : ITab
 
         ImGui.BeginGroup();
 
-        // Status indicator with icon
+        // Draw status circle
         var drawList = ImGui.GetWindowDrawList();
         var pos = ImGui.GetCursorScreenPos();
 
-        // Draw status circle
         drawList.AddCircleFilled(pos + new Vector2(10, 12), 8,
             ImGui.ColorConvertFloat4ToU32(color));
         ImGui.Dummy(new Vector2(25, 24));
@@ -114,13 +131,14 @@ public class DecryptionTab : ITab
 
         ImGui.EndGroup();
 
-        // Refresh button - aligned right
+        // Refresh button
         ImGui.SameLine(ImGui.GetContentRegionAvail().X - 120);
 
         ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.6f, 0.9f, 1f));
         if (ImGui.Button("Refresh Keys", new Vector2(110, 28)))
         {
             _state.RefreshAllKeys();
+            _lastKeyCacheTime = DateTime.MinValue;
         }
         ImGui.PopStyleColor();
 
@@ -159,18 +177,22 @@ public class DecryptionTab : ITab
         {
             PacketDecryptor.ClearKeys();
             _state.AddInGameLog("[DECRYPTION] All keys cleared");
+            _lastKeyCacheTime = DateTime.MinValue;
         }
 
         ImGui.Spacing();
         ImGui.Separator();
 
-        // Enhanced key list with details
-        ImGui.TextColored(Theme.ColAccent, $"Discovered Keys ({PacketDecryptor.DiscoveredKeys.Count})");
+        // FIXED: Use cached keys with limit
+        UpdateKeyCache();
+
+        int totalKeys = PacketDecryptor.DiscoveredKeys.Count;
+        ImGui.TextColored(Theme.ColAccent, $"Discovered Keys (showing {_cachedKeys.Count} of {totalKeys})");
 
         ImGui.BeginChild("##key_list", new Vector2(0, 200), ImGuiChildFlags.Borders);
 
         int index = 0;
-        foreach (var key in PacketDecryptor.DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt))
+        foreach (var key in _cachedKeys)
         {
             ImGui.PushID(index++);
 
@@ -179,14 +201,14 @@ public class DecryptionTab : ITab
             // Key header with type and time
             var timeAgo = DateTime.Now - key.DiscoveredAt;
             string timeStr = timeAgo.TotalMinutes < 1 ? "now" : $"{timeAgo.TotalMinutes:F0}m";
+            string useStr = key.UseCount > 0 ? $" (used {key.UseCount}x)" : "";
 
             ImGui.BeginGroup();
 
-            // Selection highlight
             if (isSelected)
                 ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColAccent);
 
-            ImGui.Text($"{key.Type} [{timeStr}]");
+            ImGui.Text($"{key.Type} [{timeStr}]{useStr}");
 
             if (isSelected)
                 ImGui.PopStyleColor();
@@ -232,7 +254,7 @@ public class DecryptionTab : ITab
             ImGui.PopID();
         }
 
-        if (PacketDecryptor.DiscoveredKeys.Count == 0)
+        if (_cachedKeys.Count == 0)
         {
             ImGui.TextColored(Theme.ColTextMuted, "No keys discovered yet");
             ImGui.Spacing();
@@ -242,12 +264,18 @@ public class DecryptionTab : ITab
             ImGui.BulletText("Manually entered above");
         }
 
+        // Show message if there are more keys
+        if (totalKeys > _cachedKeys.Count)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, $"... and {totalKeys - _cachedKeys.Count} more keys");
+        }
+
         ImGui.EndChild();
 
         // Key details panel if selected
-        if (_selectedKeyIndex >= 0 && _selectedKeyIndex < PacketDecryptor.DiscoveredKeys.Count)
+        if (_selectedKeyIndex >= 0 && _selectedKeyIndex < _cachedKeys.Count)
         {
-            var selectedKey = PacketDecryptor.DiscoveredKeys.OrderByDescending(k => k.DiscoveredAt).ElementAt(_selectedKeyIndex);
+            var selectedKey = _cachedKeys[_selectedKeyIndex];
             RenderKeyDetails(selectedKey);
         }
     }
@@ -272,6 +300,7 @@ public class DecryptionTab : ITab
         ImGui.Text($"Size: {key.Key.Length * 8} bits ({key.Key.Length} bytes)");
         ImGui.Text($"Source: {key.Source}");
         ImGui.Text($"Discovered: {key.DiscoveredAt:HH:mm:ss}");
+        ImGui.Text($"Use Count: {key.UseCount}");
 
         if (key.MemoryAddress.HasValue)
         {
@@ -334,6 +363,7 @@ public class DecryptionTab : ITab
 
         if (ImGui.Button("Clear Stats", new Vector2(100, 28)))
         {
+            // Note: Would need to add a method to reset stats
             _state.AddInGameLog("[DECRYPTION] Stats reset not implemented yet");
         }
 
@@ -430,6 +460,7 @@ public class DecryptionTab : ITab
             PacketDecryptor.AddKey(key);
             _state.AddInGameLog($"[DECRYPTION] Added manual {key.Type} key ({keyBytes.Length} bytes)");
             _manualKey = "";
+            _lastKeyCacheTime = DateTime.MinValue;
         }
         catch (Exception ex)
         {
@@ -450,10 +481,10 @@ public class DecryptionTab : ITab
 
                 // Show preview
                 string preview = Encoding.UTF8.GetString(result.DecryptedData.Take(100).ToArray());
-                preview = new string(preview.Where(c => !char.IsControl(c)).ToArray()); // Remove control chars
+                preview = new string(preview.Where(c => !char.IsControl(c)).ToArray());
                 _state.AddInGameLog($"  Preview: {preview}");
 
-                // Show entropy of decrypted data
+                // Show entropy
                 double entropy = CalculateEntropy(result.DecryptedData);
                 _state.AddInGameLog($"  Entropy: {entropy:F2} (lower = more structured)");
             }
@@ -524,4 +555,3 @@ public class DecryptionTab : ITab
         try { TextCopy.ClipboardService.SetText(text); } catch { }
     }
 }
-

@@ -1,8 +1,9 @@
-﻿
+﻿// FILE: Core/AppState.cs - FIXED: File locking issues with SSL key log
 using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
 using System.Collections.Concurrent;
+using System.IO;
 
 namespace HyForce.Core;
 
@@ -34,7 +35,7 @@ public class AppState : IDisposable
     public List<string> InGameLog { get; } = new();
     public const int MaxInGameLogLines = 1000;
 
-    public string ExportDirectory { get; set; } = @"C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs";
+    public string ExportDirectory { get; set; } = @"C:\Users\benja\source\repos\HyForce\Exported logs";
 
     public event PacketReceivedHandler? OnPacketReceived;
     public event Action? OnSecurityEvent;
@@ -50,6 +51,10 @@ public class AppState : IDisposable
     private FileSystemWatcher? _sslKeyWatcher;
     private DateTime _lastKeyLoadTime = DateTime.MinValue;
     private readonly object _keyLoadLock = new();
+
+    // FIXED: Retry queue for locked files
+    private readonly Queue<string> _pendingKeyFiles = new();
+    private readonly System.Timers.Timer _retryTimer;
 
     public AppState()
     {
@@ -68,6 +73,12 @@ public class AppState : IDisposable
 
         // NEW: Immediate scan for existing keys
         ScanAndLoadExistingKeys();
+
+        // FIXED: Setup retry timer for locked files
+        _retryTimer = new System.Timers.Timer(2000);
+        _retryTimer.Elapsed += (s, e) => ProcessPendingKeyFiles();
+        _retryTimer.AutoReset = true;
+        _retryTimer.Start();
     }
 
     private void SetupSSLKeyWatcher()
@@ -87,7 +98,7 @@ public class AppState : IDisposable
             _sslKeyWatcher.Created += (s, e) =>
             {
                 AddInGameLog($"[KEYS] New key file detected: {Path.GetFileName(e.FullPath)}");
-                TryLoadKeysFromFile(e.FullPath);
+                QueueKeyFileLoad(e.FullPath);
             };
 
             _sslKeyWatcher.Changed += (s, e) =>
@@ -98,7 +109,7 @@ public class AppState : IDisposable
                     if ((DateTime.Now - _lastKeyLoadTime).TotalSeconds > 2)
                     {
                         AddInGameLog($"[KEYS] Key file updated: {Path.GetFileName(e.FullPath)}");
-                        TryLoadKeysFromFile(e.FullPath);
+                        QueueKeyFileLoad(e.FullPath);
                         _lastKeyLoadTime = DateTime.Now;
                     }
                 }
@@ -133,7 +144,7 @@ public class AppState : IDisposable
                 // Load the most recent one first
                 foreach (var file in keyFiles.Take(3))
                 {
-                    TryLoadKeysFromFile(file);
+                    QueueKeyFileLoad(file);
                 }
             }
             else
@@ -144,6 +155,57 @@ public class AppState : IDisposable
         catch (Exception ex)
         {
             Log.Warn($"[KEYS] Scan failed: {ex.Message}", "System");
+        }
+    }
+
+    // FIXED: Queue file for loading with retry
+    private void QueueKeyFileLoad(string path)
+    {
+        lock (_pendingKeyFiles)
+        {
+            if (!_pendingKeyFiles.Contains(path))
+            {
+                _pendingKeyFiles.Enqueue(path);
+            }
+        }
+    }
+
+    // FIXED: Process queued files with retry logic
+    private void ProcessPendingKeyFiles()
+    {
+        lock (_pendingKeyFiles)
+        {
+            int count = _pendingKeyFiles.Count;
+            for (int i = 0; i < count; i++)
+            {
+                if (_pendingKeyFiles.Count == 0) break;
+
+                string path = _pendingKeyFiles.Dequeue();
+
+                // Try to load, if fails re-queue
+                if (!TryLoadKeysFromFileInternal(path))
+                {
+                    // Re-queue for retry (max 5 attempts)
+                    if (!path.Contains("|retry5"))
+                    {
+                        int retryCount = 0;
+                        if (path.Contains("|retry"))
+                        {
+                            int.TryParse(path.Split("|retry")[1], out retryCount);
+                        }
+
+                        if (retryCount < 5)
+                        {
+                            string retryPath = path.Split("|retry")[0] + $"|retry{retryCount + 1}";
+                            _pendingKeyFiles.Enqueue(retryPath);
+                        }
+                        else
+                        {
+                            AddInGameLog($"[KEYS] Gave up on {Path.GetFileName(path)} after 5 attempts");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -244,7 +306,7 @@ public class AppState : IDisposable
             foreach (var log in existingLogs)
             {
                 AddInGameLog($"[AUTO-DECRYPT] Found existing key log: {Path.GetFileName(log)}");
-                TryLoadKeysFromFile(log);
+                QueueKeyFileLoad(log);
             }
         }
         catch (Exception ex)
@@ -253,52 +315,67 @@ public class AppState : IDisposable
         }
     }
 
+    // FIXED: Public method uses queue
     public void TryLoadKeysFromFile(string path)
     {
+        QueueKeyFileLoad(path);
+    }
+
+    // FIXED: Internal method with proper file sharing
+    private bool TryLoadKeysFromFileInternal(string path)
+    {
+        // Strip retry marker for actual path
+        string actualPath = path.Split("|retry")[0];
+
         try
         {
-            if (!File.Exists(path)) return;
+            if (!File.Exists(actualPath)) return true; // Done, file gone
 
-            var lines = File.ReadAllLines(path);
             int keysAdded = 0;
             int linesProcessed = 0;
 
-            foreach (var line in lines)
+            // FIXED: Use FileStream with FileShare.ReadWrite to allow concurrent access
+            using (var fs = new FileStream(actualPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(fs))
             {
-                linesProcessed++;
-
-                // Parse SSLKEYLOGFILE format
-                if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
-                    line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
-                    line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
-                    line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
-                    line.StartsWith("EXPORTER_SECRET"))
+                string? line;
+                while ((line = reader.ReadLine()) != null)
                 {
-                    var parts = line.Split(' ');
-                    if (parts.Length >= 3)
-                    {
-                        try
-                        {
-                            var secret = Convert.FromHexString(parts[2]);
-                            if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
-                            {
-                                var key = new PacketDecryptor.EncryptionKey
-                                {
-                                    Key = secret,
-                                    IV = new byte[12],
-                                    Type = secret.Length == 32 ?
-                                        PacketDecryptor.EncryptionType.AES256GCM :
-                                        PacketDecryptor.EncryptionType.ChaCha20Poly1305,
-                                    Source = $"{Path.GetFileName(path)}:{linesProcessed}"
-                                };
+                    linesProcessed++;
 
-                                PacketDecryptor.AddKey(key);
-                                keysAdded++;
-                            }
-                        }
-                        catch (FormatException)
+                    // Parse SSLKEYLOGFILE format
+                    if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
+                        line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
+                        line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
+                        line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
+                        line.StartsWith("EXPORTER_SECRET"))
+                    {
+                        var parts = line.Split(' ');
+                        if (parts.Length >= 3)
                         {
-                            // Invalid hex, skip
+                            try
+                            {
+                                var secret = Convert.FromHexString(parts[2]);
+                                if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
+                                {
+                                    var key = new PacketDecryptor.EncryptionKey
+                                    {
+                                        Key = secret,
+                                        IV = new byte[12],
+                                        Type = secret.Length == 32 ?
+                                            PacketDecryptor.EncryptionType.AES256GCM :
+                                            PacketDecryptor.EncryptionType.ChaCha20Poly1305,
+                                        Source = $"{Path.GetFileName(actualPath)}:{linesProcessed}"
+                                    };
+
+                                    PacketDecryptor.AddKey(key);
+                                    keysAdded++;
+                                }
+                            }
+                            catch (FormatException)
+                            {
+                                // Invalid hex, skip
+                            }
                         }
                     }
                 }
@@ -306,19 +383,34 @@ public class AppState : IDisposable
 
             if (keysAdded > 0)
             {
-                AddInGameLog($"[KEYS] Loaded {keysAdded} keys from {Path.GetFileName(path)}");
-                Log.Success($"Loaded {keysAdded} keys from {Path.GetFileName(path)}", "Keys");
+                AddInGameLog($"[KEYS] Loaded {keysAdded} keys from {Path.GetFileName(actualPath)}");
+                Log.Success($"Loaded {keysAdded} keys from {Path.GetFileName(actualPath)}", "Keys");
                 OnKeysUpdated?.Invoke(); // Notify UI
+                return true; // Success
             }
             else if (linesProcessed > 0)
             {
-                AddInGameLog($"[KEYS] No valid keys found in {Path.GetFileName(path)} ({linesProcessed} lines)");
+                AddInGameLog($"[KEYS] No valid keys found in {Path.GetFileName(actualPath)} ({linesProcessed} lines)");
+                return true; // Success, just no keys
             }
+            return true; // Empty file
+        }
+        catch (IOException ex) when (IsFileLocked(ex))
+        {
+            // File is locked, will retry
+            return false;
         }
         catch (Exception ex)
         {
             AddInGameLog($"[KEYS] Failed to load keys: {ex.Message}");
+            return true; // Don't retry on other errors
         }
+    }
+
+    private static bool IsFileLocked(IOException exception)
+    {
+        int errorCode = exception.HResult & 0xFFFF;
+        return errorCode == 32 || errorCode == 33; // ERROR_SHARING_VIOLATION or ERROR_LOCK_VIOLATION
     }
 
     // NEW: Force refresh of all key files
@@ -720,6 +812,7 @@ public class AppState : IDisposable
         UdpProxy.OnPacket -= HandlePacket;
         _autoDecryptTimer?.Dispose();
         _sslKeyWatcher?.Dispose();
+        _retryTimer?.Dispose();
     }
 }
 
@@ -732,4 +825,3 @@ public class KeyStatus
     public List<string> KeySources { get; set; } = new();
     public DateTime? LastKeyAdded { get; set; }
 }
-

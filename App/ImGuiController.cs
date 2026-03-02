@@ -1,4 +1,4 @@
-﻿// FILE: App/ImGuiController.cs
+﻿// FILE: App/ImGuiController.cs - FIXED: Memory leak in clipboard callbacks
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Veldrid;
@@ -26,10 +26,10 @@ public class ImGuiController : IDisposable
 
     // Static clipboard buffer for callbacks
     private static string _clipboardBuffer = "";
+    private static IntPtr _clipboardPtr = IntPtr.Zero;
+    private static readonly object _clipboardLock = new();
 
     // Use standard delegate types that match ImGui's expected signatures
-    // SetClipboardTextFn: void(void* user_data, const char* text)
-    // GetClipboardTextFn: const char*(void* user_data)
     private delegate void SetClipboardTextDelegate(IntPtr userData, IntPtr text);
     private delegate IntPtr GetClipboardTextDelegate(IntPtr userData);
 
@@ -59,7 +59,6 @@ public class ImGuiController : IDisposable
         _getClipboardDelegate = new GetClipboardTextDelegate(GetClipboardTextCallback);
 
         // Assign to function pointers in PlatformIO
-        // In ImGui.NET 1.91+, these are IntPtr fields that point to native function pointers
         platformIO.Platform_SetClipboardTextFn = Marshal.GetFunctionPointerForDelegate(_setClipboardDelegate);
         platformIO.Platform_GetClipboardTextFn = Marshal.GetFunctionPointerForDelegate(_getClipboardDelegate);
 
@@ -96,11 +95,20 @@ public class ImGuiController : IDisposable
         if (string.IsNullOrEmpty(_clipboardBuffer))
             return IntPtr.Zero;
 
-        // Allocate unmanaged memory - this will leak but ImGui expects it to persist
-        var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
-        var ptr = Marshal.AllocHGlobal(bytes.Length);
-        Marshal.Copy(bytes, 0, ptr, bytes.Length);
-        return ptr;
+        lock (_clipboardLock)
+        {
+            // Free previous allocation to prevent memory leak
+            if (_clipboardPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_clipboardPtr);
+                _clipboardPtr = IntPtr.Zero;
+            }
+
+            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
+            _clipboardPtr = Marshal.AllocHGlobal(bytes.Length);
+            Marshal.Copy(bytes, 0, _clipboardPtr, bytes.Length);
+            return _clipboardPtr;
+        }
     }
 
     public void WindowResized(int width, int height)
@@ -481,6 +489,16 @@ void main()
 
     public void Dispose()
     {
+        // CRITICAL: Free clipboard memory to prevent leak
+        lock (_clipboardLock)
+        {
+            if (_clipboardPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_clipboardPtr);
+                _clipboardPtr = IntPtr.Zero;
+            }
+        }
+
         _vertexBuffer?.Dispose();
         _indexBuffer?.Dispose();
         _projMatrixBuffer?.Dispose();
