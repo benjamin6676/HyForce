@@ -20,6 +20,12 @@ public class MemoryTab : ITab
     private bool _isAttached = false;
     private string _processName = "Hytale";
 
+    // SSL keylog state
+    private bool _sslKeyLogEnabled = false;
+    private string _sslKeyLogPath = "";
+    private DateTime _sslKeyLogLastCheck = DateTime.MinValue;
+    private int _sslKeyLogKeyCount = 0;
+
     // Scanning state
     private string _scanValue = "";
     private string _scanPattern = "";
@@ -169,9 +175,60 @@ public class MemoryTab : ITab
             ImGui.Checkbox("Auto", ref _autoRefresh);
 
             ImGui.SameLine();
-            if (ImGui.Button("Enable SSL Keylog", new Vector2(130, 28)))
+
+            if (!_isAttached)
             {
-                TryHookSSLKeyLog();
+                // Not attached - show disabled button or hint
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.3f, 0.3f, 0.3f, 1f));
+                if (ImGui.Button("Enable SSL Keylog", new Vector2(130, 28)))
+                {
+                    _state.AddInGameLog("[KEYS] Attach to process first!");
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Attach to Hytale first, then click this");
+                ImGui.PopStyleColor();
+            }
+            else
+            {
+                // Attached - show status
+                CheckSSLKeyLogFile(); // Auto-check
+
+                if (_sslKeyLogKeyCount > 0)
+                {
+                    // Keys found! Show green success button
+                    ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.8f, 0.3f, 1f));
+                    if (ImGui.Button($"Keys: {_sslKeyLogKeyCount}", new Vector2(130, 28)))
+                    {
+                        CheckSSLKeyLogFile(); // Refresh
+                    }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Click to refresh keys from sslkeys.log");
+                    ImGui.PopStyleColor();
+                }
+                else if (_sslKeyLogEnabled)
+                {
+                    // Enabled but no keys yet - show yellow waiting button
+                    ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.9f, 0.7f, 0.2f, 1f));
+                    if (ImGui.Button("Waiting...", new Vector2(130, 28)))
+                    {
+                        CheckSSLKeyLogFile(); // Manual check
+                    }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("SSL keylog enabled. Restart Hytale if no keys appear!");
+                    ImGui.PopStyleColor();
+                }
+                else
+                {
+                    // Not enabled yet - show normal blue button
+                    ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.5f, 0.9f, 1f));
+                    if (ImGui.Button("Enable SSL Keylog", new Vector2(130, 28)))
+                    {
+                        TryHookSSLKeyLog();
+                    }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("Sets SSLKEYLOGFILE env var to capture TLS keys");
+                    ImGui.PopStyleColor();
+                }
             }
         }
     }
@@ -793,24 +850,48 @@ public class MemoryTab : ITab
         }
     }
 
-    // Add this method to MemoryTab class
+
     private void TryHookSSLKeyLog()
     {
-        _state.AddInGameLog("[KEYS] Trying to enable SSL key logging...");
+        _sslKeyLogPath = Path.Combine(_state.ExportDirectory, "sslkeys.log");
 
-        // Set environment variable BEFORE Hytale starts
-        string keyLogPath = Path.Combine(_state.ExportDirectory, "sslkeys.log");
-        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath);
+        // Set environment variable
+        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", _sslKeyLogPath);
+        _sslKeyLogEnabled = true;
 
-        _state.AddInGameLog($"[KEYS] SSLKEYLOGFILE set to: {keyLogPath}");
-        _state.AddInGameLog("[KEYS] RESTART Hytale for this to take effect!");
+        _state.AddInGameLog($"[KEYS] SSLKEYLOGFILE set to: {_sslKeyLogPath}");
 
-        // Also check if file already exists
-        if (File.Exists(keyLogPath))
+        // Check if file exists and load keys
+        CheckSSLKeyLogFile();
+
+        if (_sslKeyLogKeyCount == 0)
         {
-            _state.AddInGameLog($"[KEYS] Found existing keylog file!");
-            _state.TryLoadKeysFromFile(keyLogPath);
+            _state.AddInGameLog("[KEYS] No keys found yet. RESTART Hytale with proxy running!");
         }
+    }
+
+    // Check for keys in the file
+    private void CheckSSLKeyLogFile()
+    {
+        try
+        {
+            if (File.Exists(_sslKeyLogPath))
+            {
+                var lines = File.ReadAllLines(_sslKeyLogPath);
+                var keyLines = lines.Where(l =>
+                    l.Contains("CLIENT_TRAFFIC_SECRET") ||
+                    l.Contains("SERVER_TRAFFIC_SECRET")).ToList();
+
+                _sslKeyLogKeyCount = keyLines.Count;
+
+                if (_sslKeyLogKeyCount > 0)
+                {
+                    _state.AddInGameLog($"[KEYS] Found {_sslKeyLogKeyCount} keys in sslkeys.log!");
+                    _state.TryLoadKeysFromFile(_sslKeyLogPath);
+                }
+            }
+        }
+        catch { }
     }
 
     private void DoTLSScan(CancellationToken token)
