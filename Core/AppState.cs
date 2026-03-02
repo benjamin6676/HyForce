@@ -209,41 +209,49 @@ public class AppState : IDisposable
         }
     }
 
+    // In Core/AppState.cs - Replace SetupAutoDecryption with this:
+
     private void SetupAutoDecryption()
     {
-        _autoDecryptTimer = new System.Timers.Timer(5000);
+        // FIXED: Disabled by default - user must enable manually
+        _autoDecryptTimer = new System.Timers.Timer(10000); // 10 seconds instead of 5
         _autoDecryptTimer.Elapsed += (s, e) =>
         {
-            TryAutoDecryptPackets();
+            // Only decrypt if enabled and not throttled
+            if (PacketDecryptor.AutoDecryptEnabled)
+            {
+                TryAutoDecryptPackets();
+            }
         };
         _autoDecryptTimer.AutoReset = true;
     }
 
     private void TryAutoDecryptPackets()
     {
+        if (!PacketDecryptor.AutoDecryptEnabled) return;
         if (PacketDecryptor.DiscoveredKeys.Count == 0) return;
 
-        var recentPackets = PacketLog.GetLast(100);
+        // Only try last 10 packets, max 1 per second
+        var recentPackets = PacketLog.GetLast(10);
         int decrypted = 0;
 
         foreach (var pkt in recentPackets)
         {
-            if (pkt.EncryptionHint == "encrypted" && pkt.RawBytes.Length > 16)
+            if (pkt.EncryptionHint == "encrypted" && pkt.RawBytes.Length > 100)
             {
                 var result = PacketDecryptor.TryDecrypt(pkt.RawBytes);
-                if (result.Success)
-                {
-                    decrypted++;
-                }
+                if (result.Success) decrypted++;
             }
         }
 
         if (decrypted > 0)
         {
-            AddInGameLog($"[AUTO-DECRYPT] Decrypted {decrypted} packets automatically");
-            OnKeysUpdated?.Invoke(); // Notify UI of potential changes
+            AddInGameLog($"[AUTO-DECRYPT] Decrypted {decrypted} packets");
+            OnKeysUpdated?.Invoke();
         }
     }
+
+
 
     public void AddInGameLog(string message)
     {
@@ -322,6 +330,9 @@ public class AppState : IDisposable
     }
 
     // FIXED: Internal method with proper file sharing
+    // In Core/AppState.cs - Replace the existing TryLoadKeysFromFileInternal method with this:
+
+    // FIXED: Internal method with proper QUIC key derivation
     private bool TryLoadKeysFromFileInternal(string path)
     {
         // Strip retry marker for actual path
@@ -343,54 +354,31 @@ public class AppState : IDisposable
                 {
                     linesProcessed++;
 
-                    // Parse SSLKEYLOGFILE format
+                    // Parse SSLKEYLOGFILE format and derive QUIC keys
                     if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
                         line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
                         line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
                         line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
                         line.StartsWith("EXPORTER_SECRET"))
                     {
-                        var parts = line.Split(' ');
-                        if (parts.Length >= 3)
-                        {
-                            try
-                            {
-                                var secret = Convert.FromHexString(parts[2]);
-                                if (secret.Length == 32 || secret.Length == 48) // AES-256-GCM or ChaCha20
-                                {
-                                    var key = new PacketDecryptor.EncryptionKey
-                                    {
-                                        Key = secret,
-                                        IV = new byte[12],
-                                        Type = secret.Length == 32 ?
-                                            PacketDecryptor.EncryptionType.AES256GCM :
-                                            PacketDecryptor.EncryptionType.ChaCha20Poly1305,
-                                        Source = $"{Path.GetFileName(actualPath)}:{linesProcessed}"
-                                    };
-
-                                    PacketDecryptor.AddKey(key);
-                                    keysAdded++;
-                                }
-                            }
-                            catch (FormatException)
-                            {
-                                // Invalid hex, skip
-                            }
-                        }
+                        // Use the new method that properly derives QUIC keys
+                        PacketDecryptor.AddKeyFromSSLLog(line, actualPath);
+                        keysAdded++;
                     }
                 }
             }
 
             if (keysAdded > 0)
             {
-                AddInGameLog($"[KEYS] Loaded {keysAdded} keys from {Path.GetFileName(actualPath)}");
-                Log.Success($"Loaded {keysAdded} keys from {Path.GetFileName(actualPath)}", "Keys");
+                AddInGameLog($"[KEYS] Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}");
+                AddInGameLog($"[KEYS] QUIC keys auto-derived using RFC 9001 HKDF-Expand-Label");
+                Log.Success($"Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}", "Keys");
                 OnKeysUpdated?.Invoke(); // Notify UI
                 return true; // Success
             }
             else if (linesProcessed > 0)
             {
-                AddInGameLog($"[KEYS] No valid keys found in {Path.GetFileName(actualPath)} ({linesProcessed} lines)");
+                AddInGameLog($"[KEYS] No valid TLS secrets found in {Path.GetFileName(actualPath)} ({linesProcessed} lines)");
                 return true; // Success, just no keys
             }
             return true; // Empty file

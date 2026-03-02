@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/DecryptionTab.cs - FIXED: UI freezing with many keys
+﻿// FILE: Tabs/DecryptionTab.cs - FIXED: UI freezing with many keys + QUIC Key Derivation Info
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
@@ -29,6 +29,9 @@ public class DecryptionTab : ITab
     private DateTime _lastKeyCacheTime = DateTime.MinValue;
     private const int MAX_UI_KEYS = 20; // Only show top 20 in UI
 
+    // NEW: Show fix explanation
+    private bool _showFixExplanation = true;
+
     public DecryptionTab(AppState state)
     {
         _state = state;
@@ -44,13 +47,13 @@ public class DecryptionTab : ITab
 
     private void UpdateKeyCache()
     {
-        // Refresh cache every 2 seconds max
-        if (DateTime.Now - _lastKeyCacheTime > TimeSpan.FromSeconds(2))
+        // Refresh cache every 5 seconds max (was 2)
+        if (DateTime.Now - _lastKeyCacheTime > TimeSpan.FromSeconds(5))
         {
+            // FIXED: Limit to top 10 keys for UI performance
             _cachedKeys = PacketDecryptor.DiscoveredKeys
                 .OrderByDescending(k => k.UseCount)
-                .ThenByDescending(k => k.DiscoveredAt)
-                .Take(MAX_UI_KEYS * 2) // Get more than we show
+                .Take(10)
                 .ToList();
             _lastKeyCacheTime = DateTime.Now;
         }
@@ -58,12 +61,30 @@ public class DecryptionTab : ITab
 
     public void Render()
     {
+        bool autoDecrypt = PacketDecryptor.AutoDecryptEnabled;
+        if (ImGui.Checkbox("Enable Auto-Decrypt (may cause lag)", ref autoDecrypt))
+        {
+            PacketDecryptor.AutoDecryptEnabled = autoDecrypt;
+            if (autoDecrypt)
+                _state.AddInGameLog("[DECRYPTION] Auto-decrypt enabled - may cause lag");
+            else
+                _state.AddInGameLog("[DECRYPTION] Auto-decrypt disabled");
+        }
+
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
         ImGui.Text("  PACKET DECRYPTION  -  Manage Encryption Keys");
         ImGui.Separator();
         ImGui.Spacing();
+
+        // NEW: Show the fix explanation panel
+        if (_showFixExplanation)
+        {
+            RenderFixExplanation();
+            ImGui.Spacing();
+            ImGui.Separator();
+        }
 
         // Show status message if recent
         if (!string.IsNullOrEmpty(_statusMessage) && ImGui.GetTime() - _statusTime < 3.0)
@@ -90,6 +111,89 @@ public class DecryptionTab : ITab
         ImGui.BeginChild("##right_panel", new Vector2(rightWidth, avail.Y - 100), ImGuiChildFlags.Borders);
         RenderStatsAndTesting(rightWidth);
         ImGui.EndChild();
+    }
+
+    /// <summary>
+    /// NEW: Render the QUIC Key Derivation Fix explanation
+    /// </summary>
+    private void RenderFixExplanation()
+    {
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.15f, 0.2f, 0.15f, 1f));
+        ImGui.BeginChild("##fix_explanation", new Vector2(0, 140), ImGuiChildFlags.Borders);
+
+        ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), "Why Your Keys Don't Work (FIXED):");
+        ImGui.Spacing();
+
+        // Create a table showing the issues
+        if (ImGui.BeginTable("##fix_table", 2, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
+        {
+            ImGui.TableSetupColumn("Issue", ImGuiTableColumnFlags.WidthFixed, 180);
+            ImGui.TableSetupColumn("Explanation", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableHeadersRow();
+
+            // Row 1: Raw TLS secrets
+            ImGui.TableNextRow();
+            ImGui.TableSetColumnIndex(0);
+            ImGui.Text("Raw TLS secrets");
+            ImGui.TableSetColumnIndex(1);
+            ImGui.TextColored(Theme.ColTextMuted, "SSLKEYLOGFILE contains TLS 1.3 traffic secrets, not QUIC packet keys");
+
+            // Row 2: Missing HKDF
+            ImGui.TableNextRow();
+            ImGui.TableSetColumnIndex(0);
+            ImGui.Text("Missing HKDF derivation");
+            ImGui.TableSetColumnIndex(1);
+            ImGui.TextColored(Theme.ColTextMuted, "QUIC requires HKDF-Expand-Label with \"quic key\" / \"quic iv\" labels");
+
+            // Row 3: Wrong key length
+            ImGui.TableNextRow();
+            ImGui.TableSetColumnIndex(0);
+            ImGui.Text("Wrong key length");
+            ImGui.TableSetColumnIndex(1);
+            ImGui.TextColored(Theme.ColTextMuted, "TLS secrets are 32-48 bytes, but QUIC uses 16-byte AES-128-GCM keys");
+
+            // Row 4: Missing nonce
+            ImGui.TableNextRow();
+            ImGui.TableSetColumnIndex(0);
+            ImGui.Text("Missing nonce construction");
+            ImGui.TableSetColumnIndex(1);
+            ImGui.TextColored(Theme.ColTextMuted, "QUIC requires XORing IV with packet number");
+
+            ImGui.EndTable();
+        }
+
+        ImGui.Spacing();
+        ImGui.TextColored(new Vector4(0.6f, 1f, 0.6f, 1f),
+            "The fix derives actual QUIC packet keys from your TLS secrets using proper RFC 9001 key schedule.");
+
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
+
+        if (ImGui.Button(_showFixExplanation ? "Hide Explanation" : "Show Explanation"))
+        {
+            _showFixExplanation = !_showFixExplanation;
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Copy Fix Info"))
+        {
+            var fixInfo = @"Why Your Keys Don't Work:
+
+Issue: Raw TLS secrets
+Explanation: SSLKEYLOGFILE contains TLS 1.3 traffic secrets, not QUIC packet keys
+
+Issue: Missing HKDF derivation  
+Explanation: QUIC requires deriving keys using HKDF-Expand-Label with ""quic key"" / ""quic iv"" labels
+
+Issue: Wrong key length
+Explanation: TLS secrets are 32-48 bytes, but QUIC uses 16-byte AES-128-GCM keys
+
+Issue: Missing nonce construction
+Explanation: QUIC requires XORing IV with packet number
+
+The fix derives actual QUIC packet keys from your TLS secrets using the proper RFC 9001 key schedule.";
+            CopyToClipboard(fixInfo);
+            _state.AddInGameLog("[DECRYPTION] Fix info copied to clipboard");
+        }
     }
 
     private void RenderKeyStatusHeader()
@@ -137,8 +241,12 @@ public class DecryptionTab : ITab
         ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.6f, 0.9f, 1f));
         if (ImGui.Button("Refresh Keys", new Vector2(110, 28)))
         {
-            _state.RefreshAllKeys();
-            _lastKeyCacheTime = DateTime.MinValue;
+            // FIXED: Run on background thread
+            Task.Run(() =>
+            {
+                _state.RefreshAllKeys();
+                _lastKeyCacheTime = DateTime.MinValue;
+            });
         }
         ImGui.PopStyleColor();
 
@@ -203,12 +311,15 @@ public class DecryptionTab : ITab
             string timeStr = timeAgo.TotalMinutes < 1 ? "now" : $"{timeAgo.TotalMinutes:F0}m";
             string useStr = key.UseCount > 0 ? $" (used {key.UseCount}x)" : "";
 
+            // NEW: Show if key is derived from secret
+            string derivedStr = key.Secret != null && key.Key.Length > 0 ? " [RFC9001]" : "";
+
             ImGui.BeginGroup();
 
             if (isSelected)
                 ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColAccent);
 
-            ImGui.Text($"{key.Type} [{timeStr}]{useStr}");
+            ImGui.Text($"{key.Type}{derivedStr} [{timeStr}]{useStr}");
 
             if (isSelected)
                 ImGui.PopStyleColor();
@@ -242,6 +353,11 @@ public class DecryptionTab : ITab
                 if (ImGui.MenuItem("Copy Full Key"))
                 {
                     CopyToClipboard(Convert.ToHexString(key.Key));
+                }
+                if (ImGui.MenuItem("Copy Secret (if available)"))
+                {
+                    if (key.Secret != null)
+                        CopyToClipboard(Convert.ToHexString(key.Secret));
                 }
                 if (ImGui.MenuItem("Use for Test Decryption"))
                 {
@@ -297,7 +413,16 @@ public class DecryptionTab : ITab
         ImGui.TextColored(Theme.ColAccent, "Key Details");
 
         ImGui.Text($"Type: {key.Type}");
-        ImGui.Text($"Size: {key.Key.Length * 8} bits ({key.Key.Length} bytes)");
+
+        // NEW: Show derivation status
+        if (key.Secret != null && key.Key.Length > 0)
+        {
+            ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), "Status: RFC 9001 Derived");
+            ImGui.Text($"Secret Length: {key.Secret.Length * 8} bits");
+        }
+
+        ImGui.Text($"Key Size: {key.Key.Length * 8} bits ({key.Key.Length} bytes)");
+        ImGui.Text($"IV Size: {key.IV.Length * 8} bits ({key.IV.Length} bytes)");
         ImGui.Text($"Source: {key.Source}");
         ImGui.Text($"Discovered: {key.DiscoveredAt:HH:mm:ss}");
         ImGui.Text($"Use Count: {key.UseCount}");
@@ -315,6 +440,16 @@ public class DecryptionTab : ITab
         if (ImGui.Button("Copy Full Key", new Vector2(100, 24)))
         {
             CopyToClipboard(fullKey);
+        }
+
+        // NEW: Copy secret button
+        if (key.Secret != null)
+        {
+            ImGui.SameLine();
+            if (ImGui.Button("Copy Secret", new Vector2(100, 24)))
+            {
+                CopyToClipboard(Convert.ToHexString(key.Secret));
+            }
         }
     }
 
@@ -408,12 +543,20 @@ public class DecryptionTab : ITab
         }
 
         int validKeys = 0;
+        int derivedKeys = 0;
+
         foreach (var key in PacketDecryptor.DiscoveredKeys)
         {
+            // Check if properly derived
+            if (key.Secret != null && key.Key.Length == 16)
+            {
+                derivedKeys++;
+            }
+
             // Basic validation: check key isn't all zeros or repeating pattern
             bool isAllZero = key.Key.All(b => b == 0);
             bool isRepeating = key.Key.Distinct().Count() == 1;
-            bool isValidLength = key.Key.Length == 16 || key.Key.Length == 32 || key.Key.Length == 48;
+            bool isValidLength = key.Key.Length == 16 || key.Key.Length == 32;
 
             if (!isAllZero && !isRepeating && isValidLength)
             {
@@ -422,6 +565,11 @@ public class DecryptionTab : ITab
         }
 
         _state.AddInGameLog($"[VERIFY] {validKeys}/{PacketDecryptor.DiscoveredKeys.Count} keys appear valid");
+
+        if (derivedKeys > 0)
+        {
+            _state.AddInGameLog($"[VERIFY] {derivedKeys} keys properly derived via RFC 9001");
+        }
 
         if (validKeys < PacketDecryptor.DiscoveredKeys.Count)
         {
@@ -531,7 +679,15 @@ public class DecryptionTab : ITab
                 sb.AppendLine($"Type: {key.Type}");
                 sb.AppendLine($"Source: {key.Source}");
                 sb.AppendLine($"Discovered: {key.DiscoveredAt:yyyy-MM-dd HH:mm:ss}");
-                sb.AppendLine($"Key (hex): {Convert.ToHexString(key.Key)}");
+
+                if (key.Secret != null)
+                {
+                    sb.AppendLine($"TLS Secret (hex): {Convert.ToHexString(key.Secret)}");
+                }
+
+                sb.AppendLine($"Derived Key (hex): {Convert.ToHexString(key.Key)}");
+                sb.AppendLine($"IV (hex): {Convert.ToHexString(key.IV)}");
+
                 if (key.MemoryAddress.HasValue)
                     sb.AppendLine($"Address: 0x{(ulong)key.MemoryAddress.Value:X}");
                 sb.AppendLine();

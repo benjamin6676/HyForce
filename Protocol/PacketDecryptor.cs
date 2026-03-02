@@ -1,6 +1,7 @@
-﻿// FILE: Protocol/PacketDecryptor.cs - FIXED: Key limits and deduplication
+﻿// FILE: Protocol/PacketDecryptor.cs - FIXED: Proper QUIC key derivation from TLS secrets
 using System.Security.Cryptography;
 using System.Text;
+using System.Collections.Concurrent;
 
 namespace HyForce.Protocol;
 
@@ -12,6 +13,12 @@ public static class PacketDecryptor
         AES128GCM,
         AES256GCM,
         ChaCha20Poly1305,
+        QUIC_ClientHandshake,
+        QUIC_ServerHandshake,
+        QUIC_Client0RTT,
+        QUIC_Server0RTT,
+        QUIC_Client1RTT,
+        QUIC_Server1RTT,
         XOR,
         Custom
     }
@@ -33,65 +40,81 @@ public static class PacketDecryptor
         public string Source { get; set; } = "";
         public IntPtr? MemoryAddress { get; set; }
         public DateTime DiscoveredAt { get; set; } = DateTime.Now;
-        public int UseCount { get; set; } = 0; // Track successful uses
+        public int UseCount { get; set; }
+        public byte[]? Secret { get; set; }
     }
 
-    // FIXED: Thread-safe backing fields with strict limits
     private static readonly List<EncryptionKey> _discoveredKeys = new();
     private static readonly ReaderWriterLockSlim _keysLock = new(LockRecursionPolicy.SupportsRecursion);
     private static int _successfulDecryptions = 0;
     private static int _failedDecryptions = 0;
 
-    // FIXED: Hard limits to prevent memory/performance issues
-    private const int MAX_KEYS = 50; // Maximum keys to store
-    private const int MAX_KEYS_PER_SOURCE = 10; // Max per file/source
+    public static bool AutoDecryptEnabled { get; set; } = false;
 
-    // Public accessors
-    public static IReadOnlyList<EncryptionKey> DiscoveredKeys
-    {
-        get
-        {
-            _keysLock.EnterReadLock();
-            try { return _discoveredKeys.ToList(); }
-            finally { _keysLock.ExitReadLock(); }
-        }
-    }
+    private static DateTime _lastDecryptAttempt = DateTime.MinValue;
+    private static readonly TimeSpan _decryptCooldown = TimeSpan.FromSeconds(2);
 
-    public static event Action<EncryptionKey>? OnKeyDiscovered;
+    private const int MAX_KEYS = 20;
 
-    public static int SuccessfulDecryptions
-    {
-        get => Interlocked.CompareExchange(ref _successfulDecryptions, 0, 0);
-        private set => Interlocked.Exchange(ref _successfulDecryptions, value);
-    }
-
-    public static int FailedDecryptions
-    {
-        get => Interlocked.CompareExchange(ref _failedDecryptions, 0, 0);
-        private set => Interlocked.Exchange(ref _failedDecryptions, value);
-    }
-
-    // Auto-extraction settings
-    public static bool AutoExtractFromMemory { get; set; } = true;
-    public static bool AutoExtractFromSSLLog { get; set; } = true;
+    // RFC 9001 QUIC-TLS labels
+    private static readonly byte[] QUIC_CLIENT_HANDSHAKE_LABEL = Encoding.ASCII.GetBytes("client hs");
+    private static readonly byte[] QUIC_SERVER_HANDSHAKE_LABEL = Encoding.ASCII.GetBytes("server hs");
+    private static readonly byte[] QUIC_CLIENT_TRAFFIC_LABEL = Encoding.ASCII.GetBytes("client in");
+    private static readonly byte[] QUIC_SERVER_TRAFFIC_LABEL = Encoding.ASCII.GetBytes("server in");
+    private static readonly byte[] QUIC_KEY_LABEL = Encoding.ASCII.GetBytes("quic key");
+    private static readonly byte[] QUIC_IV_LABEL = Encoding.ASCII.GetBytes("quic iv");
+    private static readonly byte[] TLS13_LABEL_PREFIX = Encoding.ASCII.GetBytes("tls13 ");
 
     public static DecryptionResult TryDecrypt(byte[] encryptedData, byte[]? associatedData = null)
+    {
+        if (!AutoDecryptEnabled)
+        {
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = "Auto-decrypt disabled"
+            };
+        }
+
+        if (DateTime.Now - _lastDecryptAttempt < _decryptCooldown)
+        {
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = "Throttled"
+            };
+        }
+        _lastDecryptAttempt = DateTime.Now;
+
+        if (encryptedData == null || encryptedData.Length < 16)
+        {
+            return new DecryptionResult { Success = false, ErrorMessage = "Data too short" };
+        }
+
+        return TryDecryptInternal(encryptedData);
+    }
+
+    public static DecryptionResult TryDecryptManual(byte[] encryptedData)
     {
         if (encryptedData == null || encryptedData.Length < 16)
         {
             return new DecryptionResult { Success = false, ErrorMessage = "Data too short" };
         }
 
-        // FIXED: Get keys sorted by success rate (most used first)
+        return TryDecryptInternal(encryptedData);
+    }
+
+    private static DecryptionResult TryDecryptInternal(byte[] encryptedData)
+    {
         List<EncryptionKey> keysCopy;
         _keysLock.EnterReadLock();
         try
         {
-            // Only try top 10 most successful keys for performance
             keysCopy = _discoveredKeys
+                .Where(k => k.Key.Length >= 16)  // Must have actual key bytes
                 .OrderByDescending(k => k.UseCount)
                 .ThenByDescending(k => k.DiscoveredAt)
-                .Take(10)
+                .Take(5)
                 .ToList();
         }
         finally
@@ -101,50 +124,135 @@ public static class PacketDecryptor
 
         if (keysCopy.Count == 0)
         {
-            return new DecryptionResult { Success = false, ErrorMessage = "No keys available" };
+            return new DecryptionResult { Success = false, ErrorMessage = "No valid keys available" };
         }
 
-        // Try each key with validation
         foreach (var key in keysCopy)
         {
-            var result = TryDecryptWithKey(encryptedData, key, associatedData);
-
-            if (result.Success && result.DecryptedData != null)
+            try
             {
-                if (IsValidDecryptedData(result.DecryptedData))
+                var result = TryDecryptWithKey(encryptedData, key);
+
+                if (result.Success && result.DecryptedData != null && IsValidDecryptedData(result.DecryptedData))
                 {
-                    // Increment use count for this key
                     _keysLock.EnterWriteLock();
-                    try
-                    {
-                        key.UseCount++;
-                    }
-                    finally
-                    {
-                        _keysLock.ExitWriteLock();
-                    }
+                    try { key.UseCount++; }
+                    finally { _keysLock.ExitWriteLock(); }
 
                     Interlocked.Increment(ref _successfulDecryptions);
                     return result;
                 }
             }
+            catch { }
         }
 
         Interlocked.Increment(ref _failedDecryptions);
-        return new DecryptionResult { Success = false, ErrorMessage = "No valid decryption key found" };
+        return new DecryptionResult { Success = false, ErrorMessage = "No valid key found" };
     }
 
-    public static DecryptionResult TryDecryptQUIC(byte[] packetData, EncryptionKey key)
+    /// <summary>
+    /// FIXED: Derive QUIC packet keys from TLS 1.3 secrets using RFC 9001 HKDF-Expand-Label
+    /// </summary>
+    public static void DeriveQUICKeys(EncryptionKey key)
+    {
+        if (key.Secret == null || key.Secret.Length == 0) return;
+
+        try
+        {
+            // Determine which label to use based on key type
+            byte[] label;
+            switch (key.Type)
+            {
+                case EncryptionType.QUIC_ClientHandshake:
+                    label = QUIC_CLIENT_HANDSHAKE_LABEL;
+                    break;
+                case EncryptionType.QUIC_ServerHandshake:
+                    label = QUIC_SERVER_HANDSHAKE_LABEL;
+                    break;
+                case EncryptionType.QUIC_Client1RTT:
+                    label = QUIC_CLIENT_TRAFFIC_LABEL;
+                    break;
+                case EncryptionType.QUIC_Server1RTT:
+                    label = QUIC_SERVER_TRAFFIC_LABEL;
+                    break;
+                default:
+                    label = QUIC_CLIENT_TRAFFIC_LABEL;
+                    break;
+            }
+
+            // FIXED: Derive 16-byte AES-128-GCM key (QUIC uses 16 bytes, not 32!)
+            key.Key = HkdfExpandLabel(key.Secret, QUIC_KEY_LABEL, Array.Empty<byte>(), 16);
+
+            // FIXED: Derive 12-byte IV
+            key.IV = HkdfExpandLabel(key.Secret, QUIC_IV_LABEL, Array.Empty<byte>(), 12);
+
+            Console.WriteLine($"[KEY-DERIVE] Derived {key.Type} keys: Key={BitConverter.ToString(key.Key).Replace("-", "")[..16]}..., IV={BitConverter.ToString(key.IV).Replace("-", "")}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[KEY-DERIVE] Failed: {ex.Message}");
+            key.Key = Array.Empty<byte>();
+            key.IV = Array.Empty<byte>();
+        }
+    }
+
+    private static byte[] HkdfExpandLabel(byte[] secret, byte[] label, byte[] context, int length)
+    {
+        var fullLabel = new List<byte>();
+
+        fullLabel.Add((byte)(length >> 8));
+        fullLabel.Add((byte)(length & 0xFF));
+
+        fullLabel.Add((byte)(TLS13_LABEL_PREFIX.Length + label.Length));
+        fullLabel.AddRange(TLS13_LABEL_PREFIX);
+        fullLabel.AddRange(label);
+
+        fullLabel.Add((byte)context.Length);
+        fullLabel.AddRange(context);
+
+        return HkdfExpand(secret, fullLabel.ToArray(), length);
+    }
+
+    private static byte[] HkdfExpand(byte[] prk, byte[] info, int length)
+    {
+        var result = new List<byte>();
+        var counter = 1;
+        var previous = Array.Empty<byte>();
+
+        using var hmac = new HMACSHA256(prk);
+
+        while (result.Count < length)
+        {
+            var data = new List<byte>();
+            data.AddRange(previous);
+            data.AddRange(info);
+            data.Add((byte)counter);
+
+            var hash = hmac.ComputeHash(data.ToArray());
+            result.AddRange(hash);
+
+            previous = hash;
+            counter++;
+        }
+
+        return result.Take(length).ToArray();
+    }
+
+    private static DecryptionResult TryDecryptWithKey(byte[] data, EncryptionKey key)
+    {
+        if (key?.Key == null || key.Key.Length != 16)
+            return new DecryptionResult { Success = false, ErrorMessage = "Invalid key length" };
+
+        if (data.Length < 50)
+            return new DecryptionResult { Success = false, ErrorMessage = "Too small for QUIC" };
+
+        return TryDecryptQUIC(data, key);
+    }
+
+    private static DecryptionResult TryDecryptQUIC(byte[] packetData, EncryptionKey key)
     {
         const int TAG_LENGTH = 16;
         const int NONCE_LENGTH = 12;
-        const int MIN_PACKET_SIZE = 21;
-
-        if (packetData == null || packetData.Length < MIN_PACKET_SIZE)
-            return new DecryptionResult { Success = false, ErrorMessage = "Packet too small for QUIC" };
-
-        if (key?.Key == null || (key.Key.Length != 32 && key.Key.Length != 16))
-            return new DecryptionResult { Success = false, ErrorMessage = "Invalid key" };
 
         try
         {
@@ -153,25 +261,30 @@ public static class PacketDecryptor
 
             if (isLongHeader)
             {
-                if (packetData.Length < 7)
+                if (packetData.Length < 6)
                     return new DecryptionResult { Success = false, ErrorMessage = "Invalid long header" };
 
                 int dcidLen = packetData[5];
-                if (packetData.Length < 6 + dcidLen + 1)
-                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid DCID length" };
+                int offset = 6 + dcidLen;
 
-                int scidLen = packetData[6 + dcidLen];
-                headerLen = 7 + dcidLen + scidLen + 2 + 4;
+                if (packetData.Length <= offset)
+                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid DCID" };
 
-                if (headerLen > packetData.Length - TAG_LENGTH)
-                    headerLen = Math.Min(16, packetData.Length - TAG_LENGTH);
+                int scidLen = packetData[offset];
+                offset += 1 + scidLen;
+                offset += 2;
+
+                int pnLen = 4;
+                headerLen = Math.Min(offset + pnLen, packetData.Length - TAG_LENGTH);
+                if (headerLen < 1) headerLen = Math.Min(20, packetData.Length - TAG_LENGTH);
             }
             else
             {
-                headerLen = Math.Min(1 + 8, packetData.Length - TAG_LENGTH);
+                headerLen = Math.Min(1 + 8 + 4, packetData.Length - TAG_LENGTH);
             }
 
-            headerLen = Math.Max(1, Math.Min(headerLen, packetData.Length - TAG_LENGTH));
+            if (headerLen < 1 || headerLen > packetData.Length - TAG_LENGTH)
+                return new DecryptionResult { Success = false, ErrorMessage = "Invalid header length" };
 
             byte[] headerBytes = new byte[headerLen];
             Buffer.BlockCopy(packetData, 0, headerBytes, 0, headerLen);
@@ -187,222 +300,45 @@ public static class PacketDecryptor
             Buffer.BlockCopy(packetData, packetData.Length - TAG_LENGTH, tag, 0, TAG_LENGTH);
 
             byte[] nonce = new byte[NONCE_LENGTH];
-            if (key.IV != null && key.IV.Length >= NONCE_LENGTH)
-            {
-                Buffer.BlockCopy(key.IV, 0, nonce, 0, NONCE_LENGTH);
-            }
+            Buffer.BlockCopy(key.IV, 0, nonce, 0, NONCE_LENGTH);
 
-            if (headerLen >= 4 && packetData.Length > headerLen)
+            if (headerLen >= 4)
             {
-                for (int i = 0; i < 4 && i < (packetData.Length - headerLen); i++)
+                for (int i = 0; i < 4 && i < NONCE_LENGTH; i++)
                 {
-                    if (8 + i < NONCE_LENGTH)
-                        nonce[8 + i] ^= packetData[headerLen - 4 + i];
+                    nonce[NONCE_LENGTH - 4 + i] ^= headerBytes[headerLen - 4 + i];
                 }
             }
 
             using var aes = new AesGcm(key.Key, TAG_LENGTH);
             byte[] plaintext = new byte[ciphertextLength];
-
             aes.Decrypt(nonce, ciphertext, tag, plaintext, headerBytes);
 
             if (!IsValidDecryptedData(plaintext))
-            {
-                return new DecryptionResult { Success = false, ErrorMessage = "Decrypted data validation failed" };
-            }
+                return new DecryptionResult { Success = false, ErrorMessage = "Validation failed" };
 
             return new DecryptionResult
             {
                 Success = true,
                 DecryptedData = plaintext,
-                DetectedType = EncryptionType.AES256GCM,
-                Metadata =
+                DetectedType = EncryptionType.AES128GCM,
+                Metadata = new Dictionary<string, object>
                 {
-                    ["algorithm"] = "AES-256-GCM",
+                    ["algorithm"] = "AES-128-GCM",
                     ["original_size"] = packetData.Length,
                     ["decrypted_size"] = plaintext.Length,
-                    ["header_len"] = headerLen,
-                    ["quic_header_type"] = isLongHeader ? "Long" : "Short"
-                }
-            };
-        }
-        catch (CryptographicException ex)
-        {
-            return new DecryptionResult { Success = false, ErrorMessage = $"Decryption failed: {ex.Message}" };
-        }
-        catch (Exception ex)
-        {
-            return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
-        }
-    }
-
-    private static DecryptionResult TryDecryptWithKey(byte[] data, EncryptionKey key, byte[]? associatedData)
-    {
-        try
-        {
-            bool looksLikeQuic = (data.Length > 0 && (data[0] & 0x80) != 0) || data.Length > 1000;
-
-            if (looksLikeQuic)
-            {
-                var quicResult = TryDecryptQUIC(data, key);
-                if (quicResult.Success) return quicResult;
-            }
-
-            return key.Type switch
-            {
-                EncryptionType.AES128GCM or EncryptionType.AES256GCM =>
-                    DecryptAESGCM(data, key.Key, key.IV, associatedData),
-                EncryptionType.ChaCha20Poly1305 =>
-                    DecryptChaCha20(data, key.Key, key.IV, associatedData),
-                EncryptionType.XOR =>
-                    DecryptXOR(data, key.Key),
-                _ => new DecryptionResult { Success = false, ErrorMessage = "Unknown key type" }
-            };
-        }
-        catch (Exception ex)
-        {
-            return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
-        }
-    }
-
-    private static DecryptionResult DecryptAESGCM(byte[] data, byte[] key, byte[] iv, byte[]? associatedData)
-    {
-        const int NONCE_LENGTH = 12;
-        const int TAG_LENGTH = 16;
-
-        try
-        {
-            if (data.Length < NONCE_LENGTH + 1 + TAG_LENGTH)
-                return new DecryptionResult { Success = false, ErrorMessage = "Data too short for AES-GCM" };
-
-            if (key.Length != 16 && key.Length != 32)
-                return new DecryptionResult { Success = false, ErrorMessage = "Invalid key length" };
-
-            using var aes = new AesGcm(key, TAG_LENGTH);
-
-            byte[] nonce = new byte[NONCE_LENGTH];
-            Buffer.BlockCopy(data, 0, nonce, 0, NONCE_LENGTH);
-
-            int ciphertextLength = data.Length - NONCE_LENGTH - TAG_LENGTH;
-            byte[] ciphertext = new byte[ciphertextLength];
-            Buffer.BlockCopy(data, NONCE_LENGTH, ciphertext, 0, ciphertextLength);
-
-            byte[] tag = new byte[TAG_LENGTH];
-            Buffer.BlockCopy(data, data.Length - TAG_LENGTH, tag, 0, TAG_LENGTH);
-
-            byte[] plaintext = new byte[ciphertextLength];
-
-            aes.Decrypt(nonce, ciphertext, tag, plaintext, associatedData);
-
-            if (!IsValidDecryptedData(plaintext))
-            {
-                return new DecryptionResult { Success = false, ErrorMessage = "Validation failed" };
-            }
-
-            return new DecryptionResult
-            {
-                Success = true,
-                DecryptedData = plaintext,
-                DetectedType = key.Length == 32 ? EncryptionType.AES256GCM : EncryptionType.AES128GCM,
-                Metadata =
-                {
-                    ["algorithm"] = "AES-GCM",
-                    ["original_size"] = data.Length,
-                    ["decrypted_size"] = plaintext.Length
+                    ["header_type"] = isLongHeader ? "Long" : "Short"
                 }
             };
         }
         catch (CryptographicException)
         {
-            return new DecryptionResult { Success = false, ErrorMessage = "Authentication failed" };
+            return new DecryptionResult { Success = false, ErrorMessage = "Auth failed" };
         }
         catch (Exception ex)
         {
             return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
         }
-    }
-
-    private static DecryptionResult DecryptChaCha20(byte[] data, byte[] key, byte[] iv, byte[]? associatedData)
-    {
-        return new DecryptionResult
-        {
-            Success = false,
-            ErrorMessage = "ChaCha20 requires BouncyCastle library"
-        };
-    }
-
-    private static DecryptionResult DecryptXOR(byte[] data, byte[] key)
-    {
-        if (key == null || key.Length == 0)
-            return new DecryptionResult { Success = false, ErrorMessage = "Empty XOR key" };
-
-        byte[] result = new byte[data.Length];
-        for (int i = 0; i < data.Length; i++)
-        {
-            result[i] = (byte)(data[i] ^ key[i % key.Length]);
-        }
-
-        double entropy = CalculateEntropy(result);
-        bool looksValid = entropy < 6.0 && ContainsPrintableStrings(result);
-
-        return new DecryptionResult
-        {
-            Success = looksValid,
-            DecryptedData = result,
-            DetectedType = EncryptionType.XOR,
-            Metadata =
-            {
-                ["entropy"] = entropy,
-                ["key_length"] = key.Length
-            }
-        };
-    }
-
-    private static DecryptionResult TryCommonKeys(byte[] data, byte[]? associatedData)
-    {
-        var zeroKey32 = new byte[32];
-
-        var result = TryDecryptWithKey(data, new EncryptionKey
-        {
-            Key = zeroKey32,
-            IV = new byte[12],
-            Type = EncryptionType.AES256GCM,
-            Source = "Common Debug Key"
-        }, associatedData);
-
-        if (result.Success) return result;
-
-        var debugKeys = new[]
-        {
-            "HYTALE_DEBUG_KEY_32_BYTES_LONG!!",
-            "0123456789abcdef0123456789abcdef",
-            "hytalehytalehytalehytalehytale12",
-            "QUIC_DEBUG_KEY_32_BYTES_LONG!!",
-            "HytaleHytaleHytaleHytaleHytale!!"
-        };
-
-        foreach (var debugKey in debugKeys)
-        {
-            var keyBytes = Encoding.ASCII.GetBytes(debugKey);
-            if (keyBytes.Length == 32)
-            {
-                result = TryDecryptWithKey(data, new EncryptionKey
-                {
-                    Key = keyBytes,
-                    IV = new byte[12],
-                    Type = EncryptionType.AES256GCM,
-                    Source = "Common Debug Key"
-                }, associatedData);
-
-                if (result.Success)
-                {
-                    result.Metadata["key_source"] = "common_debug";
-                    return result;
-                }
-            }
-        }
-
-        return new DecryptionResult { Success = false };
     }
 
     private static bool IsValidDecryptedData(byte[] data)
@@ -412,19 +348,74 @@ public static class PacketDecryptor
         double entropy = CalculateEntropy(data);
         if (entropy > 7.9) return false;
 
-        byte firstByte = data[0];
-
-        bool hasValidFrame = firstByte <= 0x20 ||
-                            (firstByte >= 0x40 && firstByte <= 0x7F) ||
-                            (firstByte >= 0x80 && firstByte <= 0xBF);
-
+        bool hasValidHeader = data[0] <= 0x50;
         bool hasStrings = ContainsPrintableStrings(data, 4);
-        bool hasStructure = data.Any(b => b != 0) && data.Distinct().Count() > 4;
 
-        return hasValidFrame || hasStrings || (entropy < 6.0 && hasStructure);
+        return hasValidHeader || hasStrings || entropy < 6.0;
     }
 
-    // FIXED: Smart deduplication and limits
+    /// <summary>
+    /// CRITICAL FIX: Parse SSLKEYLOGFILE and IMMEDIATELY derive QUIC keys
+    /// </summary>
+    public static void AddKeyFromSSLLog(string line, string sourceFile)
+    {
+        try
+        {
+            var parts = line.Split(' ');
+            if (parts.Length < 3) return;
+
+            string label = parts[0];
+            string clientRandom = parts[1];
+            string secretHex = parts[2];
+
+            var secret = Convert.FromHexString(secretHex);
+
+            if (secret.Length != 32 && secret.Length != 48) return;
+
+            EncryptionType keyType;
+
+            if (label.Contains("CLIENT_HANDSHAKE_TRAFFIC_SECRET"))
+                keyType = EncryptionType.QUIC_ClientHandshake;
+            else if (label.Contains("SERVER_HANDSHAKE_TRAFFIC_SECRET"))
+                keyType = EncryptionType.QUIC_ServerHandshake;
+            else if (label.Contains("CLIENT_TRAFFIC_SECRET_0"))
+                keyType = EncryptionType.QUIC_Client1RTT;
+            else if (label.Contains("SERVER_TRAFFIC_SECRET_0"))
+                keyType = EncryptionType.QUIC_Server1RTT;
+            else
+                return;
+
+            // CRITICAL FIX: Create key with secret, derive immediately, then add
+            var key = new EncryptionKey
+            {
+                Secret = secret,
+                Key = Array.Empty<byte>(),
+                IV = Array.Empty<byte>(),
+                Type = keyType,
+                Source = $"{sourceFile}:{line.Length}"
+            };
+
+            // DERIVE KEYS BEFORE ADDING
+            DeriveQUICKeys(key);
+
+            // Only add if derivation succeeded
+            if (key.Key.Length == 16 && key.IV.Length == 12)
+            {
+                AddKey(key);
+                Console.WriteLine($"[SSL-LOG] Added derived {keyType} key from {sourceFile}");
+            }
+            else
+            {
+                Console.WriteLine($"[SSL-LOG] Failed to derive keys for {keyType}");
+            }
+        }
+        catch (FormatException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SSL-LOG] Error: {ex.Message}");
+        }
+    }
+
     public static void AddKey(EncryptionKey key)
     {
         if (key?.Key == null || key.Key.Length == 0) return;
@@ -432,104 +423,31 @@ public static class PacketDecryptor
         _keysLock.EnterWriteLock();
         try
         {
-            // Check for exact duplicate
+            // Check for duplicate keys
             foreach (var existing in _discoveredKeys)
             {
                 if (existing.Key.SequenceEqual(key.Key))
                 {
-                    // Update source if new info
                     if (!existing.Source.Contains(key.Source))
-                    {
                         existing.Source += $", {key.Source}";
-                    }
-                    return; // Don't add duplicate
+                    return;
                 }
             }
 
-            // Check per-source limit
-            var sourceCount = _discoveredKeys.Count(k => k.Source.StartsWith(key.Source.Split(':')[0]));
-            if (sourceCount >= MAX_KEYS_PER_SOURCE)
-            {
-                // Remove oldest from this source
-                var oldest = _discoveredKeys
-                    .Where(k => k.Source.StartsWith(key.Source.Split(':')[0]))
-                    .OrderBy(k => k.DiscoveredAt)
-                    .First();
-                _discoveredKeys.Remove(oldest);
-            }
-
-            // Check global limit
             if (_discoveredKeys.Count >= MAX_KEYS)
             {
-                // Remove least used key
-                var leastUsed = _discoveredKeys.OrderBy(k => k.UseCount).ThenBy(k => k.DiscoveredAt).First();
+                var leastUsed = _discoveredKeys.OrderBy(k => k.UseCount).First();
                 _discoveredKeys.Remove(leastUsed);
             }
 
             _discoveredKeys.Add(key);
-
-            // Invoke outside lock
-            var handler = OnKeyDiscovered;
-            _keysLock.ExitWriteLock();
-            handler?.Invoke(key);
-            return;
         }
         finally
         {
-            if (_keysLock.IsWriteLockHeld)
-                _keysLock.ExitWriteLock();
+            _keysLock.ExitWriteLock();
         }
-    }
 
-    public static void AddKeyFromMemory(IntPtr address, byte[] keyData, EncryptionType type, string source)
-    {
-        AddKey(new EncryptionKey
-        {
-            Key = keyData,
-            IV = new byte[12],
-            Type = type,
-            Source = source,
-            MemoryAddress = address
-        });
-    }
-
-    public static void AutoExtractKeysFromMemory(IntPtr processHandle)
-    {
-        if (!AutoExtractFromMemory) return;
-    }
-
-    public static void AutoExtractFromSSLLogFile(string path)
-    {
-        if (!AutoExtractFromSSLLog || !File.Exists(path)) return;
-
-        try
-        {
-            var lines = File.ReadAllLines(path);
-            foreach (var line in lines)
-            {
-                var parts = line.Split(' ');
-                if (parts.Length >= 3 &&
-                    (parts[0].Contains("TRAFFIC_SECRET") || parts[0].Contains("HANDSHAKE_TRAFFIC_SECRET")))
-                {
-                    try
-                    {
-                        var secret = Convert.FromHexString(parts[2]);
-                        if (secret.Length == 32 || secret.Length == 48)
-                        {
-                            AddKey(new EncryptionKey
-                            {
-                                Key = secret,
-                                IV = new byte[12],
-                                Type = secret.Length == 32 ? EncryptionType.AES256GCM : EncryptionType.ChaCha20Poly1305,
-                                Source = $"SSLLog:{Path.GetFileName(path)}"
-                            });
-                        }
-                    }
-                    catch (FormatException) { }
-                }
-            }
-        }
-        catch { }
+        OnKeyDiscovered?.Invoke(key);
     }
 
     public static void ClearKeys()
@@ -547,37 +465,30 @@ public static class PacketDecryptor
         }
     }
 
-    public static EncryptionType DetectEncryptionType(byte[] packetData)
+    public static IReadOnlyList<EncryptionKey> DiscoveredKeys
     {
-        if (packetData == null || packetData.Length < 4)
-            return EncryptionType.None;
-
-        if ((packetData[0] & 0x80) != 0)
+        get
         {
-            return EncryptionType.AES256GCM;
+            _keysLock.EnterReadLock();
+            try { return _discoveredKeys.ToList(); }
+            finally { _keysLock.ExitReadLock(); }
         }
-
-        double entropy = CalculateEntropy(packetData);
-        if (entropy > 7.8)
-            return EncryptionType.AES256GCM;
-
-        if (entropy > 6.5)
-            return EncryptionType.XOR;
-
-        return EncryptionType.None;
     }
+
+    public static int SuccessfulDecryptions => Interlocked.CompareExchange(ref _successfulDecryptions, 0, 0);
+    public static int FailedDecryptions => Interlocked.CompareExchange(ref _failedDecryptions, 0, 0);
+
+    public static event Action<EncryptionKey>? OnKeyDiscovered;
 
     public static bool IsLikelyEncrypted(byte[] data)
     {
         if (data.Length < 16) return false;
-        double entropy = CalculateEntropy(data);
-        return entropy > 7.5;
+        return CalculateEntropy(data) > 7.5;
     }
 
     private static double CalculateEntropy(byte[] data)
     {
         if (data == null || data.Length == 0) return 0;
-
         var freq = new int[256];
         foreach (var b in data) freq[b]++;
 
@@ -594,7 +505,6 @@ public static class PacketDecryptor
     private static bool ContainsPrintableStrings(byte[] data, int minLength = 4)
     {
         if (data == null) return false;
-
         int currentLength = 0;
         foreach (var b in data)
         {
@@ -603,25 +513,8 @@ public static class PacketDecryptor
                 currentLength++;
                 if (currentLength >= minLength) return true;
             }
-            else
-            {
-                currentLength = 0;
-            }
+            else currentLength = 0;
         }
         return false;
-    }
-
-    public static string GetStats()
-    {
-        int keys, success, failed;
-
-        _keysLock.EnterReadLock();
-        try { keys = _discoveredKeys.Count; }
-        finally { _keysLock.ExitReadLock(); }
-
-        success = SuccessfulDecryptions;
-        failed = FailedDecryptions;
-
-        return $"Keys: {keys}, Success: {success}, Failed: {failed}";
     }
 }

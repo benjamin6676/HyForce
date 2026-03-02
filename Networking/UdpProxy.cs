@@ -1,4 +1,4 @@
-﻿// FILE: Networking/UdpProxy.cs - FIXED: Proper QUIC Handshake Handling
+﻿// FILE: Networking/UdpProxy.cs - COMPLETELY TRANSPARENT PROXY
 using HyForce.Core;
 using System.Collections.Concurrent;
 using System.Net;
@@ -22,12 +22,9 @@ public class UdpProxy : IDisposable
     private readonly Data.TestLog _log;
     private UdpClient? _listener;
     private CancellationTokenSource? _cts;
-    private readonly ConcurrentDictionary<string, QuicSession> _sessions = new();
+    private readonly ConcurrentDictionary<string, UdpSession> _sessions = new();
     private IPEndPoint _serverEp = new(IPAddress.Loopback, 0);
     private uint _sequenceCounter;
-
-    // FIXED: Track handshake state per session
-    private readonly ConcurrentDictionary<string, bool> _handshakeComplete = new();
 
     public UdpProxy(Data.TestLog log)
     {
@@ -42,22 +39,26 @@ public class UdpProxy : IDisposable
         {
             if (listenPort == serverPort && serverIp == "127.0.0.1")
             {
-                _log.Error("[UDP] ERROR: Port conflict on localhost!", "UDP");
+                _log.Error("[UDP] Port conflict on localhost!", "UDP");
                 StatusMessage = "Config error: port conflict";
                 return;
             }
 
             _serverEp = new IPEndPoint(IPAddress.Parse(serverIp), serverPort);
-            _listener = new UdpClient(new IPEndPoint(IPAddress.Any, listenPort));
+
+            // FIXED: Use dual-stack socket for better compatibility
+            _listener = new UdpClient(AddressFamily.InterNetwork);
+            _listener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            _listener.Client.Bind(new IPEndPoint(IPAddress.Any, listenPort));
 
             ServerIp = serverIp;
             ServerPort = serverPort;
             ListenPort = listenPort;
             IsRunning = true;
-            StatusMessage = $"Listening 0.0.0.0:{listenPort} -> {serverIp}:{serverPort}";
+            StatusMessage = $"Listening *:{listenPort} -> {serverIp}:{serverPort}";
 
-            _log.Info($"[UDP] Started on 0.0.0.0:{listenPort}", "UDP");
-            _log.Info($"[UDP] QUIC handshake-preserving proxy", "UDP");
+            _log.Info($"[UDP] Transparent proxy started on port {listenPort}", "UDP");
+            _log.Info($"[UDP] Forwarding to {serverIp}:{serverPort}", "UDP");
 
             _cts = new CancellationTokenSource();
             Task.Run(() => ReceiveLoop(_cts.Token));
@@ -82,7 +83,6 @@ public class UdpProxy : IDisposable
             session.Dispose();
         }
         _sessions.Clear();
-        _handshakeComplete.Clear();
 
         IsRunning = false;
         StatusMessage = $"Stopped ({TotalClients} clients)";
@@ -119,65 +119,51 @@ public class UdpProxy : IDisposable
 
             if (data.Length == 0) continue;
 
-            var quicInfo = ParseQuicHeader(data);
-            bool isLongHeader = quicInfo.IsLongHeader;
-
-            // FIXED: Create or get session
+            // Get or create session - COMPLETELY PASS-THROUGH
             if (!_sessions.TryGetValue(key, out var session))
             {
                 TotalClients++;
 
-                // FIXED: Create server socket but DON'T modify client CID during handshake
-                var serverSocket = new UdpClient();
+                // Create server socket
+                var serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 serverSocket.Connect(_serverEp);
 
-                // FIXED: Store original client CID, don't generate new one yet
-                session = new QuicSession(clientEp, serverSocket, quicInfo.ClientConnectionId);
+                session = new UdpSession(clientEp, serverSocket);
                 _sessions[key] = session;
-                _handshakeComplete[key] = false; // Track handshake state
 
                 StatusMessage = $"Active: {_sessions.Count} sessions";
-                _log.Info($"[UDP] New QUIC session #{TotalClients}: {clientEp}", "UDP");
-                _log.Info($"[UDP] Client CID: {BitConverter.ToString(quicInfo.ClientConnectionId)}", "UDP");
+                _log.Info($"[UDP] New session #{TotalClients}: {clientEp} -> {_serverEp}", "UDP");
 
-                _ = Task.Run(() => ServerReceiveLoop(session, key, ct), ct);
+                _ = Task.Run(() => ServerReceiveLoop(session, ct), ct);
             }
 
             session.LastActivity = DateTimeOffset.UtcNow;
 
-            // Log the packet
-            var packet = new CapturedPacket
-            {
-                SequenceId = Interlocked.Increment(ref _sequenceCounter),
-                Timestamp = DateTime.Now,
-                Direction = PacketDirection.ClientToServer,
-                RawBytes = data,
-                IsTcp = false,
-                Opcode = data.Length > 0 ? data[0] : (ushort)0,
-                Source = "UDP/QUIC",
-                QuicInfo = quicInfo
-            };
-            OnPacket?.Invoke(packet);
-
-            // FIXED: Determine if we should translate CIDs
-            bool handshakeDone = _handshakeComplete.TryGetValue(key, out bool complete) && complete;
-
-            byte[] dataToSend;
-            if (isLongHeader && !handshakeDone)
-            {
-                // FIXED: During handshake, preserve original CIDs - only translate DCID for routing if needed
-                // But keep the original client CID so server can respond correctly
-                dataToSend = data; // Pass through unchanged during handshake!
-            }
-            else
-            {
-                // Post-handshake: can translate CIDs if needed
-                dataToSend = data;
-            }
-
+            // Log packet (copy for analysis, don't modify original)
             try
             {
-                await session.ServerSocket.SendAsync(dataToSend, dataToSend.Length);
+                var packet = new CapturedPacket
+                {
+                    SequenceId = Interlocked.Increment(ref _sequenceCounter),
+                    Timestamp = DateTime.Now,
+                    Direction = PacketDirection.ClientToServer,
+                    RawBytes = data.ToArray(), // COPY for logging
+                    IsTcp = false,
+                    Opcode = data.Length > 0 ? data[0] : (ushort)0,
+                    Source = "UDP",
+                    QuicInfo = TryParseQuicInfo(data)
+                };
+                OnPacket?.Invoke(packet);
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"[UDP] Logging error: {ex.Message}", "UDP");
+            }
+
+            // FIXED: Send EXACT bytes without modification
+            try
+            {
+                await session.ServerSocket.SendAsync(data, SocketFlags.None, ct);
             }
             catch (Exception ex)
             {
@@ -186,16 +172,18 @@ public class UdpProxy : IDisposable
         }
     }
 
-    private async Task ServerReceiveLoop(QuicSession session, string sessionKey, CancellationToken ct)
+    private async Task ServerReceiveLoop(UdpSession session, CancellationToken ct)
     {
         try
         {
+            var buffer = new byte[65536];
+
             while (!ct.IsCancellationRequested)
             {
-                UdpReceiveResult result;
+                int received;
                 try
                 {
-                    result = await session.ServerSocket.ReceiveAsync(ct);
+                    received = await session.ServerSocket.ReceiveAsync(buffer, SocketFlags.None, ct);
                 }
                 catch (OperationCanceledException)
                 {
@@ -206,44 +194,31 @@ public class UdpProxy : IDisposable
                     continue;
                 }
 
-                var serverData = result.Buffer;
-                if (serverData.Length == 0) continue;
+                if (received == 0) continue;
 
-                // Parse server response to detect handshake completion
-                var serverQuicInfo = ParseQuicHeader(serverData);
+                // Extract received data
+                var serverData = new byte[received];
+                Buffer.BlockCopy(buffer, 0, serverData, 0, received);
 
-                // FIXED: Detect handshake completion (server sends Handshake Done or 1-RTT packets)
-                if (serverQuicInfo.IsLongHeader)
+                // Log server response (copy for analysis)
+                try
                 {
-                    // Check for handshake completion indicators
-                    if (IsHandshakeCompletePacket(serverData))
+                    var packet = new CapturedPacket
                     {
-                        _handshakeComplete[sessionKey] = true;
-                        _log.Info($"[UDP] Handshake complete for {sessionKey}", "UDP");
-                    }
+                        SequenceId = Interlocked.Increment(ref _sequenceCounter),
+                        Timestamp = DateTime.Now,
+                        Direction = PacketDirection.ServerToClient,
+                        RawBytes = serverData.ToArray(),
+                        IsTcp = false,
+                        Opcode = serverData.Length > 0 ? serverData[0] : (ushort)0,
+                        Source = "UDP",
+                        QuicInfo = TryParseQuicInfo(serverData)
+                    };
+                    OnPacket?.Invoke(packet);
                 }
-                else
-                {
-                    // Short header = 1-RTT data = handshake definitely complete
-                    _handshakeComplete[sessionKey] = true;
-                }
+                catch { }
 
-                // Log server-to-client packet
-                var packet = new CapturedPacket
-                {
-                    SequenceId = Interlocked.Increment(ref _sequenceCounter),
-                    Timestamp = DateTime.Now,
-                    Direction = PacketDirection.ServerToClient,
-                    RawBytes = serverData,
-                    IsTcp = false,
-                    Opcode = serverData.Length > 0 ? serverData[0] : (ushort)0,
-                    Source = "UDP/QUIC",
-                    QuicInfo = serverQuicInfo
-                };
-                OnPacket?.Invoke(packet);
-
-                // FIXED: Send response back to client unchanged
-                // The server has already set the correct Destination CID based on client's original CID
+                // FIXED: Send back to client EXACTLY as received
                 try
                 {
                     await _listener!.SendAsync(serverData, serverData.Length, session.ClientEndpoint);
@@ -260,80 +235,48 @@ public class UdpProxy : IDisposable
         }
     }
 
-    private QuicHeaderInfo ParseQuicHeader(byte[] data)
+    private QuicHeaderInfo? TryParseQuicInfo(byte[] data)
     {
-        var info = new QuicHeaderInfo();
-
-        if (data.Length < 1)
-            return info;
-
-        byte firstByte = data[0];
-        bool isLongHeader = (firstByte & 0x80) != 0;
-        info.IsLongHeader = isLongHeader;
-
-        if (isLongHeader && data.Length >= 6)
+        try
         {
-            info.Version = (uint)((data[1] << 24) | (data[2] << 16) | (data[3] << 8) | data[4]);
-            byte dcidLen = data[5];
+            if (data.Length < 1) return null;
 
-            if (data.Length >= 6 + dcidLen)
-            {
-                info.ClientConnectionId = new byte[dcidLen];
-                Buffer.BlockCopy(data, 6, info.ClientConnectionId, 0, dcidLen);
-            }
+            var info = new QuicHeaderInfo();
+            byte firstByte = data[0];
+            bool isLongHeader = (firstByte & 0x80) != 0;
+            info.IsLongHeader = isLongHeader;
 
-            // Parse SCID if present
-            int scidOffset = 6 + dcidLen;
-            if (data.Length > scidOffset)
+            if (isLongHeader && data.Length >= 6)
             {
-                byte scidLen = data[scidOffset];
-                if (data.Length >= scidOffset + 1 + scidLen)
+                info.Version = (uint)((data[1] << 24) | (data[2] << 16) | (data[3] << 8) | data[4]);
+                byte dcidLen = data[5];
+                if (data.Length >= 6 + dcidLen && dcidLen <= 20)
                 {
-                    info.SourceConnectionId = new byte[scidLen];
-                    Buffer.BlockCopy(data, scidOffset + 1, info.SourceConnectionId, 0, scidLen);
+                    info.ClientConnectionId = new byte[dcidLen];
+                    Buffer.BlockCopy(data, 6, info.ClientConnectionId, 0, dcidLen);
                 }
             }
+            return info;
         }
-        else if (!isLongHeader && data.Length >= 5)
-        {
-            // Short header: DCID follows immediately after first byte
-            int dcidLen = Math.Min(4, data.Length - 1); // Typically 4 bytes for Hytale
-            info.ClientConnectionId = new byte[dcidLen];
-            Buffer.BlockCopy(data, 1, info.ClientConnectionId, 0, dcidLen);
-        }
-
-        return info;
-    }
-
-    private bool IsHandshakeCompletePacket(byte[] data)
-    {
-        // Look for Handshake Done frame (type 0x1e) or NST (0x07)
-        // This is a simplified check - in production, you'd parse the crypto frames properly
-        for (int i = 5; i < Math.Min(data.Length - 1, 100); i++)
-        {
-            if (data[i] == 0x1e) return true; // Handshake Done
-            if (data[i] == 0x07) return true; // New Session Ticket (indicates handshake success)
-        }
-        return false;
+        catch { return null; }
     }
 
     public void Dispose() => Stop();
 }
 
-public class QuicSession : IDisposable
+// Simplified session - no CID translation
+public class UdpSession : IDisposable
 {
     public IPEndPoint ClientEndpoint { get; }
-    public UdpClient ServerSocket { get; }
-    public byte[] ClientConnectionId { get; }
+    public Socket ServerSocket { get; }
     public DateTimeOffset LastActivity { get; set; }
 
     private bool _disposed;
 
-    public QuicSession(IPEndPoint clientEp, UdpClient serverSocket, byte[] clientCid)
+    public UdpSession(IPEndPoint clientEp, Socket serverSocket)
     {
         ClientEndpoint = clientEp;
         ServerSocket = serverSocket;
-        ClientConnectionId = clientCid;
         LastActivity = DateTimeOffset.UtcNow;
     }
 
