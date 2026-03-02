@@ -1,4 +1,5 @@
-﻿using HyForce.Core;
+﻿
+using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
@@ -35,10 +36,13 @@ public class MemoryTab : ITab
     private double _lastRefresh = 0;
     private float _refreshInterval = 0.5f;
 
-    // Cancellation token for scans
+    // FIX 4: Cancellation and progress tracking
     private CancellationTokenSource? _scanCts;
+    private bool _isScanning = false;
+    private int _scanProgress = 0;
+    private int _scanTotalRegions = 0;
+    private int _scanCurrentRegion = 0;
 
-    // FIXED: Smaller chunk size to prevent memory pressure
     private const int MAX_SCAN_CHUNK = 256 * 1024;
     private const int MAX_RESULTS = 10000;
 
@@ -133,12 +137,21 @@ public class MemoryTab : ITab
             ImGui.PopStyleColor();
 
             ImGui.SameLine();
-            bool scanning = _scanCts != null;
-            if (scanning)
+
+            // FIX 4: Show scanning status with cancel button
+            if (_isScanning)
             {
-                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.5f, 0.5f, 0.5f, 1f));
-                ImGui.Button("Scanning...", new Vector2(140, 28));
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.9f, 0.3f, 0.2f, 1f));
+                if (ImGui.Button($"Stop Scan ({_scanCurrentRegion}/{_scanTotalRegions})", new Vector2(180, 28)))
+                {
+                    CancelScan();
+                }
                 ImGui.PopStyleColor();
+
+                // Show progress bar
+                ImGui.SameLine();
+                float progress = _scanTotalRegions > 0 ? (float)_scanCurrentRegion / _scanTotalRegions : 0;
+                ImGui.ProgressBar(progress, new Vector2(150, 28), $"{_scanProgress}%");
             }
             else
             {
@@ -148,19 +161,29 @@ public class MemoryTab : ITab
                     Task.Run(() => ScanForTLSKeys());
                 }
                 ImGui.PopStyleColor();
-            }
 
-            ImGui.SameLine();
+                ImGui.SameLine();
 
-            // FIXED: Quick Scan Player button now scans for LocalPlayer patterns
-            if (ImGui.Button("Quick Scan Player", new Vector2(140, 28)))
-            {
-                Task.Run(() => QuickScanLocalPlayer());
+                if (ImGui.Button("Quick Scan Player", new Vector2(140, 28)))
+                {
+                    Task.Run(() => QuickScanLocalPlayer());
+                }
             }
 
             ImGui.SameLine();
             ImGui.Checkbox("Auto", ref _autoRefresh);
         }
+    }
+
+    // FIX 4: Cancel scan method
+    private void CancelScan()
+    {
+        if (_scanCts != null)
+        {
+            _scanCts.Cancel();
+            _state.AddInGameLog("[MEMORY] Scan cancelled by user");
+        }
+        _isScanning = false;
     }
 
     private void RenderNotAttached()
@@ -204,16 +227,29 @@ public class MemoryTab : ITab
 
         ImGui.Spacing();
 
-        bool scanning = _scanCts != null;
-        if (scanning) ImGui.BeginDisabled();
+        // FIX 4: Show scanning state
+        if (_isScanning)
+        {
+            ImGui.BeginDisabled();
+            ImGui.Button("Scanning...", new Vector2(100, 28));
+            ImGui.EndDisabled();
 
-        if (ImGui.Button("First Scan", new Vector2(100, 28)))
-            PerformFirstScan();
+            ImGui.SameLine();
+            if (ImGui.Button("Stop", new Vector2(80, 28)))
+            {
+                CancelScan();
+            }
+        }
+        else
+        {
+            if (ImGui.Button("First Scan", new Vector2(100, 28)))
+                PerformFirstScan();
 
-        ImGui.SameLine();
+            ImGui.SameLine();
 
-        if (ImGui.Button("Next Scan", new Vector2(100, 28)))
-            PerformNextScan();
+            if (ImGui.Button("Next Scan", new Vector2(100, 28)))
+                PerformNextScan();
+        }
 
         ImGui.SameLine();
 
@@ -221,11 +257,8 @@ public class MemoryTab : ITab
         {
             _scanResults.Clear();
             _filteredResults.Clear();
-            _scanCts?.Cancel();
-            _scanCts = null;
+            CancelScan();
         }
-
-        if (scanning) ImGui.EndDisabled();
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -413,15 +446,12 @@ public class MemoryTab : ITab
         ImGui.EndChild();
     }
 
-    // ==================== FIXED: LocalPlayer Scan ====================
-
-    /// <summary>
-    /// FIXED: Scan for LocalPlayer patterns (health, position, name)
-    /// </summary>
     private async void QuickScanLocalPlayer()
     {
         if (!_isAttached || _processHandle == IntPtr.Zero) return;
 
+        // FIX 4: Set scanning state
+        _isScanning = true;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
 
@@ -441,6 +471,7 @@ public class MemoryTab : ITab
         }
         finally
         {
+            _isScanning = false;
             _scanCts = null;
         }
     }
@@ -453,19 +484,26 @@ public class MemoryTab : ITab
             .Where(r => r.Size > 0x1000 && r.Size < 0x10000000)
             .ToList();
 
+        // FIX 4: Set total regions for progress
+        _scanTotalRegions = Math.Min(regions.Count, 50);
+        _scanCurrentRegion = 0;
+        _scanProgress = 0;
+
         int foundHealth = 0;
-        int foundPosition = 0;
         int foundName = 0;
 
-        // Scan 1: Look for health value (100 as float and int)
         foreach (var region in regions.Take(50))
         {
-            // CRITICAL FIX: Check cancellation frequently
+            // FIX 4: Check cancellation frequently
             if (token.IsCancellationRequested)
             {
                 _state.AddInGameLog("[MEMORY] Scan cancelled by user");
                 break;
             }
+
+            // FIX 4: Update progress
+            _scanCurrentRegion++;
+            _scanProgress = (int)((double)_scanCurrentRegion / _scanTotalRegions * 100);
 
             try
             {
@@ -476,18 +514,18 @@ public class MemoryTab : ITab
                     if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
                         continue;
 
-                    // Search for 100 as float (common health value)
                     byte[] healthFloat = BitConverter.GetBytes(100f);
                     byte[] healthInt = BitConverter.GetBytes(100);
-                    byte[] healthIntBE = new byte[] { 0, 0, 0, 100 }; // Big endian
 
                     for (int i = 0; i < read - 4; i++)
                     {
-                        // Check float 100.0
+                        // Check cancellation every 1000 iterations
+                        if (i % 1000 == 0 && token.IsCancellationRequested)
+                            break;
+
                         if (buffer[i] == healthFloat[0] && buffer[i + 1] == healthFloat[1] &&
                             buffer[i + 2] == healthFloat[2] && buffer[i + 3] == healthFloat[3])
                         {
-                            // Verify it's in a reasonable range for player health
                             _scanResults.Add(new MemoryResult
                             {
                                 Address = region.BaseAddress + i,
@@ -498,7 +536,6 @@ public class MemoryTab : ITab
                             if (_scanResults.Count >= MAX_RESULTS) break;
                         }
 
-                        // Check int 100
                         if (buffer[i] == healthInt[0] && buffer[i + 1] == healthInt[1] &&
                             buffer[i + 2] == healthInt[2] && buffer[i + 3] == healthInt[3])
                         {
@@ -513,10 +550,11 @@ public class MemoryTab : ITab
                         }
                     }
 
-                    // Scan 2: Look for player name pattern "LocalPlayer" or common names
                     string[] namePatterns = { "LocalPlayer", "Player", "Hero", "Character" };
                     foreach (var name in namePatterns)
                     {
+                        if (token.IsCancellationRequested) break;
+
                         var nameBytes = Encoding.ASCII.GetBytes(name);
                         for (int i = 0; i < read - nameBytes.Length; i++)
                         {
@@ -535,7 +573,7 @@ public class MemoryTab : ITab
                                 {
                                     Address = region.BaseAddress + i,
                                     Type = ScanValueType.String,
-                                    ValuePreview = $"\\{ name }\\"
+                                    ValuePreview = $"\\{name}\\"
                                 });
                                 foundName++;
                             }
@@ -554,13 +592,14 @@ public class MemoryTab : ITab
         _state.AddInGameLog($"[MEMORY] LocalPlayer scan: {foundHealth} health values, {foundName} name patterns");
     }
 
-    // ==================== TLS Key Scanning ====================
-
     private async void ScanForTLSKeys()
     {
         if (!_isAttached || _hytaleProcess == null || _processHandle == IntPtr.Zero) return;
 
         _state.AddInGameLog("[AUTO-KEY] Starting automatic TLS key extraction...");
+
+        // FIX 4: Set scanning state
+        _isScanning = true;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
 
@@ -603,6 +642,7 @@ public class MemoryTab : ITab
         }
         finally
         {
+            _isScanning = false;
             _scanCts = null;
         }
     }
@@ -614,15 +654,24 @@ public class MemoryTab : ITab
             .Where(r => r.Size > 0x1000 && r.Size < 0x10000000)
             .OrderByDescending(r => r.Size);
 
+        // FIX 4: Set progress tracking
+        _scanTotalRegions = 20;
+        _scanCurrentRegion = 0;
+
         foreach (var region in regions.Take(20))
         {
             if (token.IsCancellationRequested) break;
+
+            _scanCurrentRegion++;
+            _scanProgress = (int)((double)_scanCurrentRegion / _scanTotalRegions * 100);
 
             try
             {
                 long offset = 0;
                 while (offset < region.Size)
                 {
+                    if (token.IsCancellationRequested) break;
+
                     int toRead = (int)Math.Min(MAX_SCAN_CHUNK, region.Size - offset);
 
                     byte[]? buffer = ArrayPool<byte>.Shared.Rent(toRead);
@@ -715,7 +764,6 @@ public class MemoryTab : ITab
             if (!ReadProcessMemory(_processHandle, sessionPtr, sessionData, 256, out int read))
                 return null;
 
-            // Look for 48-byte master secret (TLS 1.3)
             for (int i = 0; i < sessionData.Length - 48; i++)
             {
                 double entropy = CalculateEntropy(sessionData, i, 48);
@@ -736,7 +784,6 @@ public class MemoryTab : ITab
                         MemoryAddress = sessionPtr + i
                     };
 
-                    // CRITICAL: Derive keys immediately
                     PacketDecryptor.DeriveQUICKeys(key);
 
                     if (key.Key.Length == 16)
@@ -756,11 +803,18 @@ public class MemoryTab : ITab
             .OrderByDescending(r => r.Size)
             .ToList();
 
+        // FIX 4: Progress tracking
+        _scanTotalRegions = 30;
+        _scanCurrentRegion = 0;
+
         int totalKeysFound = 0;
 
         foreach (var region in regions.Take(30))
         {
             if (token.IsCancellationRequested) break;
+
+            _scanCurrentRegion++;
+            _scanProgress = (int)((double)_scanCurrentRegion / _scanTotalRegions * 100);
 
             try
             {
@@ -804,7 +858,7 @@ public class MemoryTab : ITab
 
             var key = new PacketDecryptor.EncryptionKey
             {
-                Key = keyBytes.Take(16).ToArray(), // Use first 16 bytes
+                Key = keyBytes.Take(16).ToArray(),
                 IV = new byte[12],
                 Type = PacketDecryptor.EncryptionType.AES128GCM,
                 Source = "Memory scan",
@@ -840,10 +894,10 @@ public class MemoryTab : ITab
         return entropy;
     }
 
-    // ==================== Standard Scanning ====================
-
     private async void PerformFirstScan()
     {
+        // FIX 4: Set scanning state
+        _isScanning = true;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
 
@@ -863,6 +917,7 @@ public class MemoryTab : ITab
         }
         finally
         {
+            _isScanning = false;
             _scanCts = null;
         }
     }
@@ -874,11 +929,17 @@ public class MemoryTab : ITab
         if (_processHandle == IntPtr.Zero) return;
 
         var regions = GetReadableMemoryRegions();
-        int scannedRegions = 0;
+
+        // FIX 4: Progress tracking
+        _scanTotalRegions = Math.Min(regions.Count, 50);
+        _scanCurrentRegion = 0;
 
         foreach (var region in regions.Take(50))
         {
             if (token.IsCancellationRequested) break;
+
+            _scanCurrentRegion++;
+            _scanProgress = (int)((double)_scanCurrentRegion / _scanTotalRegions * 100);
 
             try
             {
@@ -896,7 +957,6 @@ public class MemoryTab : ITab
                             case 3: ScanFloatRange(buffer, read, region.BaseAddress, _scanValue); break;
                         }
                     }
-                    scannedRegions++;
                 }
                 finally
                 {
@@ -907,7 +967,7 @@ public class MemoryTab : ITab
         }
 
         _filteredResults = new List<MemoryResult>(_scanResults);
-        _state.AddInGameLog($"[MEMORY] Scanned {scannedRegions} regions, found {_scanResults.Count} results");
+        _state.AddInGameLog($"[MEMORY] Scanned {_scanCurrentRegion} regions, found {_scanResults.Count} results");
     }
 
     private void PerformNextScan()
@@ -1053,7 +1113,7 @@ public class MemoryTab : ITab
                 {
                     Address = baseAddr + i,
                     Type = ScanValueType.String,
-                    ValuePreview = $"{ str }"
+                    ValuePreview = $"{str}"
                 });
                 if (_scanResults.Count >= MAX_RESULTS) return;
             }
@@ -1109,13 +1169,11 @@ public class MemoryTab : ITab
         return regions;
     }
 
-    // CRITICAL FIX: Added bounds checking to prevent buffer overflow
     private byte[]? ReadMemoryBytes(IntPtr address, int size)
     {
         if (_processHandle == IntPtr.Zero || address == IntPtr.Zero)
             return null;
 
-        // CRITICAL FIX: Validate size to prevent overflow
         if (size <= 0 || size > 4096)
         {
             _state.AddInGameLog($"[MEMORY] Invalid read size: {size}");
@@ -1244,6 +1302,8 @@ public class MemoryTab : ITab
 
     private void Detach()
     {
+        CancelScan(); // FIX 4: Cancel any running scan
+
         if (_processHandle != IntPtr.Zero)
             CloseHandle(_processHandle);
 
@@ -1252,8 +1312,6 @@ public class MemoryTab : ITab
         _isAttached = false;
         _scanResults.Clear();
         _watches.Clear();
-        _scanCts?.Cancel();
-        _scanCts = null;
     }
 
     private void CopyToClipboard(string text)

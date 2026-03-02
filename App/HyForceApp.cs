@@ -56,9 +56,14 @@ public class HyForceApp
         _tabs.Add(new PacketFeedTab(_state));
         _tabs.Add(new SecurityAuditTab(_state));
         _tabs.Add(new LogTab(_state));
-        _tabs.Add(new MemoryTab(_state));        // Memory scanner
-        _tabs.Add(new DecryptionTab(_state));    // Decryption management
+        _tabs.Add(new MemoryTab(_state));
+        _tabs.Add(new ActionCorrelatorTab(_state));
+        _tabs.Add(new DecryptionTab(_state));
         _tabs.Add(new SettingsTab(_state));
+        _tabs.Add(new PacketAnalyticsTab(_state));
+        _tabs.Add(new PacketInspectorTab(_state));
+        _tabs.Add(new RegistryTab(_state));
+
     }
 
     private void SetupImGuiStyle()

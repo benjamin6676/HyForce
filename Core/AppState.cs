@@ -14,6 +14,9 @@ public class AppState : IDisposable
     public Config Config { get; } = new();
     public UdpProxy UdpProxy { get; }
 
+    // FIX 2: Add TcpProxy property
+    public TcpProxy TcpProxy { get; }
+
     public PacketLog PacketLog { get; }
     public TestLog Log { get; }
     public PlayerItemDatabase Database { get; }
@@ -22,11 +25,13 @@ public class AppState : IDisposable
     public int TargetPort { get; set; } = 5520;
     public int ListenPort { get; set; } = 5521;
 
-    public bool IsRunning => UdpProxy.IsRunning;
+    public bool IsRunning => UdpProxy.IsRunning || TcpProxy.IsRunning;
     public DateTime? StartTime { get; private set; }
 
     public long TotalPackets => PacketLog.TotalPackets;
     public long UdpPackets => PacketLog.PacketsUdp;
+    // FIX 2: Add TcpPackets property
+    public long TcpPackets => PacketLog.PacketsTcp;
 
     public ConcurrentBag<SecurityEvent> SecurityEvents { get; } = new();
     public bool ShowAboutWindow;
@@ -39,35 +44,33 @@ public class AppState : IDisposable
     public event PacketReceivedHandler? OnPacketReceived;
     public event Action? OnSecurityEvent;
     public event Action? OnMemoryDataUpdated;
-
-    // NEW: Event for key updates
     public event Action? OnKeysUpdated;
 
-    // Auto-decryption timer
     private System.Timers.Timer? _autoDecryptTimer;
-
-    // NEW: File watcher for SSL key log
     private FileSystemWatcher? _sslKeyWatcher;
     private DateTime _lastKeyLoadTime = DateTime.MinValue;
     private readonly object _keyLoadLock = new();
-
-    // FIXED: Retry queue for locked files
     private readonly Queue<string> _pendingKeyFiles = new();
     private readonly System.Timers.Timer _retryTimer;
-
-    // CRITICAL FIX: Cached delegate for proper event unsubscription
     private readonly PacketReceivedHandler _packetHandlerDelegate;
+    // FIX 2: Add TCP packet handler delegate
+    private readonly PacketReceivedHandler _tcpPacketHandlerDelegate;
 
     public AppState()
     {
         Log = new TestLog();
         UdpProxy = new UdpProxy(Log);
+        // FIX 2: Initialize TcpProxy
+        TcpProxy = new TcpProxy(Log);
         PacketLog = new PacketLog(10000);
         Database = new PlayerItemDatabase();
 
-        // CRITICAL FIX: Cache delegate to allow proper removal
         _packetHandlerDelegate = HandlePacket;
         UdpProxy.OnPacket += _packetHandlerDelegate;
+
+        // FIX 2: Subscribe to TCP packets
+        _tcpPacketHandlerDelegate = HandlePacket;
+        TcpProxy.OnPacket += _tcpPacketHandlerDelegate;
 
         Directory.CreateDirectory(ExportDirectory);
 
@@ -75,7 +78,6 @@ public class AppState : IDisposable
         SetupSSLKeyWatcher();
         ScanAndLoadExistingKeys();
 
-        // FIXED: Setup retry timer for locked files
         _retryTimer = new System.Timers.Timer(2000);
         _retryTimer.Elapsed += (s, e) => ProcessPendingKeyFiles();
         _retryTimer.AutoReset = true;
@@ -104,7 +106,6 @@ public class AppState : IDisposable
 
             _sslKeyWatcher.Changed += (s, e) =>
             {
-                // Debounce rapid change events
                 lock (_keyLoadLock)
                 {
                     if ((DateTime.Now - _lastKeyLoadTime).TotalSeconds > 2)
@@ -130,7 +131,6 @@ public class AppState : IDisposable
         {
             if (!Directory.Exists(ExportDirectory)) return;
 
-            // Look for any SSL-related log files
             var keyFiles = Directory.GetFiles(ExportDirectory, "*.log")
                 .Where(f =>
                     Path.GetFileName(f).Contains("ssl", StringComparison.OrdinalIgnoreCase) ||
@@ -141,8 +141,6 @@ public class AppState : IDisposable
             if (keyFiles.Any())
             {
                 AddInGameLog($"[KEYS] Found {keyFiles.Count} potential key files");
-
-                // Load the most recent one first
                 foreach (var file in keyFiles.Take(3))
                 {
                     QueueKeyFileLoad(file);
@@ -159,7 +157,6 @@ public class AppState : IDisposable
         }
     }
 
-    // FIXED: Queue file for loading with retry
     private void QueueKeyFileLoad(string path)
     {
         lock (_pendingKeyFiles)
@@ -171,7 +168,6 @@ public class AppState : IDisposable
         }
     }
 
-    // FIXED: Process queued files with retry logic
     private void ProcessPendingKeyFiles()
     {
         lock (_pendingKeyFiles)
@@ -180,13 +176,9 @@ public class AppState : IDisposable
             for (int i = 0; i < count; i++)
             {
                 if (_pendingKeyFiles.Count == 0) break;
-
                 string path = _pendingKeyFiles.Dequeue();
-
-                // Try to load, if fails re-queue
                 if (!TryLoadKeysFromFileInternal(path))
                 {
-                    // Re-queue for retry (max 5 attempts)
                     if (!path.Contains("|retry5"))
                     {
                         int retryCount = 0;
@@ -194,7 +186,6 @@ public class AppState : IDisposable
                         {
                             int.TryParse(path.Split("|retry")[1], out retryCount);
                         }
-
                         if (retryCount < 5)
                         {
                             string retryPath = path.Split("|retry")[0] + $"|retry{retryCount + 1}";
@@ -210,15 +201,11 @@ public class AppState : IDisposable
         }
     }
 
-    // In Core/AppState.cs - Replace SetupAutoDecryption with this:
-
     private void SetupAutoDecryption()
     {
-        // FIXED: Disabled by default - user must enable manually
-        _autoDecryptTimer = new System.Timers.Timer(10000); // 10 seconds instead of 5
+        _autoDecryptTimer = new System.Timers.Timer(10000);
         _autoDecryptTimer.Elapsed += (s, e) =>
         {
-            // Only decrypt if enabled and not throttled
             if (PacketDecryptor.AutoDecryptEnabled)
             {
                 TryAutoDecryptPackets();
@@ -232,7 +219,6 @@ public class AppState : IDisposable
         if (!PacketDecryptor.AutoDecryptEnabled) return;
         if (PacketDecryptor.DiscoveredKeys.Count == 0) return;
 
-        // Only try last 10 packets, max 1 per second
         var recentPackets = PacketLog.GetLast(10);
         int decrypted = 0;
 
@@ -252,8 +238,6 @@ public class AppState : IDisposable
         }
     }
 
-
-
     public void AddInGameLog(string message)
     {
         lock (InGameLog)
@@ -264,19 +248,28 @@ public class AppState : IDisposable
         }
     }
 
+    // FIX 2: Modified Start() to start both TCP and UDP proxies
     public void Start()
     {
         if (IsRunning) return;
 
+        // Start UDP proxy for gameplay
         UdpProxy.Start("0.0.0.0", ListenPort, TargetHost, TargetPort);
+
+        // FIX 2: Start TCP proxy for registry sync (on different port)
+        int tcpListenPort = ListenPort + 1; // 5522 for TCP
+        int tcpTargetPort = TargetPort;     // 5520 (Hytale uses same port for TCP/UDP)
+        TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, tcpTargetPort);
+
         StartTime = DateTime.Now;
         _autoDecryptTimer?.Start();
 
         Log.Info($"[HyForce] Started - UDP Proxy on 0.0.0.0:{ListenPort}", "System");
+        Log.Info($"[HyForce] Started - TCP Proxy on 0.0.0.0:{tcpListenPort}", "System");
         Log.Info($"[HyForce] Forwarding to {TargetHost}:{TargetPort}", "System");
-        Log.Info($"[HyForce] Hytale uses UDP/QUIC only - no TCP needed", "System");
 
         AddInGameLog($"UDP Proxy started on 127.0.0.1:{ListenPort}");
+        AddInGameLog($"TCP Proxy started on 127.0.0.1:{tcpListenPort}");
         AddInGameLog($"Connect Hytale to 127.0.0.1:{ListenPort}");
 
         // AUTO-COPY IP TO CLIPBOARD
@@ -292,11 +285,50 @@ public class AppState : IDisposable
             Log.Warn($"Failed to copy to clipboard: {ex.Message}", "System");
         }
 
-        // AUTO-ATTEMPT SSLKEYLOGFILE
         TryEnableSSLKeyLogFile();
-
-        // NEW: Re-scan for keys on start (in case they were added while stopped)
         ScanAndLoadExistingKeys();
+    }
+
+    private PacketDecryptor.EncryptionKey? ParseSSLKeyLogLine(string line, string source)
+    {
+        try
+        {
+            // SSLKEYLOGFILE format: CLIENT_TRAFFIC_SECRET_0 <hex> <hex>
+            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 3) return null;
+
+            string label = parts[0];
+            byte[] clientRandom = Convert.FromHexString(parts[1]);
+            byte[] secret = Convert.FromHexString(parts[2]);
+
+            // Determine key type based on label
+            var keyType = label switch
+            {
+                "CLIENT_TRAFFIC_SECRET_0" => PacketDecryptor.EncryptionType.QUIC_Client1RTT,
+                "SERVER_TRAFFIC_SECRET_0" => PacketDecryptor.EncryptionType.QUIC_Server1RTT,
+                "CLIENT_HANDSHAKE_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_ClientHandshake,
+                "SERVER_HANDSHAKE_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_ServerHandshake,
+                _ => PacketDecryptor.EncryptionType.QUIC_Client1RTT
+            };
+
+            var key = new PacketDecryptor.EncryptionKey
+            {
+                Secret = secret,
+                Type = keyType,
+                Source = source,
+                DiscoveredAt = DateTime.Now
+            };
+
+            // Derive actual QUIC keys from TLS secret
+            PacketDecryptor.DeriveQUICKeys(key);
+
+            return key;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Failed to parse SSL key log line: {ex.Message}", "Keys");
+            return null;
+        }
     }
 
     private void TryEnableSSLKeyLogFile()
@@ -307,7 +339,6 @@ public class AppState : IDisposable
             Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath);
             AddInGameLog($"[AUTO-DECRYPT] SSLKEYLOGFILE set to: {keyLogPath}");
 
-            // Also try to find existing key log files
             var existingLogs = Directory.GetFiles(ExportDirectory, "*.log")
                 .Where(f => f.Contains("key", StringComparison.OrdinalIgnoreCase) ||
                            f.Contains("ssl", StringComparison.OrdinalIgnoreCase));
@@ -324,16 +355,13 @@ public class AppState : IDisposable
         }
     }
 
-    // FIXED: Public method uses queue
     public void TryLoadKeysFromFile(string path)
     {
         QueueKeyFileLoad(path);
     }
 
-    // FIXED: Internal method with proper QUIC key derivation
     private bool TryLoadKeysFromFileInternal(string path)
     {
-        // Strip retry marker for actual path
         string actualPath = path.Split("|retry")[0];
         int retryCount = 0;
         const int MAX_RETRIES = 5;
@@ -342,12 +370,11 @@ public class AppState : IDisposable
         {
             try
             {
-                if (!File.Exists(actualPath)) return true; // Done, file gone
+                if (!File.Exists(actualPath)) return true;
 
                 int keysAdded = 0;
                 int linesProcessed = 0;
 
-                // CRITICAL FIX: Use FileShare.ReadWrite to allow concurrent access
                 using (var fs = new FileStream(actualPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 using (var reader = new StreamReader(fs))
                 {
@@ -355,17 +382,19 @@ public class AppState : IDisposable
                     while ((line = reader.ReadLine()) != null)
                     {
                         linesProcessed++;
-
-                        // Parse SSLKEYLOGFILE format and derive QUIC keys
                         if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
                             line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
                             line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
                             line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
                             line.StartsWith("EXPORTER_SECRET"))
                         {
-                            // Use the new method that properly derives QUIC keys
-                            PacketDecryptor.AddKeyFromSSLLog(line, actualPath);
-                            keysAdded++;
+                            // Parse SSL key log line and add key
+                            var key = ParseSSLKeyLogLine(line, actualPath);
+                            if (key != null)
+                            {
+                                PacketDecryptor.AddKey(key);
+                                keysAdded++;
+                            }
                         }
                     }
                 }
@@ -375,15 +404,15 @@ public class AppState : IDisposable
                     AddInGameLog($"[KEYS] Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}");
                     AddInGameLog($"[KEYS] QUIC keys auto-derived using RFC 9001 HKDF-Expand-Label");
                     Log.Success($"Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}", "Keys");
-                    OnKeysUpdated?.Invoke(); // Notify UI
-                    return true; // Success
+                    OnKeysUpdated?.Invoke();
+                    return true;
                 }
                 else if (linesProcessed > 0)
                 {
                     AddInGameLog($"[KEYS] No valid TLS secrets found in {Path.GetFileName(actualPath)} ({linesProcessed} lines)");
-                    return true; // Success, just no keys
+                    return true;
                 }
-                return true; // Empty file
+                return true;
             }
             catch (IOException ex) when (IsFileLocked(ex))
             {
@@ -393,12 +422,12 @@ public class AppState : IDisposable
                     AddInGameLog($"[KEYS] File locked after {MAX_RETRIES} attempts: {Path.GetFileName(actualPath)}");
                     return false;
                 }
-                Thread.Sleep(100 * retryCount); // Exponential backoff
+                Thread.Sleep(100 * retryCount);
             }
             catch (Exception ex)
             {
                 AddInGameLog($"[KEYS] Failed to load keys: {ex.Message}");
-                return true; // Don't retry on other errors
+                return true;
             }
         }
         return false;
@@ -407,10 +436,9 @@ public class AppState : IDisposable
     private static bool IsFileLocked(IOException exception)
     {
         int errorCode = exception.HResult & 0xFFFF;
-        return errorCode == 32 || errorCode == 33; // ERROR_SHARING_VIOLATION or ERROR_LOCK_VIOLATION
+        return errorCode == 32 || errorCode == 33;
     }
 
-    // NEW: Force refresh of all key files
     public void RefreshAllKeys()
     {
         AddInGameLog("[KEYS] Refreshing all key files...");
@@ -418,7 +446,6 @@ public class AppState : IDisposable
         OnKeysUpdated?.Invoke();
     }
 
-    // NEW: Get detailed key status
     public KeyStatus GetKeyStatus()
     {
         return new KeyStatus
@@ -436,6 +463,8 @@ public class AppState : IDisposable
     public void Stop()
     {
         UdpProxy.Stop();
+        // FIX 2: Stop TCP proxy too
+        TcpProxy.Stop();
         StartTime = null;
         _autoDecryptTimer?.Stop();
         Log.Info("[HyForce] Proxy stopped", "System");
@@ -449,12 +478,10 @@ public class AppState : IDisposable
         Database.ProcessPacket(packet);
         OnPacketReceived?.Invoke(packet);
 
-        // NEW: If decryption keeps failing, trigger auto-key scan
         if (PacketDecryptor.FailedDecryptions > 100 &&
             PacketDecryptor.DiscoveredKeys.Count == 0 &&
             _autoDecryptTimer?.Enabled == true)
         {
-            // Trigger memory scan from menu system
             TriggerMemoryScan();
         }
     }
@@ -517,7 +544,7 @@ public class AppState : IDisposable
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("+------------------------------------------------------------------------------+");
-        sb.AppendLine("                    HYFORCE V22-ENHANCED - UDP-ONLY MODE                       ");
+        sb.AppendLine("                    HYFORCE V22-ENHANCED - TCP+UDP MODE                        ");
         sb.AppendLine("+------------------------------------------------------------------------------+");
         sb.AppendLine();
         sb.AppendLine($"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
@@ -536,9 +563,10 @@ public class AppState : IDisposable
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                                CONFIGURATION                                  ");
         sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine($"Mode: UDP-ONLY (Hytale uses QUIC/UDP)");
+        sb.AppendLine($"Mode: TCP+UDP (Hytale Registry + Gameplay)");
         sb.AppendLine($"Target: {TargetHost}:{TargetPort}");
-        sb.AppendLine($"Listen: 0.0.0.0:{ListenPort}");
+        sb.AppendLine($"UDP Listen: 0.0.0.0:{ListenPort}");
+        sb.AppendLine($"TCP Listen: 0.0.0.0:{ListenPort + 1}");
         sb.AppendLine($"Export Path: {ExportDirectory}");
         sb.AppendLine();
 
@@ -550,11 +578,18 @@ public class AppState : IDisposable
         sb.AppendLine($"  - Active Sessions: {UdpProxy.ActiveSessions}");
         sb.AppendLine($"  - Total Clients: {UdpProxy.TotalClients}");
         sb.AppendLine();
+        // FIX 2: Add TCP proxy status to diagnostics
+        sb.AppendLine($"TCP Proxy: {(TcpProxy.IsRunning ? "RUNNING " : "STOPPED")}");
+        sb.AppendLine($"  - Status: {TcpProxy.StatusMessage}");
+        sb.AppendLine($"  - Active Connections: {TcpProxy.ActiveSessions}");
+        sb.AppendLine($"  - Total Connections: {TcpProxy.TotalConnections}");
+        sb.AppendLine();
 
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                              TRAFFIC STATISTICS                               ");
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine($"Total Packets: {TotalPackets:N0}");
+        sb.AppendLine($"  TCP: {TcpPackets:N0} ({FormatBytes(PacketLog.BytesTcp)} bytes) - Registry/Login");
         sb.AppendLine($"  UDP: {UdpPackets:N0} ({FormatBytes(PacketLog.BytesUdp)} bytes) - Gameplay");
         sb.AppendLine();
         sb.AppendLine($"Bytes Total: {FormatBytes(PacketLog.BytesSc + PacketLog.BytesCs)}");
@@ -654,7 +689,7 @@ public class AppState : IDisposable
         var packets = PacketLog.GetAll();
         foreach (var pkt in packets)
         {
-            sb.AppendLine($"[{pkt.Timestamp:HH:mm:ss.fff}] {pkt.DirStr} UDP " +
+            sb.AppendLine($"[{pkt.Timestamp:HH:mm:ss.fff}] {pkt.DirStr} {(pkt.IsTcp ? "TCP" : "UDP")} " +
                 $"0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeName}) {pkt.ByteLength} bytes " +
                 $"[{pkt.CompressionMethod}] [{(pkt.EncryptionHint == "encrypted" ? "ENC" : "CLR")}]");
 
@@ -750,7 +785,6 @@ public class AppState : IDisposable
                 File.WriteAllLines(Path.Combine(basePath, "players.txt"), Protocol.RegistrySyncParser.PlayerNamesSeen);
             }
 
-            // NEW: Export keys if available
             if (PacketDecryptor.DiscoveredKeys.Count > 0)
             {
                 var keysSb = new System.Text.StringBuilder();
@@ -805,8 +839,9 @@ public class AppState : IDisposable
 
     public void Dispose()
     {
-        // CRITICAL FIX: Remove cached delegate instead of instance method
         UdpProxy.OnPacket -= _packetHandlerDelegate;
+        // FIX 2: Unsubscribe TCP handler
+        TcpProxy.OnPacket -= _tcpPacketHandlerDelegate;
 
         Stop();
         _autoDecryptTimer?.Dispose();
@@ -817,7 +852,6 @@ public class AppState : IDisposable
     }
 }
 
-// NEW: Key status class
 public class KeyStatus
 {
     public int TotalKeys { get; set; }

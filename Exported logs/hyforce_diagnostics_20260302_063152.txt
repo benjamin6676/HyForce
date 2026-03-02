@@ -1,0 +1,209 @@
++------------------------------------------------------------------------------+
+                    HYFORCE V22-ENHANCED - UDP-ONLY MODE                       
++------------------------------------------------------------------------------+
+
+Generated: 2026-03-02 06:31:52
+Session Duration: 5m 44s
+
+-------------------------------------------------------------------------------
+                              SYSTEM INFORMATION                               
+-------------------------------------------------------------------------------
+OS: Microsoft Windows NT 10.0.19045.0
+.NET Version: 10.0.3
+Machine: DESKTOP-640UJ9D
+Processor Count: 12
+
+-------------------------------------------------------------------------------
+                                CONFIGURATION                                  
+-------------------------------------------------------------------------------
+Mode: UDP-ONLY (Hytale uses QUIC/UDP)
+Target: 51.195.60.80:5520
+Listen: 0.0.0.0:5521
+Export Path: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs
+
+-------------------------------------------------------------------------------
+                                PROXY STATUS                                   
+-------------------------------------------------------------------------------
+UDP Proxy: RUNNING 
+  - Status: Active: 1 sessions
+  - Active Sessions: 1
+  - Total Clients: 1
+
+-------------------------------------------------------------------------------
+                              TRAFFIC STATISTICS                               
+-------------------------------------------------------------------------------
+Total Packets: 33 051
+  UDP: 33 051 (9,61 MB bytes) - Gameplay
+
+Bytes Total: 9,61 MB
+  Server->Client: 8,65 MB
+  Client->Server: 982,38 KB
+
+Unique Opcodes: 0
+
+-------------------------------------------------------------------------------
+                             DECRYPTION STATUS                                 
+-------------------------------------------------------------------------------
+Keys Available: 20
+Successful Decryptions: 0
+Failed Decryptions: 64
+
+Key Sources:
+  - C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161: 10 keys
+  - C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153: 10 keys
+
+-------------------------------------------------------------------------------
+                                TOP 20 OPCODES                                 
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+                               PLAYER DATABASE                                 
+-------------------------------------------------------------------------------
+Unique Items: 0
+Unique Players: 17 916
+
+-------------------------------------------------------------------------------
+                               SECURITY EVENTS                                 
+-------------------------------------------------------------------------------
+Total Events: 13 660
+By Category: Encryption: 13660
+
+--- Recent Events (Last 20) ---
+[06:29:01] [Encryption  ] Key discovered: QUIC_Server1RTT
+    type: QUIC_Server1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ServerHandshake
+    type: QUIC_ServerHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ClientHandshake
+    type: QUIC_ClientHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_Server1RTT
+    type: QUIC_Server1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ServerHandshake
+    type: QUIC_ServerHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ClientHandshake
+    type: QUIC_ClientHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_Server1RTT
+    type: QUIC_Server1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ServerHandshake
+    type: QUIC_ServerHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ClientHandshake
+    type: QUIC_ClientHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_Server1RTT
+    type: QUIC_Server1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ServerHandshake
+    type: QUIC_ServerHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ClientHandshake
+    type: QUIC_ClientHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_Server1RTT
+    type: QUIC_Server1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:153
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ServerHandshake
+    type: QUIC_ServerHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+[06:29:01] [Encryption  ] Key discovered: QUIC_ClientHandshake
+    type: QUIC_ClientHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log:161
+    key_length: 16
+
+-------------------------------------------------------------------------------
+                                IN-GAME LOG                                    
+-------------------------------------------------------------------------------
+[06:31:39] [006F] MouseInteraction (60 bytes)
+[06:31:40] [006C] ClientMovement (50 bytes)
+[06:31:40] [0070] DamageInfo (60 bytes)
+[06:31:41] [0070] DamageInfo (50 bytes)
+[06:31:41] [0070] DamageInfo (50 bytes)
+[06:31:41] [0070] DamageInfo (50 bytes)
+[06:31:41] [INTERACTION] Mouse click/attack
+[06:31:41] [006F] MouseInteraction (60 bytes)
+[06:31:42] [0070] DamageInfo (50 bytes)
+[06:31:42] [0070] DamageInfo (50 bytes)
+[06:31:42] [0070] DamageInfo (50 bytes)
+[06:31:42] [INTERACTION] Mouse click/attack
+[06:31:42] [006F] MouseInteraction (50 bytes)
+[06:31:43] [0070] DamageInfo (50 bytes)
+[06:31:44] [INTERACTION] Mouse click/attack
+[06:31:44] [006F] MouseInteraction (50 bytes)
+[06:31:44] [INTERACTION] Mouse click/attack
+[06:31:44] [006F] MouseInteraction (86 bytes)
+[06:31:44] [0070] DamageInfo (49 bytes)
+[06:31:44] [0070] DamageInfo (50 bytes)
+[06:31:44] [INTERACTION] Mouse click/attack
+[06:31:44] [006F] MouseInteraction (50 bytes)
+[06:31:45] [INTERACTION] Mouse click/attack
+[06:31:45] [006F] MouseInteraction (50 bytes)
+[06:31:45] [INTERACTION] Mouse click/attack
+[06:31:45] [006F] MouseInteraction (50 bytes)
+[06:31:45] [006C] ClientMovement (50 bytes)
+[06:31:45] [INTERACTION] Mouse click/attack
+[06:31:45] [006F] MouseInteraction (50 bytes)
+[06:31:46] [006C] ClientMovement (60 bytes)
+[06:31:46] [0070] DamageInfo (50 bytes)
+[06:31:46] [INTERACTION] Mouse click/attack
+[06:31:46] [006F] MouseInteraction (77 bytes)
+[06:31:46] [0070] DamageInfo (50 bytes)
+[06:31:46] [006C] ClientMovement (50 bytes)
+[06:31:47] [006C] ClientMovement (50 bytes)
+[06:31:48] [0070] DamageInfo (50 bytes)
+[06:31:48] [006C] ClientMovement (50 bytes)
+[06:31:48] [INTERACTION] Mouse click/attack
+[06:31:48] [006F] MouseInteraction (50 bytes)
+[06:31:49] [006C] ClientMovement (50 bytes)
+[06:31:49] [0070] DamageInfo (77 bytes)
+[06:31:49] [0070] DamageInfo (50 bytes)
+[06:31:50] Diagnostics report generated
+[06:31:50] [0070] DamageInfo (50 bytes)
+[06:31:51] [INTERACTION] Mouse click/attack
+[06:31:51] [006F] MouseInteraction (50 bytes)
+[06:31:52] [INTERACTION] Mouse click/attack
+[06:31:52] [006F] MouseInteraction (60 bytes)
+[06:31:52] [006C] ClientMovement (50 bytes)
+
+-------------------------------------------------------------------------------
+                           END OF DIAGNOSTICS REPORT                           
+-------------------------------------------------------------------------------
