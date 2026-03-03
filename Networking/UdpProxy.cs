@@ -1,4 +1,4 @@
-﻿// FILE: Networking/UdpProxy.cs - FIXED: Proper QUIC transparent proxy without handshake corruption
+// FILE: Networking/UdpProxy.cs - FIXED: Proper QUIC transparent proxy without handshake corruption
 using HyForce.Core;
 using System.Collections.Concurrent;
 using System.Net;
@@ -16,6 +16,9 @@ public class UdpProxy : IDisposable
     public string ServerIp { get; private set; } = "";
     public int ServerPort { get; private set; }
     public int ListenPort { get; private set; }
+
+    private IPEndPoint? _lastClientEndpoint = null;
+    public IPEndPoint? LastClientEndpoint { get => _lastClientEndpoint; private set => _lastClientEndpoint = value; }
 
     public event PacketReceivedHandler? OnPacket;
 
@@ -118,6 +121,18 @@ public class UdpProxy : IDisposable
         _log.Info("[UDP] Stopped", "UDP");
     }
 
+    public async Task InjectToServerAsync(byte[] data)
+    {
+        if (_sharedServerSocket != null && _serverEp != null)
+            await _sharedServerSocket.SendAsync(data, data.Length, _serverEp);
+    }
+
+    public async Task InjectToClientAsync(byte[] data)
+    {
+        if (_listener != null && _lastClientEndpoint != null)
+            await _listener.SendAsync(data, data.Length, _lastClientEndpoint);
+    }
+
     // CRITICAL FIX: Batch logging to prevent thread pool exhaustion
     private void StartBatchLogging()
     {
@@ -185,6 +200,7 @@ public class UdpProxy : IDisposable
 
             var clientEp = result.RemoteEndPoint;
             var key = clientEp.ToString();
+            _lastClientEndpoint = clientEp;
             var data = result.Buffer;
 
             if (data.Length == 0) continue;
@@ -193,7 +209,7 @@ public class UdpProxy : IDisposable
             if (!_sessions.TryGetValue(key, out var session))
             {
                 TotalClients++;
-                session = new UdpSession(clientEp);
+                session = new UdpSession(clientEp, this);
                 _sessions[key] = session;
                 StatusMessage = $"Active: {_sessions.Count} sessions";
                 _log.Info($"[UDP] New session #{TotalClients}: {clientEp}", "UDP");
@@ -333,21 +349,9 @@ public class UdpSession : IDisposable
 {
     public IPEndPoint ClientEndpoint { get; }
     public DateTimeOffset LastActivity { get; set; }
-
-    private bool _disposed;
-
-    // FIXED: Lightweight session - no per-client sockets
-    public UdpSession(IPEndPoint clientEp)
-    {
-        ClientEndpoint = clientEp;
-        LastActivity = DateTimeOffset.UtcNow;
-    }
-
-    public void Dispose()
-    {
-        if (!_disposed)
-        {
-            _disposed = true;
-        }
-    }
+    private readonly UdpProxy _parent;
+    public UdpSession(IPEndPoint ep, UdpProxy parent) { ClientEndpoint = ep; _parent = parent; LastActivity = DateTimeOffset.UtcNow; }
+    public void Dispose() { }
+    public async Task InjectToServerAsync(byte[] d) => await _parent.InjectToServerAsync(d);
+    public async Task InjectToClientAsync(byte[] d) => await _parent.InjectToClientAsync(d);
 }

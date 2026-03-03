@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/PacketFeedTab.cs - ENHANCED: Opcode exclusion, better filtering, performance
+// FILE: Tabs/PacketFeedTab.cs - ENHANCED: Opcode exclusion, better filtering, performance
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
@@ -16,6 +16,7 @@ public class PacketFeedTab : ITab
 {
     public string Name => "Packet Feed";
     private readonly AppState _state;
+    private readonly PacketInspectorTab? _inspector; // FIX: wired from HyForceApp
     private PacketLogEntry? _selectedPacket;
     private string _filterOpcode = "";
     private bool _showOnlyCritical;
@@ -59,9 +60,10 @@ public class PacketFeedTab : ITab
         ["All Registry"] = Enumerable.Range(0x28, 0x1B).Select(i => (ushort)i).ToArray()
     };
 
-    public PacketFeedTab(AppState state)
+    public PacketFeedTab(AppState state, PacketInspectorTab? inspector = null)
     {
         _state = state;
+        _inspector = inspector;
 
         // Auto-exclude QUIC handshake noise on startup
         if (_excludeQuicHandshake)
@@ -314,6 +316,7 @@ public class PacketFeedTab : ITab
                 if (ImGui.Selectable(selectableId, isSelected, ImGuiSelectableFlags.SpanAllColumns))
                 {
                     _selectedPacket = pkt;
+                    _inspector?.SelectPacket(pkt); // FIX: wire Inspector
                 }
 
                 if (isSelected)

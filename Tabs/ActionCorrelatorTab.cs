@@ -1,4 +1,4 @@
-﻿using HyForce.Core;
+using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
@@ -26,6 +26,10 @@ public class ActionCorrelatorTab : ITab
     private List<CapturedAction> _capturedPackets = new();
     private List<CorrelatedOpcode> _correlatedOpcodes = new();
 
+    // FIX: Pre-capture ring buffer — keeps last 50 packets before action trigger
+    private readonly Queue<CapturedAction> _preBuffer = new();
+    private const int PRE_BUFFER_CAPACITY = 50;
+
     // Settings
     private float _captureWindowSeconds = 3.0f;
     private int _minOccurrences = 2;
@@ -43,18 +47,27 @@ public class ActionCorrelatorTab : ITab
 
     private void OnPacketReceived(CapturedPacket packet)
     {
-        // Only capture during capture window
+        // Always buffer recent packets as pre-action context
+        var preEntry = new CapturedAction
+        {
+            Packet = packet,
+            TimeBeforeAction = 0, // corrected when trigger fires
+            IsYourAction = false
+        };
+        _preBuffer.Enqueue(preEntry);
+        while (_preBuffer.Count > PRE_BUFFER_CAPACITY) _preBuffer.Dequeue();
+
         if (_currentState != ActionState.Capturing) return;
 
+        // FIX: positive = AFTER trigger, negative = BEFORE trigger
         var timeSinceAction = (DateTime.Now - _actionTimestamp).TotalSeconds;
         if (timeSinceAction > _captureWindowSeconds) return;
 
-        // Record packet with timing relative to action
         _capturedPackets.Add(new CapturedAction
         {
             Packet = packet,
-            TimeBeforeAction = -timeSinceAction, // Negative = before action
-            IsYourAction = true // Marked as potentially yours
+            TimeBeforeAction = timeSinceAction, // FIX: was -timeSinceAction (inverted)
+            IsYourAction = true
         });
     }
 
@@ -348,8 +361,24 @@ public class ActionCorrelatorTab : ITab
     {
         _actionTimestamp = DateTime.Now;
         _capturedPackets.Clear();
+
+        // Flush pre-buffer: assign correct negative timestamps (before trigger)
+        foreach (var pre in _preBuffer)
+        {
+            pre.TimeBeforeAction = (pre.Packet.Timestamp - _actionTimestamp).TotalSeconds;
+            _capturedPackets.Add(pre);
+        }
+        _preBuffer.Clear();
+
         _currentState = ActionState.Capturing;
-        _state.AddInGameLog("[ACTION] CAPTURING! Perform your action now!");
+        _state.AddInGameLog($"[ACTION] CAPTURING! Pre-buffered {_capturedPackets.Count} context packets. Perform your action now!");
+    }
+
+    /// <summary>Called by GlobalHotkeys (F8) — triggers a 3-second capture immediately.</summary>
+    public void TriggerCapture()
+    {
+        if (_currentState != ActionState.Idle) return;
+        StartCapturing();
     }
 
     private void StartAnalysis()

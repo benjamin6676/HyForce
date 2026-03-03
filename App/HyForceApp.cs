@@ -1,8 +1,9 @@
-﻿// FILE: App/HyForceApp.cs - FIXED: PROPER EVENT ACCESS AND MENU
+// FILE: App/HyForceApp.cs - FIXED: PROPER EVENT ACCESS AND MENU
 using HyForce.Core;
 using HyForce.Tabs;
 using HyForce.UI;
 using HyForce.Protocol;
+using HyForce.Utils;
 using ImGuiNET;
 using Veldrid;
 using Veldrid.Sdl2;
@@ -21,6 +22,7 @@ public class HyForceApp
     private readonly Protocol.PacketHandler _packetHandler;
     private readonly List<ITab> _tabs = new();
     private readonly Theme _theme;
+    private readonly GlobalHotkeys _hotkeys;
     private int _selectedTab = 0;
 
     public HyForceApp(Sdl2Window window, GraphicsDevice graphicsDevice)
@@ -39,6 +41,7 @@ public class HyForceApp
 
         _state = AppState.Instance;
         _theme = new Theme();
+        _hotkeys = new GlobalHotkeys();
 
         _packetHandler = new Protocol.PacketHandler(_state);
 
@@ -47,22 +50,30 @@ public class HyForceApp
 
         InitializeTabs();
         SetupImGuiStyle();
+
+        // Wire F8 hotkey to Action Correlator
+        var correlator = _tabs.OfType<ActionCorrelatorTab>().FirstOrDefault();
+        if (correlator != null)
+            _hotkeys.OnCorrelatorCapture += correlator.TriggerCapture;
     }
 
     private void InitializeTabs()
     {
         _tabs.Add(new ConnectTab(_state));
         _tabs.Add(new ItemsTab(_state));
-        _tabs.Add(new PacketFeedTab(_state));
+        // FIX: Inspector receives packet selection from feed
+        var inspector = new PacketInspectorTab(_state);
+        var feed      = new PacketFeedTab(_state, inspector);
+        _tabs.Add(feed);
         _tabs.Add(new OpcodeManager(_state));
         _tabs.Add(new SecurityAuditTab(_state));
         _tabs.Add(new LogTab(_state));
-        _tabs.Add(new MemoryTab(_state));
+        _tabs.Add(new MemoryAnalysisTab(_state)); // Note: MemoryTab.cs is now MemoryAnalysisTab — same filename);
         _tabs.Add(new ActionCorrelatorTab(_state));
         _tabs.Add(new DecryptionTab(_state));
         _tabs.Add(new SettingsTab(_state));
         _tabs.Add(new PacketAnalyticsTab(_state));
-        _tabs.Add(new PacketInspectorTab(_state));
+        _tabs.Add(inspector);
         _tabs.Add(new RegistryTab(_state));
         _tabs.Add(new DecryptionStatsWindow(_state));
     }
@@ -87,6 +98,9 @@ public class HyForceApp
 
             var snapshot = _window.PumpEvents();
             if (!_window.Exists) break;
+
+            // Poll global hotkeys (F8-F11)
+            _hotkeys.Poll();
 
             _imguiController.Update((float)deltaTime, snapshot);
 
@@ -138,6 +152,9 @@ public class HyForceApp
         ImGui.EndChild();
 
         ImGui.End();
+
+        // Hotkey overlay notification (top-left)
+        _hotkeys.RenderOverlay();
 
         if (_state.ShowAboutWindow)
         {
@@ -230,7 +247,7 @@ public class HyForceApp
                     // Switch to Memory tab
                     for (int i = 0; i < _tabs.Count; i++)
                     {
-                        if (_tabs[i] is MemoryTab)
+                        if (_tabs[i] is MemoryAnalysisTab)
                         {
                             _selectedTab = i;
                             break;
@@ -395,6 +412,9 @@ public class HyForceApp
             }
         }
         ImGui.End();
+
+        // Hotkey overlay notification (top-left)
+        _hotkeys.RenderOverlay();
 
         _state.ShowAboutWindow = showWindow;
     }

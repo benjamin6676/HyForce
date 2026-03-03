@@ -27,6 +27,7 @@
     
     <!-- ADD THIS: Cross-platform clipboard -->
     <PackageReference Include="TextCopy" Version="6.2.1" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.7" />
   </ItemGroup>
 
 </Project>

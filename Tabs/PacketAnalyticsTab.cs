@@ -12,7 +12,9 @@ public class PacketAnalyticsTab : ITab
     public string Name => "Analytics";
     private readonly AppState _state;
     private Dictionary<PacketCategory, int> _categoryStats = new();
-    private List<PacketPattern> _patterns = new();
+    private List<PacketPattern>             _patterns        = new();
+    private DateTime                        _lastStatsUpdate = DateTime.MinValue;
+    private const int                       STATS_THROTTLE_MS = 500;
 
     public PacketAnalyticsTab(AppState state)
     {
@@ -39,18 +41,19 @@ public class PacketAnalyticsTab : ITab
         RenderPatternAnalysis();
         ImGui.EndChild();
     }
-
+    
     private void RenderOverviewCards()
     {
-        var packets = _state.PacketLog.GetAll();
+        var log = _state.PacketLog;
 
         ImGui.BeginChild("Card1", new Vector2(150, 80), ImGuiChildFlags.Borders);
         ImGui.TextColored(new Vector4(0.5f, 0.8f, 1, 1), "TOTAL");
-        ImGui.Text($"{packets.Count:N0}");
+        ImGui.Text($"{log.TotalPackets:N0}");
         ImGui.EndChild();
 
         ImGui.SameLine();
 
+        var packets = _state.PacketLog.GetAll();
         var c2s = packets.Count(p => p.Direction == PacketDirection.ClientToServer);
         ImGui.BeginChild("Card2", new Vector2(150, 80), ImGuiChildFlags.Borders);
         ImGui.TextColored(new Vector4(0.3f, 0.8f, 0.3f, 1), "C2S");
@@ -112,7 +115,9 @@ public class PacketAnalyticsTab : ITab
 
     private void UpdateStats()
     {
-        var packets = _state.PacketLog.GetAll();
+        if ((DateTime.Now - _lastStatsUpdate).TotalMilliseconds < STATS_THROTTLE_MS) return;
+        _lastStatsUpdate = DateTime.Now;
+        var packets = _state.PacketLog.GetLast(500); // FIX: was GetAll()
 
         _categoryStats = packets
             .Select(p => Protocol.OpcodeRegistry.GetInfo(p.OpcodeDecimal, p.Direction)?.Category ?? PacketCategory.Unknown)

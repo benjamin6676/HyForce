@@ -1,9 +1,10 @@
 ﻿// FILE: Protocol/PacketDecryptor.cs - FIXED: Proper async decryption without blocking UI
+using HyForce.Networking;
+using System.Collections.Concurrent;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
-using System.Collections.Concurrent;
 using System.Threading.Channels;
-using System.Runtime.ExceptionServices;
 
 namespace HyForce.Protocol;
 
@@ -1514,6 +1515,44 @@ public static class PacketDecryptor
         if (data.Length < 16) return false;
         return CalculateEntropy(data) > 7.5;
     }
+
+    public class EncryptionResult
+    {
+        public bool Success { get; set; }
+        public byte[]? EncryptedData { get; set; }
+        public ulong PacketNumber { get; set; }
+        public string ErrorMessage { get; set; } = "";
+        public static EncryptionResult Fail(string msg) => new() { Success = false, ErrorMessage = msg };
+    }
+
+    public static EncryptionResult TryEncrypt(byte[] plaintext, PacketDirection direction)
+    {
+        if (plaintext?.Length == 0) return EncryptionResult.Fail("Empty data");
+        if (DiscoveredKeys.Count == 0) return EncryptionResult.Fail("No keys");
+
+        var key = DiscoveredKeys.First();
+        try
+        {
+            ulong pn = (ulong)DateTime.UtcNow.Ticks;
+            byte[] header = { 0x40, (byte)(pn >> 24), (byte)(pn >> 16), (byte)(pn >> 8), (byte)pn };
+            byte[] nonce = ConstructQUICNonce(key.IV, pn);
+
+            using var aes = new AesGcm(key.Key, 16);
+            byte[] cipher = new byte[plaintext.Length], tag = new byte[16];
+            aes.Encrypt(nonce, plaintext, cipher, tag, header);
+
+            byte[] result = new byte[header.Length + cipher.Length + tag.Length];
+            Buffer.BlockCopy(header, 0, result, 0, header.Length);
+            Buffer.BlockCopy(cipher, 0, result, header.Length, cipher.Length);
+            Buffer.BlockCopy(tag, 0, result, header.Length + cipher.Length, tag.Length);
+
+            return new EncryptionResult { Success = true, EncryptedData = result, PacketNumber = pn };
+        }
+        catch (Exception ex)
+        {
+            return EncryptionResult.Fail(ex.Message);
+        }
+    }
 }
 
 // FIXED: Rate limiter helper class
@@ -1550,5 +1589,12 @@ public class RateLimiter
 
             return false;
         }
+
+
+
     }
+
+
+
+
 }
