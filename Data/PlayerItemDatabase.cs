@@ -89,10 +89,18 @@ public class PlayerItemDatabase
 
     private bool IsPlayerName(string str)
     {
-        return str.Length >= 3 && str.Length <= 16 &&
-               str.All(c => char.IsLetterOrDigit(c) || c == '_') &&
-               !str.Contains("__") &&
-               !str.Contains('_');
+        // Must contain at least one letter, no consecutive underscores
+        // AND must look like a real name (not random bytes)
+        if (str.Length < 3 || str.Length > 16) return false;
+        if (!str.Any(char.IsLetter)) return false;  // At least one letter
+        if (str.Contains("__")) return false;
+
+        // Additional heuristics to filter garbage
+        var upperCount = str.Count(char.IsUpper);
+        if (upperCount > 5) return false;  // Too many caps (random data)
+        if (str.Count(c => !char.IsLetterOrDigit(c) && c != '_') > 0) return false;
+
+        return true;
     }
 
     private uint ComputeHash(string str)

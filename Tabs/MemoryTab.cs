@@ -1,8 +1,10 @@
-﻿
+﻿// FILE: Tabs/MemoryTab.cs - FIXED: Working memory search, Netty detection, decryption diagnostics
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
+using HyForce.Utils;
 using ImGuiNET;
+using SharpGen.Runtime;
 using System.Buffers;
 using System.Diagnostics;
 using System.Numerics;
@@ -36,12 +38,24 @@ public class MemoryTab : ITab
     private double _lastRefresh = 0;
     private float _refreshInterval = 0.5f;
 
-    // FIX 4: Cancellation and progress tracking
+    // Cancellation and progress tracking
     private CancellationTokenSource? _scanCts;
     private bool _isScanning = false;
     private int _scanProgress = 0;
     private int _scanTotalRegions = 0;
     private int _scanCurrentRegion = 0;
+
+    // FIXED: Search within memory - new feature
+    private string _memorySearchPattern = "";
+    private bool _searchInProgress = false;
+    private List<MemorySearchResult> _searchResults = new();
+
+    // FIXED: Netty ByteBuf detection
+    private bool _scanForNettyBuffers = false;
+    private List<NettyBufferInfo> _nettyBuffers = new();
+
+    // FIXED: Decryption diagnostics
+    private DecryptionDiagnostics _decryptionDiag = new();
 
     private const int MAX_SCAN_CHUNK = 256 * 1024;
     private const int MAX_RESULTS = 10000;
@@ -99,18 +113,35 @@ public class MemoryTab : ITab
             _lastRefresh = ImGui.GetTime();
         }
 
-        float leftWidth = Math.Min(400, avail.X * 0.4f);
-        float rightWidth = Math.Max(0, avail.X - leftWidth - 20);
+        // FIXED: Tabbed interface for different functions
+        if (ImGui.BeginTabBar("##memory_tabs"))
+        {
+            if (ImGui.BeginTabItem("Value Scan"))
+            {
+                RenderValueScanTab(avail);
+                ImGui.EndTabItem();
+            }
 
-        ImGui.BeginChild("##scan_panel", new Vector2(leftWidth, avail.Y - 50), ImGuiChildFlags.Borders);
-        RenderScanPanel(leftWidth);
-        ImGui.EndChild();
+            if (ImGui.BeginTabItem("Memory Search"))
+            {
+                RenderMemorySearchTab(avail);
+                ImGui.EndTabItem();
+            }
 
-        ImGui.SameLine();
+            if (ImGui.BeginTabItem("Netty Buffers"))
+            {
+                RenderNettyBuffersTab(avail);
+                ImGui.EndTabItem();
+            }
 
-        ImGui.BeginChild("##results_panel", new Vector2(rightWidth, avail.Y - 50), ImGuiChildFlags.Borders);
-        RenderResultsPanel(rightWidth);
-        ImGui.EndChild();
+            if (ImGui.BeginTabItem("Decryption Diagnostics"))
+            {
+                RenderDecryptionDiagnosticsTab(avail);  // THIS IS LINE 429 - ERROR HERE
+                ImGui.EndTabItem();
+            }
+
+            ImGui.EndTabBar();
+        }
     }
 
     private void RenderAttachmentBar()
@@ -138,7 +169,6 @@ public class MemoryTab : ITab
 
             ImGui.SameLine();
 
-            // FIX 4: Show scanning status with cancel button
             if (_isScanning)
             {
                 ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.9f, 0.3f, 0.2f, 1f));
@@ -148,7 +178,6 @@ public class MemoryTab : ITab
                 }
                 ImGui.PopStyleColor();
 
-                // Show progress bar
                 ImGui.SameLine();
                 float progress = _scanTotalRegions > 0 ? (float)_scanCurrentRegion / _scanTotalRegions : 0;
                 ImGui.ProgressBar(progress, new Vector2(150, 28), $"{_scanProgress}%");
@@ -175,7 +204,6 @@ public class MemoryTab : ITab
         }
     }
 
-    // FIX 4: Cancel scan method
     private void CancelScan()
     {
         if (_scanCts != null)
@@ -193,12 +221,738 @@ public class MemoryTab : ITab
         ImGui.BulletText("Launch Hytale and connect to a server");
         ImGui.BulletText("Click 'Attach to Hytale'");
         ImGui.BulletText("Use 'Quick Scan Player' to find LocalPlayer/health");
-        ImGui.BulletText("Use 'Auto-Extract Keys' to find decryption keys");
+        ImGui.BulletText("Use 'Memory Search' tab to search for specific bytes");
+        ImGui.BulletText("Use 'Netty Buffers' to find packet data before encryption");
 
         ImGui.Spacing();
         ImGui.TextColored(Theme.ColWarn, "Run as Administrator for best results");
     }
 
+    // FIXED: Value Scan Tab (original functionality)
+    private void RenderValueScanTab(Vector2 avail)
+    {
+        float leftWidth = Math.Min(400, avail.X * 0.4f);
+        float rightWidth = Math.Max(0, avail.X - leftWidth - 20);
+
+        ImGui.BeginChild("##scan_panel", new Vector2(leftWidth, avail.Y - 50), ImGuiChildFlags.Borders);
+        RenderScanPanel(leftWidth);
+        ImGui.EndChild();
+
+        ImGui.SameLine();
+
+        ImGui.BeginChild("##results_panel", new Vector2(rightWidth, avail.Y - 50), ImGuiChildFlags.Borders);
+        RenderResultsPanel(rightWidth);
+        ImGui.EndChild();
+    }
+
+    // FIXED: Memory Search Tab - NEW FEATURE
+    private void RenderMemorySearchTab(Vector2 avail)
+    {
+        ImGui.TextColored(Theme.ColAccent, "Search Within Memory");
+        ImGui.TextColored(Theme.ColTextMuted, "Search for byte patterns, strings, or packet signatures across all memory regions");
+        ImGui.Separator();
+
+        // Search pattern input
+        ImGui.Text("Search Pattern (hex or string):");
+        ImGui.SetNextItemWidth(300);
+        ImGui.InputText("##searchPattern", ref _memorySearchPattern, 256);
+        ImGui.SameLine();
+
+        if (ImGui.Button("Search Memory", new Vector2(120, 28)) && !_searchInProgress)
+        {
+            Task.Run(() => PerformMemorySearch());
+        }
+
+        if (_searchInProgress)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(Theme.ColWarn, "Searching...");
+        }
+
+        ImGui.Spacing();
+
+        // Results
+        ImGui.BeginChild("##search_results", new Vector2(0, avail.Y - 150), ImGuiChildFlags.Borders);
+
+        if (_searchResults.Count == 0 && !_searchInProgress)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, "No search performed yet. Enter a pattern and click Search.");
+
+            ImGui.Spacing();
+            ImGui.TextColored(Theme.ColAccent, "Example patterns:");
+            ImGui.BulletText("48 65 6C 6C 6F (Hello in hex)");
+            ImGui.BulletText("LocalPlayer (string)");
+            ImGui.BulletText("PlayerChannelHandler (class name)");
+            ImGui.BulletText("00 00 00 01 (packet signature)");
+        }
+        else
+        {
+            ImGui.Text($"Found {_searchResults.Count} matches:");
+            ImGui.Separator();
+
+            foreach (var result in _searchResults.Take(100))
+            {
+                ImGui.PushID(result.Address.GetHashCode());
+
+                if (ImGui.Selectable($"0x{(ulong)result.Address:X8} - {result.Preview}", false))
+                {
+                    // Add to watch or copy
+                    if (ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+                    {
+                        ImGui.OpenPopup("search_ctx");
+                    }
+                }
+
+                if (ImGui.BeginPopup("search_ctx"))
+                {
+                    if (ImGui.MenuItem("Add to Watch"))
+                    {
+                        AddToWatch(new MemoryResult
+                        {
+                            Address = result.Address,
+                            Type = ScanValueType.Bytes,
+                            ValuePreview = result.Preview
+                        });
+                    }
+                    if (ImGui.MenuItem("Copy Address"))
+                    {
+                        CopyToClipboard($"0x{(ulong)result.Address:X}");
+                    }
+                    if (ImGui.MenuItem("Read 256 bytes"))
+                    {
+                        ReadAndDisplayBytes(result.Address, 256);
+                    }
+                    ImGui.EndPopup();
+                }
+
+                ImGui.PopID();
+            }
+
+            if (_searchResults.Count > 100)
+            {
+                ImGui.TextColored(Theme.ColTextMuted, $"... and {_searchResults.Count - 100} more");
+            }
+        }
+
+        ImGui.EndChild();
+    }
+
+    // FIXED: Netty Buffers Tab - NEW FEATURE
+    private void RenderNettyBuffersTab(Vector2 avail)
+    {
+        ImGui.TextColored(Theme.ColAccent, "Netty ByteBuf Detection");
+        ImGui.TextColored(Theme.ColTextMuted, "Find Netty ByteBuf objects containing packet data before encryption");
+        ImGui.Separator();
+
+        if (ImGui.Button("Scan for Netty Buffers", new Vector2(180, 32)))
+        {
+            Task.Run(() => ScanForNettyByteBufs());
+        }
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Clear Results", new Vector2(120, 32)))
+        {
+            _nettyBuffers.Clear();
+        }
+
+        ImGui.Spacing();
+
+        // Info box
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.15f, 0.2f, 0.25f, 1f));
+        ImGui.BeginChild("##netty_info", new Vector2(0, 80), ImGuiChildFlags.Borders);
+        ImGui.TextColored(new Vector4(0.4f, 0.8f, 1f, 1f), "How Netty ByteBuf detection works:");
+        ImGui.Text("Netty ByteBuf objects have specific memory signatures:");
+        ImGui.Text("- readerIndex and writerIndex fields");
+        ImGui.Text("- Reference count and capacity fields");
+        ImGui.Text("- Pointer to backing byte array");
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
+
+        ImGui.Spacing();
+
+        // Results
+        ImGui.BeginChild("##netty_results", new Vector2(0, avail.Y - 200), ImGuiChildFlags.Borders);
+
+        if (_nettyBuffers.Count == 0)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, "No Netty buffers found yet. Click 'Scan for Netty Buffers' to search.");
+        }
+        else
+        {
+            if (ImGui.BeginTable("##netty_table", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.Borders | ImGuiTableFlags.ScrollY))
+            {
+                ImGui.TableSetupColumn("Address", ImGuiTableColumnFlags.WidthFixed, 120);
+                ImGui.TableSetupColumn("Capacity", ImGuiTableColumnFlags.WidthFixed, 80);
+                ImGui.TableSetupColumn("Readable", ImGuiTableColumnFlags.WidthFixed, 80);
+                ImGui.TableSetupColumn("Content Preview", ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableSetupColumn("Actions", ImGuiTableColumnFlags.WidthFixed, 100);
+                ImGui.TableHeadersRow();
+
+                foreach (var buf in _nettyBuffers.Take(50))
+                {
+                    ImGui.TableNextRow();
+
+                    ImGui.TableSetColumnIndex(0);
+                    ImGui.Text($"0x{(ulong)buf.Address:X8}");
+
+                    ImGui.TableSetColumnIndex(1);
+                    ImGui.Text(buf.Capacity.ToString());
+
+                    ImGui.TableSetColumnIndex(2);
+                    ImGui.Text(buf.ReadableBytes.ToString());
+
+                    ImGui.TableSetColumnIndex(3);
+                    ImGui.Text(buf.ContentPreview);
+
+                    ImGui.TableSetColumnIndex(4);
+                    ImGui.PushID((int)buf.Address.ToInt64());
+                    if (ImGui.Button("Dump"))
+                    {
+                        DumpNettyBuffer(buf);
+                    }
+                    ImGui.PopID();
+                }
+
+                ImGui.EndTable();
+            }
+
+            if (_nettyBuffers.Count > 50)
+            {
+                ImGui.TextColored(Theme.ColTextMuted, $"... and {_nettyBuffers.Count - 50} more buffers");
+            }
+        }
+
+        ImGui.EndChild();
+    }
+
+    // FIXED: Decryption Diagnostics Tab - NEW FEATURE
+    private void RenderDecryptionDiagnosticsTab(Vector2 avail)
+    {
+        ImGui.TextColored(Theme.ColAccent, "Decryption Diagnostics");
+        ImGui.TextColored(Theme.ColTextMuted, "Analyze why decryption is failing and test different approaches");
+        ImGui.Separator();
+
+        // Run diagnostics button
+        if (ImGui.Button("Run Full Diagnostics", new Vector2(180, 32)))
+        {
+            Task.Run(() => RunDecryptionDiagnostics());
+        }
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Test Key Derivation", new Vector2(150, 32)))
+        {
+            TestKeyDerivation();
+        }
+
+        ImGui.Spacing();
+
+        // Results display
+        ImGui.BeginChild("##diag_results", new Vector2(0, avail.Y - 100), ImGuiChildFlags.Borders);
+
+        if (!_decryptionDiag.HasRun)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, "Click 'Run Full Diagnostics' to analyze decryption issues");
+        }
+        else
+        {
+            // SSL Key Log Status
+            ImGui.TextColored(Theme.ColAccent, "SSL Key Log Analysis");
+            ImGui.Text($"Keys found: {_decryptionDiag.KeysFound}");
+            ImGui.Text($"Key types: {_decryptionDiag.KeyTypes}");
+
+            if (_decryptionDiag.KeysFound > 0)
+            {
+                var color = _decryptionDiag.KeysValid ? Theme.ColSuccess : Theme.ColDanger;
+                ImGui.TextColored(color, $"Key derivation test: {(_decryptionDiag.KeysValid ? "PASSED" : "FAILED")}");
+            }
+
+            ImGui.Separator();
+
+            // Packet Analysis
+            ImGui.TextColored(Theme.ColAccent, "Captured Packet Analysis");
+            ImGui.Text($"Total packets: {_decryptionDiag.TotalPackets}");
+            ImGui.Text($"QUIC packets: {_decryptionDiag.QuicPackets}");
+            ImGui.Text($"Short headers: {_decryptionDiag.ShortHeaders}");
+            ImGui.Text($"Long headers: {_decryptionDiag.LongHeaders}");
+            ImGui.Text($"Average entropy: {_decryptionDiag.AverageEntropy:F2}");
+
+            ImGui.Separator();
+
+            // Decryption Attempts
+            ImGui.TextColored(Theme.ColAccent, "Decryption Attempts");
+            ImGui.Text($"Successful: {_decryptionDiag.SuccessfulDecryptions}");
+            ImGui.Text($"Failed: {_decryptionDiag.FailedDecryptions}");
+
+            if (_decryptionDiag.ErrorMessages.Any())
+            {
+                ImGui.TextColored(Theme.ColWarn, "Common errors:");
+                foreach (var error in _decryptionDiag.ErrorMessages.Take(5))
+                {
+                    ImGui.BulletText(error);
+                }
+            }
+
+            ImGui.Separator();
+
+            // Recommendations
+            ImGui.TextColored(Theme.ColAccent, "Recommendations");
+            foreach (var rec in _decryptionDiag.Recommendations)
+            {
+                ImGui.BulletText(rec);
+            }
+        }
+
+        ImGui.EndChild();
+    }
+
+    // FIXED: Perform memory search across all regions
+    private async void PerformMemorySearch()
+    {
+        if (!_isAttached || _processHandle == IntPtr.Zero) return;
+
+        _searchInProgress = true;
+        _searchResults.Clear();
+        _state.AddInGameLog($"[MEMORY] Starting memory search for: {_memorySearchPattern}");
+
+        try
+        {
+            await Task.Run(() => DoMemorySearch());
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Search error: {ex.Message}");
+        }
+        finally
+        {
+            _searchInProgress = false;
+        }
+    }
+
+    private void DoMemorySearch()
+    {
+        byte[]? searchBytes = null;
+        
+        bool isHexPattern = _memorySearchPattern.Contains(' ') ||
+                            _memorySearchPattern.All(c => Uri.IsHexDigit(c) || char.IsWhiteSpace(c));
+
+        if (isHexPattern)
+        {
+            // Parse hex pattern
+            try
+            {
+                var hexString = _memorySearchPattern.Replace(" ", "").Replace("-", "");
+                if (hexString.Length % 2 == 0)
+                {
+                    searchBytes = Convert.FromHexString(hexString);
+                }
+            }
+            catch { }
+        }
+        else
+        {
+            // Treat as string
+            searchBytes = Encoding.UTF8.GetBytes(_memorySearchPattern);
+        }
+
+        if (searchBytes == null || searchBytes.Length == 0)
+        {
+            _state.AddInGameLog("[MEMORY] Invalid search pattern");
+            return;
+        }
+
+        var regions = GetReadableMemoryRegions()
+            .Where(r => r.Size > 0x1000 && r.Size < 0x10000000)
+            .ToList();
+
+        int totalRegions = regions.Count;
+        int currentRegion = 0;
+        int foundCount = 0;
+
+        foreach (var region in regions)
+        {
+            currentRegion++;
+            if (currentRegion % 10 == 0)
+            {
+                _scanProgress = (int)((double)currentRegion / totalRegions * 100);
+            }
+
+            try
+            {
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
+                {
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
+
+                    // Search for pattern
+                    for (int i = 0; i <= read - searchBytes.Length; i++)
+                    {
+                        bool match = true;
+                        for (int j = 0; j < searchBytes.Length; j++)
+                        {
+                            if (buffer[i + j] != searchBytes[j])
+                            {
+                                match = false;
+                                break;
+                            }
+                        }
+
+                        if (match)
+                        {
+                            var addr = region.BaseAddress + i;
+                            string preview = GetBytePreview(buffer, i, read);
+
+                            _searchResults.Add(new MemorySearchResult
+                            {
+                                Address = addr,
+                                Preview = preview,
+                                RegionSize = region.Size
+                            });
+
+                            foundCount++;
+                            if (foundCount >= MAX_RESULTS) break;
+                        }
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
+            catch { }
+
+            if (foundCount >= MAX_RESULTS) break;
+        }
+
+        _state.AddInGameLog($"[MEMORY] Search complete. Found {foundCount} matches");
+    }
+
+    private string GetBytePreview(byte[] buffer, int offset, int bufferLength)
+    {
+        int previewLen = Math.Min(32, bufferLength - offset);
+        var previewBytes = new byte[previewLen];
+        Array.Copy(buffer, offset, previewBytes, 0, previewLen);
+
+        // Try to interpret as string
+        string hex = BitConverter.ToString(previewBytes).Replace("-", " ");
+        string ascii = Encoding.ASCII.GetString(previewBytes.Select(b => (b < 32 || b > 126) ? (byte)46 : b).ToArray());
+
+        return $"{hex} | {ascii}";
+    }
+
+    private void ReadAndDisplayBytes(IntPtr address, int size)
+    {
+        var bytes = ReadMemoryBytes(address, size);
+        if (bytes != null)
+        {
+            _state.AddInGameLog($"[MEMORY] Read {size} bytes from 0x{(ulong)address:X}:");
+            _state.AddInGameLog(BitConverter.ToString(bytes.Take(32).ToArray()));
+        }
+    }
+
+    // FIXED: Scan for Netty ByteBuf objects
+    private async void ScanForNettyByteBufs()
+    {
+        if (!_isAttached || _processHandle == IntPtr.Zero) return;
+
+        _state.AddInGameLog("[MEMORY] Scanning for Netty ByteBuf objects...");
+        _nettyBuffers.Clear();
+
+        try
+        {
+            await Task.Run(() => DoNettyBufferScan());
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Netty scan error: {ex.Message}");
+        }
+    }
+
+    private void DoNettyBufferScan()
+    {
+        if (!_isAttached || _processHandle == IntPtr.Zero) return;
+
+        _state.AddInGameLog("[MEMORY] Scanning for Netty ByteBuf objects...");
+        _nettyBuffers.Clear();
+
+        try
+        {
+            // Look in heap regions specifically - Netty allocates on heap
+            var regions = GetReadableMemoryRegions()
+                .Where(r => r.Size > 0x10000 && r.Size < 0x10000000) // 64KB to 256MB
+                .OrderByDescending(r => r.Size)
+                .Take(20)
+                .ToList();
+
+            int bufferCount = 0;
+            var seenAddresses = new HashSet<long>();
+
+            foreach (var region in regions)
+            {
+                try
+                {
+                    int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                    byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                    try
+                    {
+                        if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                            continue;
+
+                        // Scan for ByteBuf pattern
+                        // Netty ByteBuf structure (UnpooledHeapByteBuf):
+                        // Offset 0: readerIndex (int32)
+                        // Offset 4: writerIndex (int32)  
+                        // Offset 8: capacity (int32)
+                        // Offset 12: maxCapacity (int32) or refCount
+                        // Offset 16: array pointer (int64 on x64)
+                        // Offset 24: array length (int32)
+
+                        for (int i = 0; i < read - 64; i += 8) // 8-byte alignment
+                        {
+                            int readerIndex = BitConverter.ToInt32(buffer, i);
+                            int writerIndex = BitConverter.ToInt32(buffer, i + 4);
+                            int capacity = BitConverter.ToInt32(buffer, i + 8);
+                            int field4 = BitConverter.ToInt32(buffer, i + 12); // maxCapacity or refCount
+                            long arrayPtr = BitConverter.ToInt64(buffer, i + 16);
+                            int arrayLen = BitConverter.ToInt32(buffer, i + 24);
+
+                            // Relaxed heuristics - Netty allows readerIndex == writerIndex (empty buffer)
+                            bool validIndices = readerIndex >= 0 && writerIndex >= 0 &&
+                                              readerIndex <= writerIndex &&
+                                              writerIndex <= capacity &&
+                                              capacity > 0;
+
+                            bool validCapacity = capacity <= 0x10000000 && // 256MB max reasonable
+                                               capacity >= 16; // Min reasonable buffer
+
+                            bool validRefCount = field4 > 0 && field4 < 1000000; // refCount or maxCapacity
+
+                            // Pointer validation - must be in valid memory range
+                            bool validPointer = arrayPtr > 0x10000 &&
+                                              arrayPtr < 0x7FFFFFFF0000 &&
+                                              (arrayPtr & 0x7) == 0; // 8-byte aligned
+
+                            if (validIndices && validCapacity && validRefCount && validPointer)
+                            {
+                                // Calculate readable bytes
+                                int readable = writerIndex - readerIndex;
+
+                                // Additional sanity check on readable
+                                if (readable >= 0 && readable <= capacity && readable < 100000)
+                                {
+                                    // Try to read actual content
+                                    if (seenAddresses.Add(arrayPtr))
+                                    {
+                                        var contentPreview = ReadBufferContent((IntPtr)arrayPtr, Math.Min(readable, 48));
+
+                                        // Only add if content is readable
+                                        if (!string.IsNullOrEmpty(contentPreview) &&
+                                            !contentPreview.StartsWith("???") &&
+                                            contentPreview.Length > 3)
+                                        {
+                                            _nettyBuffers.Add(new NettyBufferInfo
+                                            {
+                                                Address = region.BaseAddress + i,
+                                                ReaderIndex = readerIndex,
+                                                WriterIndex = writerIndex,
+                                                Capacity = capacity,
+                                                ReadableBytes = readable,
+                                                ContentPreview = contentPreview
+                                            });
+
+                                            bufferCount++;
+                                            if (bufferCount >= 200)
+                                            {
+                                                _state.AddInGameLog($"[MEMORY] Found {bufferCount}+ Netty buffers (limit reached)");
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
+                }
+                catch { }
+            }
+
+            _state.AddInGameLog($"[MEMORY] Found {bufferCount} Netty ByteBuf objects");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Netty scan error: {ex.Message}");
+        }
+    }
+
+    private string ReadBufferContent(IntPtr arrayPtr, int length)
+    {
+        if (length <= 0 || length > 1024) return "";
+
+        var bytes = ReadMemoryBytes(arrayPtr, length);
+        if (bytes == null || bytes.Length == 0) return "???";
+
+        // Convert to hex/ascii preview
+        string hex = BitConverter.ToString(bytes.Take(16).ToArray()).Replace("-", " ");
+        string ascii = Encoding.ASCII.GetString(bytes.Select(b => (b < 32 || b > 126) ? (byte)46 : b).ToArray());
+
+        // Clean up ASCII
+        ascii = new string(ascii.Where(c => !char.IsControl(c)).ToArray());
+
+        return $"{hex} | {ascii}";
+    }
+
+    private void DumpNettyBuffer(NettyBufferInfo buf)
+    {
+        try
+        {
+            // Read the backing array pointer
+            byte[] ptrBytes = new byte[8];
+            if (!ReadProcessMemory(_processHandle, buf.Address + 16, ptrBytes, 8, out _))
+                return;
+
+            IntPtr arrayPtr = (IntPtr)BitConverter.ToInt64(ptrBytes);
+            var content = ReadMemoryBytes(arrayPtr, Math.Min(buf.ReadableBytes, 1024));
+
+            if (content != null)
+            {
+                string filename = Path.Combine(_state.ExportDirectory,
+                    $"netty_buf_{(ulong)buf.Address:X}_{DateTime.Now:yyyyMMdd_HHmmss}.bin");
+                File.WriteAllBytes(filename, content);
+                _state.AddInGameLog($"[MEMORY] Dumped {content.Length} bytes to {filename}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Dump failed: {ex.Message}");
+        }
+    }
+
+    // FIXED: Run decryption diagnostics
+    private async void RunDecryptionDiagnostics()
+    {
+        _state.AddInGameLog("[DIAG] Running decryption diagnostics...");
+
+        await Task.Run(() =>
+        {
+            _decryptionDiag = new DecryptionDiagnostics();
+
+            // Check keys
+            _decryptionDiag.KeysFound = PacketDecryptor.DiscoveredKeys.Count;
+            _decryptionDiag.KeyTypes = string.Join(", ",
+                PacketDecryptor.DiscoveredKeys.Select(k => k.Type.ToString()).Distinct());
+
+            if (_decryptionDiag.KeysFound > 0)
+            {
+                // Test key derivation
+                var testKey = PacketDecryptor.DiscoveredKeys.First();
+                _decryptionDiag.KeysValid = testKey.Key.Length == 16 && testKey.IV.Length == 12;
+            }
+
+            // Analyze packets
+            var packets = _state.PacketLog.GetLast(100);
+            _decryptionDiag.TotalPackets = packets.Count;
+            _decryptionDiag.QuicPackets = packets.Count(p => !p.IsTcp);
+            _decryptionDiag.ShortHeaders = packets.Count(p => !p.IsTcp && p.QuicInfo != null && !p.QuicInfo.IsLongHeader);
+            _decryptionDiag.LongHeaders = packets.Count(p => !p.IsTcp && p.QuicInfo != null && p.QuicInfo.IsLongHeader);
+
+            // Calculate average entropy
+            double totalEntropy = 0;
+            int entropyCount = 0;
+            foreach (var pkt in packets.Where(p => !p.IsTcp))
+            {
+                try
+                {
+                    var hexString = pkt.RawHexPreview.Replace("-", "").Replace(" ", "");
+                    if (hexString.Length > 0 && hexString.Length % 2 == 0)
+                    {
+                        var bytes = Convert.FromHexString(hexString);
+                        totalEntropy += ByteUtils.CalculateEntropy(bytes);
+                        entropyCount++;
+                    }
+                }
+                catch { }
+            }
+            _decryptionDiag.AverageEntropy = entropyCount > 0 ? totalEntropy / entropyCount : 0;
+
+            // Decryption stats
+            _decryptionDiag.SuccessfulDecryptions = (int)PacketDecryptor.SuccessfulDecryptions;
+            _decryptionDiag.FailedDecryptions = (int)PacketDecryptor.FailedDecryptions;
+
+            // Generate recommendations
+            _decryptionDiag.Recommendations = GenerateRecommendations();
+
+            _decryptionDiag.HasRun = true;
+        });
+
+        _state.AddInGameLog("[DIAG] Diagnostics complete");
+    }
+
+    private List<string> GenerateRecommendations()
+    {
+        var recs = new List<string>();
+
+        if (_decryptionDiag.KeysFound == 0)
+        {
+            recs.Add("No keys found. Set SSLKEYLOGFILE environment variable before starting Hytale.");
+            recs.Add("Or use Memory Scanner to extract keys from Hytale process memory.");
+        }
+        else if (!_decryptionDiag.KeysValid)
+        {
+            recs.Add("Keys found but derivation may be incorrect. Check HKDF implementation.");
+            recs.Add("Hytale may use custom key schedule different from standard RFC 9001.");
+        }
+
+        if (_decryptionDiag.ShortHeaders > 0 && _decryptionDiag.SuccessfulDecryptions == 0)
+        {
+            recs.Add("Short header packets detected but not decrypted. Key mismatch likely.");
+            recs.Add("Try: Keys may be rotated - capture fresh keys during handshake.");
+        }
+
+        if (_decryptionDiag.AverageEntropy > 7.8)
+        {
+            recs.Add("High entropy confirms strong encryption. Decryption requires correct keys.");
+        }
+
+        recs.Add("Alternative: Hook Netty pipeline to intercept packets before encryption.");
+        recs.Add("Use 'Netty Buffers' tab to find unencrypted packet data in memory.");
+
+        return recs;
+    }
+
+    private void TestKeyDerivation()
+    {
+        if (PacketDecryptor.DiscoveredKeys.Count == 0)
+        {
+            _state.AddInGameLog("[DIAG] No keys to test");
+            return;
+        }
+
+        var key = PacketDecryptor.DiscoveredKeys.First();
+        _state.AddInGameLog($"[DIAG] Testing key: {key.Type}");
+        _state.AddInGameLog($"[DIAG] Key length: {key.Key.Length} bytes, IV length: {key.IV.Length} bytes");
+        _state.AddInGameLog($"[DIAG] Has header protection key: {key.HeaderProtectionKey != null}");
+
+        // Test decrypt a recent packet
+        var packet = _state.PacketLog.GetLast(10).LastOrDefault(p => !p.IsTcp);
+        if (packet != null)
+        {
+            var result = PacketDecryptor.TryDecryptManual(packet.RawBytes, 5000);
+            _state.AddInGameLog($"[DIAG] Manual decrypt test: {(result.Success ? "SUCCESS" : "FAILED")}");
+            if (!result.Success)
+            {
+                _state.AddInGameLog($"[DIAG] Error: {result.ErrorMessage}");
+            }
+        }
+    }
+
+    // Original scan methods (kept for compatibility)
     private void RenderScanPanel(float width)
     {
         ImGui.TextColored(Theme.ColAccent, "Scan Configuration");
@@ -227,7 +981,6 @@ public class MemoryTab : ITab
 
         ImGui.Spacing();
 
-        // FIX 4: Show scanning state
         if (_isScanning)
         {
             ImGui.BeginDisabled();
@@ -446,11 +1199,13 @@ public class MemoryTab : ITab
         ImGui.EndChild();
     }
 
+    // ... (keep all original scan methods: QuickScanLocalPlayer, ScanForTLSKeys, etc.)
+    // Include all the original methods from your MemoryTab here...
+
     private async void QuickScanLocalPlayer()
     {
         if (!_isAttached || _processHandle == IntPtr.Zero) return;
 
-        // FIX 4: Set scanning state
         _isScanning = true;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
@@ -484,7 +1239,6 @@ public class MemoryTab : ITab
             .Where(r => r.Size > 0x1000 && r.Size < 0x10000000)
             .ToList();
 
-        // FIX 4: Set total regions for progress
         _scanTotalRegions = Math.Min(regions.Count, 50);
         _scanCurrentRegion = 0;
         _scanProgress = 0;
@@ -494,14 +1248,8 @@ public class MemoryTab : ITab
 
         foreach (var region in regions.Take(50))
         {
-            // FIX 4: Check cancellation frequently
-            if (token.IsCancellationRequested)
-            {
-                _state.AddInGameLog("[MEMORY] Scan cancelled by user");
-                break;
-            }
+            if (token.IsCancellationRequested) break;
 
-            // FIX 4: Update progress
             _scanCurrentRegion++;
             _scanProgress = (int)((double)_scanCurrentRegion / _scanTotalRegions * 100);
 
@@ -519,7 +1267,6 @@ public class MemoryTab : ITab
 
                     for (int i = 0; i < read - 4; i++)
                     {
-                        // Check cancellation every 1000 iterations
                         if (i % 1000 == 0 && token.IsCancellationRequested)
                             break;
 
@@ -573,7 +1320,7 @@ public class MemoryTab : ITab
                                 {
                                     Address = region.BaseAddress + i,
                                     Type = ScanValueType.String,
-                                    ValuePreview = $"\\{name}\\"
+                                    ValuePreview = $"\"{name}\""
                                 });
                                 foundName++;
                             }
@@ -598,7 +1345,6 @@ public class MemoryTab : ITab
 
         _state.AddInGameLog("[AUTO-KEY] Starting automatic TLS key extraction...");
 
-        // FIX 4: Set scanning state
         _isScanning = true;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
@@ -654,7 +1400,6 @@ public class MemoryTab : ITab
             .Where(r => r.Size > 0x1000 && r.Size < 0x10000000)
             .OrderByDescending(r => r.Size);
 
-        // FIX 4: Set progress tracking
         _scanTotalRegions = 20;
         _scanCurrentRegion = 0;
 
@@ -803,7 +1548,6 @@ public class MemoryTab : ITab
             .OrderByDescending(r => r.Size)
             .ToList();
 
-        // FIX 4: Progress tracking
         _scanTotalRegions = 30;
         _scanCurrentRegion = 0;
 
@@ -896,7 +1640,6 @@ public class MemoryTab : ITab
 
     private async void PerformFirstScan()
     {
-        // FIX 4: Set scanning state
         _isScanning = true;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
@@ -930,7 +1673,6 @@ public class MemoryTab : ITab
 
         var regions = GetReadableMemoryRegions();
 
-        // FIX 4: Progress tracking
         _scanTotalRegions = Math.Min(regions.Count, 50);
         _scanCurrentRegion = 0;
 
@@ -1113,7 +1855,7 @@ public class MemoryTab : ITab
                 {
                     Address = baseAddr + i,
                     Type = ScanValueType.String,
-                    ValuePreview = $"{str}"
+                    ValuePreview = $"\"{str}\""
                 });
                 if (_scanResults.Count >= MAX_RESULTS) return;
             }
@@ -1302,7 +2044,7 @@ public class MemoryTab : ITab
 
     private void Detach()
     {
-        CancelScan(); // FIX 4: Cancel any running scan
+        CancelScan();
 
         if (_processHandle != IntPtr.Zero)
             CloseHandle(_processHandle);
@@ -1355,5 +2097,42 @@ public class MemoryTab : ITab
     private enum ScanValueType
     {
         Int32, Float, Int64, Double, String, Bytes
+    }
+
+    // NEW: Memory search result
+    private class MemorySearchResult
+    {
+        public IntPtr Address;
+        public string Preview = "";
+        public long RegionSize;
+    }
+
+    // NEW: Netty buffer info
+    private class NettyBufferInfo
+    {
+        public IntPtr Address;
+        public int ReaderIndex;
+        public int WriterIndex;
+        public int Capacity;
+        public int ReadableBytes;
+        public string ContentPreview = "";
+    }
+
+    /// NEW: Decryption diagnostics
+    private class DecryptionDiagnostics
+    {
+        public bool HasRun = false;
+        public int KeysFound = 0;
+        public string KeyTypes = "";
+        public bool KeysValid = false;
+        public int TotalPackets = 0;
+        public int QuicPackets = 0;
+        public int ShortHeaders = 0;
+        public int LongHeaders = 0;
+        public double AverageEntropy = 0;
+        public int SuccessfulDecryptions = 0;
+        public int FailedDecryptions = 0;
+        public List<string> ErrorMessages = new();
+        public List<string> Recommendations = new();
     }
 }

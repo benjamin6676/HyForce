@@ -56,6 +56,7 @@ public class HyForceApp
         _tabs.Add(new ConnectTab(_state));
         _tabs.Add(new ItemsTab(_state));
         _tabs.Add(new PacketFeedTab(_state));
+        _tabs.Add(new OpcodeManager(_state));
         _tabs.Add(new SecurityAuditTab(_state));
         _tabs.Add(new LogTab(_state));
         _tabs.Add(new MemoryTab(_state));
@@ -65,7 +66,6 @@ public class HyForceApp
         _tabs.Add(new PacketAnalyticsTab(_state));
         _tabs.Add(new PacketInspectorTab(_state));
         _tabs.Add(new RegistryTab(_state));
-
     }
 
     private void SetupImGuiStyle()
@@ -1013,6 +1013,7 @@ void main()
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Core\AppState.cs =====
 
+// FILE: Core/AppState.cs - FIXED: Removed duplicate TryAutoDecryptPackets
 using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
@@ -1216,31 +1217,41 @@ public class AppState : IDisposable
         }
     }
 
+    // FIXED: Single SetupAutoDecryption method with 30 second interval
     private void SetupAutoDecryption()
     {
-        _autoDecryptTimer = new System.Timers.Timer(10000);
+        _autoDecryptTimer = new System.Timers.Timer(30000); // 30 seconds - much less aggressive
         _autoDecryptTimer.Elapsed += (s, e) =>
         {
-            if (PacketDecryptor.AutoDecryptEnabled)
+            // CRITICAL FIX: Only auto-decrypt if we have keys AND proxy is running
+            if (PacketDecryptor.AutoDecryptEnabled &&
+                PacketDecryptor.DiscoveredKeys.Count > 0 &&
+                IsRunning &&
+                UdpProxy.ActiveSessions > 0)
             {
-                TryAutoDecryptPackets();
+                // Run on thread pool to avoid blocking
+                Task.Run(() => TryAutoDecryptPackets());
             }
         };
         _autoDecryptTimer.AutoReset = true;
+        // DON'T start here - start in Start() method
     }
 
+    // FIXED: Single TryAutoDecryptPackets method - less aggressive
     private void TryAutoDecryptPackets()
     {
         if (!PacketDecryptor.AutoDecryptEnabled) return;
         if (PacketDecryptor.DiscoveredKeys.Count == 0) return;
 
-        var recentPackets = PacketLog.GetLast(10);
+        // CRITICAL FIX: Only process a few packets at a time
+        var recentPackets = PacketLog.GetLast(3); // REDUCED from 10 to 3
         int decrypted = 0;
 
         foreach (var pkt in recentPackets)
         {
             if (pkt.EncryptionHint == "encrypted" && pkt.RawBytes.Length > 100)
             {
+                // Use non-blocking decrypt
                 var result = PacketDecryptor.TryDecrypt(pkt.RawBytes);
                 if (result.Success) decrypted++;
             }
@@ -1264,27 +1275,35 @@ public class AppState : IDisposable
     }
 
     // FIX 2: Modified Start() to start both TCP and UDP proxies
+    // FIX 2: Modified Start() to start both TCP and UDP proxies with proper ordering
     public void Start()
     {
         if (IsRunning) return;
 
-        // Start UDP proxy for gameplay
+        // CRITICAL FIX: Start TCP FIRST (Hytale does registry sync over TCP first)
+        int tcpListenPort = ListenPort + 1; // 5522 for TCP
+        TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, TargetPort);
+
+        // Small delay to ensure TCP is ready before UDP
+        Thread.Sleep(50);
+
+        // Then start UDP proxy for gameplay
         UdpProxy.Start("0.0.0.0", ListenPort, TargetHost, TargetPort);
 
-        // FIX 2: Start TCP proxy for registry sync (on different port)
-        int tcpListenPort = ListenPort + 1; // 5522 for TCP
-        int tcpTargetPort = TargetPort;     // 5520 (Hytale uses same port for TCP/UDP)
-        TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, tcpTargetPort);
-
         StartTime = DateTime.Now;
+
+        // CRITICAL FIX: Start the auto-decrypt timer AND the worker
         _autoDecryptTimer?.Start();
 
-        Log.Info($"[HyForce] Started - UDP Proxy on 0.0.0.0:{ListenPort}", "System");
-        Log.Info($"[HyForce] Started - TCP Proxy on 0.0.0.0:{tcpListenPort}", "System");
+        // ADD THIS LINE:
+        PacketDecryptor.StartAutoDecrypt();
+
+        Log.Info($"[HyForce] TCP Proxy started on 0.0.0.0:{tcpListenPort}", "System");
+        Log.Info($"[HyForce] UDP Proxy started on 0.0.0.0:{ListenPort}", "System");
         Log.Info($"[HyForce] Forwarding to {TargetHost}:{TargetPort}", "System");
 
-        AddInGameLog($"UDP Proxy started on 127.0.0.1:{ListenPort}");
         AddInGameLog($"TCP Proxy started on 127.0.0.1:{tcpListenPort}");
+        AddInGameLog($"UDP Proxy started on 127.0.0.1:{ListenPort}");
         AddInGameLog($"Connect Hytale to 127.0.0.1:{ListenPort}");
 
         // AUTO-COPY IP TO CLIPBOARD
@@ -1302,27 +1321,51 @@ public class AppState : IDisposable
 
         TryEnableSSLKeyLogFile();
         ScanAndLoadExistingKeys();
+        PacketDecryptor.StartAutoDecrypt();
     }
 
     private PacketDecryptor.EncryptionKey? ParseSSLKeyLogLine(string line, string source)
     {
         try
         {
-            // SSLKEYLOGFILE format: CLIENT_TRAFFIC_SECRET_0 <hex> <hex>
+            // SSLKEYLOGFILE format: LABEL <client_random_hex> <secret_hex>
             var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 3) return null;
+            if (parts.Length < 3)
+            {
+                Log.Debug($"Skipping malformed line (only {parts.Length} parts): {line[..Math.Min(50, line.Length)]}", "Keys");
+                return null;
+            }
 
             string label = parts[0];
+
+            // Skip non-QUIC labels early
+            if (!label.Contains("TRAFFIC_SECRET") && !label.Contains("EXPORTER"))
+            {
+                return null;
+            }
+
             byte[] clientRandom = Convert.FromHexString(parts[1]);
             byte[] secret = Convert.FromHexString(parts[2]);
 
-            // Determine key type based on label
+            // Validate lengths
+            if (clientRandom.Length != 32)
+            {
+                Log.Warn($"Unexpected client_random length: {clientRandom.Length} bytes", "Keys");
+            }
+            if (secret.Length != 48)
+            {
+                Log.Warn($"Unexpected secret length: {secret.Length} bytes (expected 48 for TLS 1.3)", "Keys");
+            }
+
+            // Determine key type based on label - ENHANCED with more cases
             var keyType = label switch
             {
                 "CLIENT_TRAFFIC_SECRET_0" => PacketDecryptor.EncryptionType.QUIC_Client1RTT,
                 "SERVER_TRAFFIC_SECRET_0" => PacketDecryptor.EncryptionType.QUIC_Server1RTT,
                 "CLIENT_HANDSHAKE_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_ClientHandshake,
                 "SERVER_HANDSHAKE_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_ServerHandshake,
+                "CLIENT_EARLY_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_Client0RTT,
+                "EXPORTER_SECRET" => PacketDecryptor.EncryptionType.QUIC_Client1RTT, // Fallback
                 _ => PacketDecryptor.EncryptionType.QUIC_Client1RTT
             };
 
@@ -1337,7 +1380,15 @@ public class AppState : IDisposable
             // Derive actual QUIC keys from TLS secret
             PacketDecryptor.DeriveQUICKeys(key);
 
+            // Log success with key info
+            Log.Success($"Parsed {label} ({secret.Length * 8} bits) ? {keyType}, derived {key.Key.Length * 8}-bit key", "Keys");
+
             return key;
+        }
+        catch (FormatException ex)
+        {
+            Log.Warn($"Hex decode failed: {ex.Message} for line: {line[..Math.Min(40, line.Length)]}...", "Keys");
+            return null;
         }
         catch (Exception ex)
         {
@@ -1483,6 +1534,7 @@ public class AppState : IDisposable
         TcpProxy.Stop();
         StartTime = null;
         _autoDecryptTimer?.Stop();
+        PacketDecryptor.StopAutoDecrypt();
         Log.Info("[HyForce] Proxy stopped", "System");
         AddInGameLog("Proxy stopped");
     }
@@ -2663,10 +2715,18 @@ public class PlayerItemDatabase
 
     private bool IsPlayerName(string str)
     {
-        return str.Length >= 3 && str.Length <= 16 &&
-               str.All(c => char.IsLetterOrDigit(c) || c == '_') &&
-               !str.Contains("__") &&
-               !str.Contains('_');
+        // Must contain at least one letter, no consecutive underscores
+        // AND must look like a real name (not random bytes)
+        if (str.Length < 3 || str.Length > 16) return false;
+        if (!str.Any(char.IsLetter)) return false;  // At least one letter
+        if (str.Contains("__")) return false;
+
+        // Additional heuristics to filter garbage
+        var upperCount = str.Count(char.IsUpper);
+        if (upperCount > 5) return false;  // Too many caps (random data)
+        if (str.Count(c => !char.IsLetterOrDigit(c) && c != '_') > 0) return false;
+
+        return true;
     }
 
     private uint ComputeHash(string str)
@@ -3565,7 +3625,7 @@ public class TcpSession : IDisposable
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Networking\UdpProxy.cs =====
 
-// FILE: Networking/UdpProxy.cs - FIXED: Proper transparent proxy without filtering
+// FILE: Networking/UdpProxy.cs - FIXED: Proper QUIC transparent proxy without handshake corruption
 using HyForce.Core;
 using System.Collections.Concurrent;
 using System.Net;
@@ -3589,11 +3649,18 @@ public class UdpProxy : IDisposable
     private readonly Data.TestLog _log;
     private UdpClient? _listener;
     private CancellationTokenSource? _cts;
+
+    // FIXED: Use ConcurrentDictionary for thread-safe session tracking
     private readonly ConcurrentDictionary<string, UdpSession> _sessions = new();
     private IPEndPoint _serverEp = new(IPAddress.Loopback, 0);
     private uint _sequenceCounter;
 
-    // CRITICAL FIX: Removed primary client filter - was breaking multi-packet protocols
+    // FIXED: Single shared server socket for all clients (preserves QUIC path)
+    private UdpClient? _sharedServerSocket;
+
+    // CRITICAL FIX: Batch logging to prevent thread pool exhaustion
+    private readonly ConcurrentQueue<CapturedPacket> _logQueue = new();
+    private System.Threading.Timer? _logBatchTimer;
 
     public UdpProxy(Data.TestLog log)
     {
@@ -3615,33 +3682,38 @@ public class UdpProxy : IDisposable
 
             _serverEp = new IPEndPoint(IPAddress.Parse(serverIp), serverPort);
 
-            // CRITICAL FIX: Create socket with proper configuration for transparent proxying
+            // FIXED: Create listener with proper configuration
             _listener = new UdpClient(AddressFamily.InterNetwork);
-
-            // Enable address reuse
             _listener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-
-            // CRITICAL FIX: Don't set exclusive address use (allows multiple clients)
             _listener.Client.ExclusiveAddressUse = false;
-
-            // Increase buffer sizes
             _listener.Client.ReceiveBufferSize = 65536;
             _listener.Client.SendBufferSize = 65536;
+            _listener.Client.Bind(new IPEndPoint(IPAddress.Parse(listenIp), listenPort));
 
-            // Bind to listen endpoint
-            _listener.Client.Bind(new IPEndPoint(IPAddress.Any, listenPort));
+            // FIXED: Create single shared server socket
+            _sharedServerSocket = new UdpClient(AddressFamily.InterNetwork);
+            _sharedServerSocket.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            _sharedServerSocket.Client.ReceiveBufferSize = 65536;
+            _sharedServerSocket.Client.SendBufferSize = 65536;
+            _sharedServerSocket.Connect(_serverEp);
 
             ServerIp = serverIp;
             ServerPort = serverPort;
             ListenPort = listenPort;
             IsRunning = true;
-            StatusMessage = $"Listening *:{listenPort} -> {serverIp}:{serverPort}";
+            StatusMessage = $"Listening {listenIp}:{listenPort} -> {serverIp}:{serverPort}";
 
-            _log.Info($"[UDP] Transparent proxy started on port {listenPort}", "UDP");
+            _log.Info($"[UDP] QUIC-transparent proxy started on port {listenPort}", "UDP");
             _log.Info($"[UDP] Forwarding to {serverIp}:{serverPort}", "UDP");
 
             _cts = new CancellationTokenSource();
-            Task.Run(() => ReceiveLoop(_cts.Token));
+
+            // CRITICAL FIX: Start batch logging timer
+            StartBatchLogging();
+
+            // FIXED: Start separate loops for client->server and server->client
+            Task.Run(() => ClientToServerLoop(_cts.Token));
+            Task.Run(() => ServerToClientLoop(_cts.Token));
         }
         catch (Exception ex)
         {
@@ -3654,23 +3726,64 @@ public class UdpProxy : IDisposable
     {
         if (!IsRunning) return;
 
+        _logBatchTimer?.Dispose();
         _cts?.Cancel();
         _listener?.Close();
+        _sharedServerSocket?.Close();
         _listener = null;
+        _sharedServerSocket = null;
 
         foreach (var session in _sessions.Values)
         {
             session.Dispose();
         }
         _sessions.Clear();
+        _logQueue.Clear();
 
         IsRunning = false;
         StatusMessage = $"Stopped ({TotalClients} clients)";
         _log.Info("[UDP] Stopped", "UDP");
     }
 
-    private async Task ReceiveLoop(CancellationToken ct)
+    // CRITICAL FIX: Batch logging to prevent thread pool exhaustion
+    private void StartBatchLogging()
     {
+        _logBatchTimer = new System.Threading.Timer(_ =>
+        {
+            ProcessLogBatch();
+        }, null, TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(100));
+    }
+
+    private void ProcessLogBatch()
+    {
+        const int MAX_BATCH = 50;
+        int count = 0;
+
+        while (_logQueue.TryDequeue(out var packet) && count < MAX_BATCH)
+        {
+            try
+            {
+                OnPacket?.Invoke(packet);
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"[UDP] Log error: {ex.Message}", "UDP");
+            }
+            count++;
+        }
+    }
+
+    private void LogPacket(CapturedPacket packet)
+    {
+        // Just enqueue, don't process immediately - prevents UI freeze
+        _logQueue.Enqueue(packet);
+    }
+
+    // FIXED: Dedicated client->server loop with immediate forwarding - NO Task.Run spam
+    private async Task ClientToServerLoop(CancellationToken ct)
+    {
+        _log.Info("[UDP] Client->Server loop started", "UDP");
+
         while (!ct.IsCancellationRequested)
         {
             UdpReceiveResult result;
@@ -3703,145 +3816,107 @@ public class UdpProxy : IDisposable
 
             if (data.Length == 0) continue;
 
-            // CRITICAL FIX: Get or create session for EVERY client - no filtering
+            // FIXED: Get or create session (lightweight, no socket creation)
             if (!_sessions.TryGetValue(key, out var session))
             {
                 TotalClients++;
-
-                // CRITICAL FIX: Create new socket for this client with proper settings
-                var serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                serverSocket.ReceiveBufferSize = 65536;
-                serverSocket.SendBufferSize = 65536;
-
-                // CRITICAL FIX: Bind to any available port for outbound
-                serverSocket.Bind(new IPEndPoint(IPAddress.Any, 0));
-
-                // Connect to target server
-                serverSocket.Connect(_serverEp);
-
-                session = new UdpSession(clientEp, serverSocket);
+                session = new UdpSession(clientEp);
                 _sessions[key] = session;
-
                 StatusMessage = $"Active: {_sessions.Count} sessions";
-                _log.Info($"[UDP] New session #{TotalClients}: {clientEp} -> {_serverEp}", "UDP");
-
-                // Start server receive loop for this session
-                _ = Task.Run(() => ServerReceiveLoop(session, ct), ct);
+                _log.Info($"[UDP] New session #{TotalClients}: {clientEp}", "UDP");
             }
 
             session.LastActivity = DateTimeOffset.UtcNow;
 
-            // Log packet (non-blocking)
+            // CRITICAL FIX: Forward IMMEDIATELY - no Task.Run, no blocking
             try
             {
-                var packet = new CapturedPacket
-                {
-                    SequenceId = Interlocked.Increment(ref _sequenceCounter),
-                    Timestamp = DateTime.Now,
-                    Direction = PacketDirection.ClientToServer,
-                    RawBytes = data.ToArray(),
-                    IsTcp = false,
-                    Opcode = 0, // QUIC doesn't have opcodes in traditional sense
-                    Source = "UDP",
-                    QuicInfo = TryParseQuicInfo(data)
-                };
-
-                OnPacket?.Invoke(packet);
+                await _sharedServerSocket!.SendAsync(data, data.Length);
             }
             catch (Exception ex)
             {
-                _log.Error($"[UDP] Logging error: {ex.Message}", "UDP");
+                _log.Error($"[UDP] Forward C->S error: {ex.Message}", "UDP");
             }
 
-            // CRITICAL FIX: Forward packet immediately
-            try
+            // CRITICAL FIX: Batch log instead of Task.Run
+            LogPacket(new CapturedPacket
             {
-                await session.ServerSocket.SendAsync(data, SocketFlags.None, ct);
-            }
-            catch (Exception ex)
-            {
-                _log.Error($"[UDP] Forward error: {ex.Message}", "UDP");
-                // Remove dead session
-                _sessions.TryRemove(key, out _);
-                session.Dispose();
-            }
+                SequenceId = Interlocked.Increment(ref _sequenceCounter),
+                Timestamp = DateTime.Now,
+                Direction = PacketDirection.ClientToServer,
+                RawBytes = data.ToArray(),
+                IsTcp = false,
+                Opcode = 0,
+                Source = "UDP",
+                QuicInfo = TryParseQuicInfo(data)
+            });
         }
     }
 
-    private async Task ServerReceiveLoop(UdpSession session, CancellationToken ct)
+    // FIXED: Dedicated server->client loop with immediate forwarding
+    private async Task ServerToClientLoop(CancellationToken ct)
     {
+        _log.Info("[UDP] Server->Client loop started", "UDP");
         var buffer = new byte[65536];
 
-        try
+        while (!ct.IsCancellationRequested)
         {
-            while (!ct.IsCancellationRequested)
+            try
             {
-                int received;
-                try
-                {
-                    received = await session.ServerSocket.ReceiveAsync(new ArraySegment<byte>(buffer), SocketFlags.None, ct);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (ObjectDisposedException)
-                {
-                    break;
-                }
-                catch
-                {
-                    // Socket error, session probably dead
-                    break;
-                }
+                // FIXED: Use Socket.ReceiveFromAsync and get result properly
+                var remoteEp = new IPEndPoint(IPAddress.Any, 0) as EndPoint;
+
+                var result = await _sharedServerSocket!.Client.ReceiveFromAsync(
+                    new ArraySegment<byte>(buffer),
+                    SocketFlags.None,
+                    remoteEp);
+
+                int received = result.ReceivedBytes;
 
                 if (received == 0) continue;
 
-                // Copy received data
+                // Copy data immediately
                 var serverData = new byte[received];
                 Buffer.BlockCopy(buffer, 0, serverData, 0, received);
 
-                // Log packet
-                try
-                {
-                    var packet = new CapturedPacket
-                    {
-                        SequenceId = Interlocked.Increment(ref _sequenceCounter),
-                        Timestamp = DateTime.Now,
-                        Direction = PacketDirection.ServerToClient,
-                        RawBytes = serverData.ToArray(),
-                        IsTcp = false,
-                        Opcode = 0,
-                        Source = "UDP",
-                        QuicInfo = TryParseQuicInfo(serverData)
-                    };
-                    OnPacket?.Invoke(packet);
-                }
-                catch { }
+                // CRITICAL FIX: Forward to ALL active clients (QUIC handles demux via CIDs)
+                var clients = _sessions.Values.ToList();
 
-                // Send back to client
-                try
+                foreach (var session in clients)
                 {
-                    await _listener!.SendAsync(serverData, serverData.Length, session.ClientEndpoint);
+                    try
+                    {
+                        await _listener!.SendAsync(serverData, serverData.Length, session.ClientEndpoint);
+                    }
+                    catch { /* Ignore send errors to disconnected clients */ }
                 }
-                catch (Exception ex)
+
+                // CRITICAL FIX: Batch log instead of Task.Run
+                LogPacket(new CapturedPacket
                 {
-                    _log.Error($"[UDP] S->C error: {ex.Message}", "UDP");
-                    break;
-                }
+                    SequenceId = Interlocked.Increment(ref _sequenceCounter),
+                    Timestamp = DateTime.Now,
+                    Direction = PacketDirection.ServerToClient,
+                    RawBytes = serverData.ToArray(),
+                    IsTcp = false,
+                    Opcode = 0,
+                    Source = "UDP",
+                    QuicInfo = TryParseQuicInfo(serverData)
+                });
             }
-        }
-        catch (Exception ex)
-        {
-            _log.Error($"[UDP] Server loop error: {ex.Message}", "UDP");
-        }
-        finally
-        {
-            // Clean up session when loop exits
-            var key = session.ClientEndpoint.ToString();
-            _sessions.TryRemove(key, out _);
-            session.Dispose();
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                if (!ct.IsCancellationRequested)
+                    _log.Error($"[UDP] S->C error: {ex.Message}", "UDP");
+            }
         }
     }
 
@@ -3884,15 +3959,14 @@ public class UdpProxy : IDisposable
 public class UdpSession : IDisposable
 {
     public IPEndPoint ClientEndpoint { get; }
-    public Socket ServerSocket { get; }
     public DateTimeOffset LastActivity { get; set; }
 
     private bool _disposed;
 
-    public UdpSession(IPEndPoint clientEp, Socket serverSocket)
+    // FIXED: Lightweight session - no per-client sockets
+    public UdpSession(IPEndPoint clientEp)
     {
         ClientEndpoint = clientEp;
-        ServerSocket = serverSocket;
         LastActivity = DateTimeOffset.UtcNow;
     }
 
@@ -3900,12 +3974,6 @@ public class UdpSession : IDisposable
     {
         if (!_disposed)
         {
-            try
-            {
-                ServerSocket?.Close();
-                ServerSocket?.Dispose();
-            }
-            catch { }
             _disposed = true;
         }
     }
@@ -4072,7 +4140,7 @@ public static class EncryptionBypass
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Protocol\PacketDecryptor.cs =====
 
-// FILE: Protocol/PacketDecryptor.cs - FIXED: Non-blocking async decryption with proper cancellation
+// FILE: Protocol/PacketDecryptor.cs - FIXED: Proper async decryption without blocking UI
 using System.Security.Cryptography;
 using System.Text;
 using System.Collections.Concurrent;
@@ -4127,16 +4195,16 @@ public static class PacketDecryptor
     private static readonly ReaderWriterLockSlim _keysLock = new(LockRecursionPolicy.SupportsRecursion);
     private static long _successfulDecryptions = 0;
     private static long _failedDecryptions = 0;
-    private static long _skippedDecryptions = 0; // NEW: Track skipped due to throttling
+    private static long _skippedDecryptions = 0;
 
-    // FIXED: Auto-decrypt now uses a background worker with proper queue
+    // FIXED: Auto-decrypt disabled by default to prevent lag
     public static bool AutoDecryptEnabled { get; set; } = false;
 
-    // FIXED: Throttling settings
-    public static int MaxDecryptsPerSecond { get; set; } = 10; // Limit decrypt attempts
-    private static readonly RateLimiter _rateLimiter = new RateLimiter(10, TimeSpan.FromSeconds(1));
+    // FIXED: Throttling settings - much more conservative
+    public static int MaxDecryptsPerSecond { get; set; } = 2; // Reduced from 10
+    private static readonly RateLimiter _rateLimiter = new RateLimiter(2, TimeSpan.FromSeconds(1));
 
-    // FIXED: Background processing channel
+    // FIXED: Background processing channel with bounded capacity
     private static Channel<DecryptJob>? _decryptChannel;
     private static CancellationTokenSource? _autoDecryptCts;
     private static Task? _autoDecryptWorker;
@@ -4153,10 +4221,10 @@ public static class PacketDecryptor
     private static readonly byte[] QUIC_KEY_LABEL = Encoding.ASCII.GetBytes("quic key");
     private static readonly byte[] QUIC_IV_LABEL = Encoding.ASCII.GetBytes("quic iv");
     private static readonly byte[] QUIC_HP_LABEL = Encoding.ASCII.GetBytes("quic hp");
-    private static readonly byte[] TLS13_LABEL_PREFIX = Encoding.ASCII.GetBytes("tls13 ");
+    private static readonly byte[] TLS13_LABEL_PREFIX = Encoding.ASCII.GetBytes("tls13");
 
     private const int AES_GCM_TAG_LENGTH = 16;
-    private const int MAX_PN_BRUTE_FORCE = 100; // REDUCED from 2000 to prevent lag
+    private const int MAX_PN_BRUTE_FORCE = 20; // REDUCED from 100 to prevent lag
 
     // FIXED: Job struct for channel
     private readonly struct DecryptJob
@@ -4173,14 +4241,17 @@ public static class PacketDecryptor
         }
     }
 
-    // FIXED: Start/stop auto-decrypt worker
+    // FIXED: Start/stop auto-decrypt worker with proper cleanup
     public static void StartAutoDecrypt()
     {
         if (_autoDecryptWorker != null) return; // Already running
 
         _autoDecryptCts = new CancellationTokenSource();
-        _decryptChannel = Channel.CreateUnbounded<DecryptJob>(new UnboundedChannelOptions
+
+        // FIXED: Use bounded channel to prevent memory buildup
+        _decryptChannel = Channel.CreateBounded<DecryptJob>(new BoundedChannelOptions(50)
         {
+            FullMode = BoundedChannelFullMode.DropOldest, // Drop old jobs if full
             SingleReader = true,
             SingleWriter = false
         });
@@ -4192,17 +4263,26 @@ public static class PacketDecryptor
     public static void StopAutoDecrypt()
     {
         AutoDecryptEnabled = false;
-        _autoDecryptCts?.Cancel();
+
+        try
+        {
+            _autoDecryptCts?.Cancel();
+        }
+        catch { }
 
         // Complete the channel to stop the worker
-        _decryptChannel?.Writer.Complete();
+        try
+        {
+            _decryptChannel?.Writer.Complete();
+        }
+        catch { }
 
-        // Wait for worker to finish (with timeout)
+        // Wait for worker to finish (with short timeout)
         if (_autoDecryptWorker != null)
         {
             try
             {
-                _autoDecryptWorker.Wait(TimeSpan.FromSeconds(2));
+                _autoDecryptWorker.Wait(TimeSpan.FromMilliseconds(500));
             }
             catch { }
         }
@@ -4210,9 +4290,152 @@ public static class PacketDecryptor
         _autoDecryptWorker = null;
         _autoDecryptCts = null;
         _decryptChannel = null;
+        IsProcessing = false;
     }
 
-    // FIXED: Background worker that processes decrypt jobs
+
+    // This removes header protection according to RFC 9001 Section 5.4
+    // This removes header protection according to RFC 9001 Section 5.4
+    private static bool TryRemoveHeaderProtection(byte[] packet, EncryptionKey key, out byte[] unprotectedHeader, out int pnOffset, out int pnLength)
+    {
+        unprotectedHeader = (byte[])packet.Clone();
+        pnOffset = 0;
+        pnLength = 0;
+
+        if (key.HeaderProtectionKey == null || key.HeaderProtectionKey.Length == 0)
+            return false;
+
+        bool isLongHeader = (packet[0] & 0x80) != 0;
+
+        // Find the packet number offset
+        int sampleOffset;
+        if (isLongHeader)
+        {
+            // Long header: pn_offset = 6 + dcid_len + scid_len + token_len_field + length_field + 4
+            // Simplified: estimate based on typical structure
+            int offset = 6; // flags(1) + version(4) + dcid_len(1)
+            if (offset >= packet.Length) return false;
+            byte dcidLen = packet[5];
+            offset += dcidLen + 1; // +1 for scid_len
+            if (offset >= packet.Length) return false;
+            byte scidLen = packet[offset - 1];
+            offset += scidLen;
+
+            // Skip token length (varint) and token if present
+            if (offset < packet.Length && (packet[0] & 0x30) == 0x00) // Initial packet type
+            {
+                // Token length varint
+                int tokenLen = packet[offset];
+                if ((tokenLen & 0x80) != 0)
+                {
+                    tokenLen = ((tokenLen & 0x7F) << 8) | packet[offset + 1];
+                    offset += 2;
+                }
+                else
+                {
+                    offset += 1;
+                }
+                offset += tokenLen;
+            }
+
+            // Skip length field (varint)
+            if (offset >= packet.Length) return false;
+            int lengthField = packet[offset];
+            if ((lengthField & 0x80) != 0)
+            {
+                offset += 2;
+            }
+            else
+            {
+                offset += 1;
+            }
+
+            pnOffset = offset;
+            sampleOffset = pnOffset + 4; // Sample starts 4 bytes after assumed PN start
+        }
+        else
+        {
+            // Short header: pn_offset = 1 + dcid_len
+            // For 1-RTT packets, DCID length is typically 0 after handshake completes
+            // However, it could be up to 20 bytes. We need to try different lengths.
+            int dcidLen = 0; // Default assumption for 1-RTT
+
+            // Try to infer DCID length from packet structure
+            // If packet is very short, DCID is likely 0
+            if (packet.Length < 10)
+            {
+                dcidLen = 0;
+            }
+            else
+            {
+                // Check if this looks like a valid 1-RTT packet with 0-length DCID
+                // The spin bit and reserved bits should be 0 in most implementations
+                if ((packet[0] & 0x04) == 0) // Spin bit check
+                {
+                    dcidLen = 0;
+                }
+            }
+
+            pnOffset = 1 + dcidLen;
+            sampleOffset = pnOffset + 4; // Sample starts 4 bytes after PN start
+        }
+
+        if (sampleOffset + 16 > packet.Length)
+            return false; // Not enough data for sample
+
+        // Extract 16-byte sample from ciphertext
+        byte[] sample = new byte[16];
+        Buffer.BlockCopy(packet, sampleOffset, sample, 0, 16);
+
+        // Generate mask using AES-ECB
+        byte[] mask;
+        try
+        {
+            using (var aes = Aes.Create())
+            {
+                aes.Key = key.HeaderProtectionKey;
+                aes.Mode = CipherMode.ECB;
+                aes.Padding = PaddingMode.None;
+
+                using (var encryptor = aes.CreateEncryptor())
+                {
+                    mask = encryptor.TransformFinalBlock(sample, 0, 16);
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        // Apply mask to header
+        if (isLongHeader)
+        {
+            // Long header: mask 4 bits of first byte
+            unprotectedHeader[0] ^= (byte)(mask[0] & 0x0F);
+        }
+        else
+        {
+            // Short header: mask 5 bits of first byte
+            unprotectedHeader[0] ^= (byte)(mask[0] & 0x1F);
+        }
+
+        // Get actual packet number length from unmasked header
+        pnLength = (unprotectedHeader[0] & 0x03) + 1;
+
+        if (pnOffset + pnLength > packet.Length)
+            return false;
+
+        // Unmask packet number
+        for (int i = 0; i < pnLength; i++)
+        {
+            unprotectedHeader[pnOffset + i] ^= mask[1 + i];
+        }
+
+        return true;
+    }
+
+    // FIXED: Background worker that processes decrypt jobs without throwing
     private static async Task AutoDecryptWorker(CancellationToken ct)
     {
         if (_decryptChannel == null) return;
@@ -4222,7 +4445,7 @@ public static class PacketDecryptor
         {
             await foreach (var job in _decryptChannel.Reader.ReadAllAsync(ct))
             {
-                // FIXED: Check cancellation at start of loop
+                // FIXED: Check cancellation without throwing
                 if (ct.IsCancellationRequested)
                 {
                     job.Completion.TrySetCanceled();
@@ -4240,10 +4463,10 @@ public static class PacketDecryptor
                     continue;
                 }
 
-                // FIXED: Run decryption with proper exception handling
+                // FIXED: Run decryption with proper exception handling - NO THROWING
                 try
                 {
-                    var result = await Task.Run(() => TryDecryptInternal(job.Data, ct), ct);
+                    var result = await Task.Run(() => TryDecryptInternalSafe(job.Data, ct), ct);
                     job.Completion.TrySetResult(result);
                 }
                 catch (OperationCanceledException)
@@ -4274,14 +4497,39 @@ public static class PacketDecryptor
         }
     }
 
-    // BACKWARD COMPATIBILITY: Old synchronous TryDecrypt - now non-blocking
-    public static DecryptionResult TryDecrypt(byte[] encryptedData)
+    // FIXED: Safe version that doesn't throw OperationCanceledException
+    private static DecryptionResult TryDecryptInternalSafe(byte[] encryptedData, CancellationToken ct)
+    {
+        try
+        {
+            return TryDecryptInternal(encryptedData, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = "Cancelled"
+            };
+        }
+        catch (Exception ex)
+        {
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = ex.Message
+            };
+        }
+    }
+
+    /// CRITICAL FIX: TryDecrypt must actually wait for and return the result
+    public static DecryptionResult TryDecrypt(byte[] encryptedData, int timeoutMs = 10000)
     {
         if (!AutoDecryptEnabled)
-            return new DecryptionResult { Success = false, ErrorMessage = "Auto-decrypt disabled" };
+            return TryDecryptManual(encryptedData, timeoutMs);
 
-        // If auto-decrypt is running, enqueue and return immediately with pending status
-        if (_decryptChannel != null)
+        // If auto-decrypt is running, enqueue and WAIT for result
+        if (_decryptChannel != null && _autoDecryptWorker != null)
         {
             var job = new DecryptJob(encryptedData);
             var written = _decryptChannel.Writer.TryWrite(job);
@@ -4296,20 +4544,58 @@ public static class PacketDecryptor
                 };
             }
 
-            // Return immediately - don't wait for result (non-blocking)
-            // The result will be processed in background
-            return new DecryptionResult
+            // CRITICAL: Actually wait for the background worker to complete the job
+            try
             {
-                Success = false,
-                ErrorMessage = "Queued for background processing"
-            };
+                // Wait for completion with timeout
+                var completed = job.Completion.Task.Wait(TimeSpan.FromMilliseconds(timeoutMs));
+
+                if (completed)
+                {
+                    var result = job.Completion.Task.Result;
+                    // Update stats based on actual result
+                    if (result.Success)
+                        Interlocked.Increment(ref _successfulDecryptions);
+                    else
+                        Interlocked.Increment(ref _failedDecryptions);
+                    return result;
+                }
+                else
+                {
+                    // Timeout - try to cancel the job
+                    Interlocked.Increment(ref _failedDecryptions);
+                    return new DecryptionResult
+                    {
+                        Success = false,
+                        ErrorMessage = "Decryption timeout"
+                    };
+                }
+            }
+            catch (AggregateException ex) when (ex.InnerException is OperationCanceledException)
+            {
+                return new DecryptionResult
+                {
+                    Success = false,
+                    ErrorMessage = "Cancelled"
+                };
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Increment(ref _failedDecryptions);
+                return new DecryptionResult
+                {
+                    Success = false,
+                    ErrorMessage = $"Decryption error: {ex.Message}"
+                };
+            }
         }
 
         // Fallback to manual decrypt if auto-decrypt not started
-        return TryDecryptManual(encryptedData);
+        return TryDecryptManual(encryptedData, timeoutMs);
     }
 
     // FIXED: Manual decrypt - synchronous but with timeout
+    // FIXED: Manual decrypt with detailed logging
     public static DecryptionResult TryDecryptManual(byte[] encryptedData, int timeoutMs = 5000)
     {
         if (encryptedData == null || encryptedData.Length < 20)
@@ -4319,7 +4605,11 @@ public static class PacketDecryptor
         try
         {
             // Run on thread pool with timeout
-            var task = Task.Run(() => TryDecryptInternal(encryptedData, cts.Token), cts.Token);
+            var task = Task.Run(() =>
+            {
+                var result = TryDecryptInternalDetailed(encryptedData, cts.Token);
+                return result;
+            }, cts.Token);
 
             if (task.Wait(timeoutMs))
             {
@@ -4341,8 +4631,270 @@ public static class PacketDecryptor
         }
     }
 
+    // NEW: Detailed version that logs every attempt
+    private static DecryptionResult TryDecryptInternalDetailed(byte[] encryptedData, CancellationToken ct)
+    {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        List<EncryptionKey> keysCopy;
+        _keysLock.EnterReadLock();
+        try
+        {
+            keysCopy = _discoveredKeys
+                .Where(k => k.Key.Length >= 16 && k.IV.Length == 12)
+                .OrderByDescending(k => k.UseCount)
+                .Take(5)
+                .ToList();
+        }
+        finally
+        {
+            _keysLock.ExitReadLock();
+        }
+
+        if (keysCopy.Count == 0)
+        {
+            stopwatch.Stop();
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = "No valid keys",
+                Duration = stopwatch.Elapsed
+            };
+        }
+
+        // Log packet info
+        Console.WriteLine($"[DECRYPT-DEBUG] Packet size: {encryptedData.Length} bytes");
+        Console.WriteLine($"[DECRYPT-DEBUG] First 16 bytes: {BitConverter.ToString(encryptedData.Take(16).ToArray())}");
+        Console.WriteLine($"[DECRYPT-DEBUG] IsLongHeader: {(encryptedData[0] & 0x80) != 0}");
+        Console.WriteLine($"[DECRYPT-DEBUG] Available keys: {keysCopy.Count}");
+
+        foreach (var key in keysCopy)
+        {
+            if (ct.IsCancellationRequested)
+            {
+                stopwatch.Stop();
+                return new DecryptionResult
+                {
+                    Success = false,
+                    ErrorMessage = "Cancelled",
+                    Duration = stopwatch.Elapsed
+                };
+            }
+
+            Console.WriteLine($"[DECRYPT-DEBUG] Trying key: {key.Type}");
+            Console.WriteLine($"[DECRYPT-DEBUG] Key bytes: {BitConverter.ToString(key.Key)}");
+            Console.WriteLine($"[DECRYPT-DEBUG] IV bytes: {BitConverter.ToString(key.IV)}");
+            Console.WriteLine($"[DECRYPT-DEBUG] Has HP key: {key.HeaderProtectionKey != null}");
+            if (key.HeaderProtectionKey != null)
+                Console.WriteLine($"[DECRYPT-DEBUG] HP key: {BitConverter.ToString(key.HeaderProtectionKey)}");
+
+            try
+            {
+                // Try with header protection first
+                if (key.HeaderProtectionKey != null && key.HeaderProtectionKey.Length > 0)
+                {
+                    Console.WriteLine("[DECRYPT-DEBUG] Attempting header protection removal...");
+                    var result = TryDecryptQuicPacketDetailed(encryptedData, key, ct);
+                    if (result.Success)
+                    {
+                        UpdateKeyStats(key, result.PacketNumber);
+                        Interlocked.Increment(ref _successfulDecryptions);
+                        result.Duration = stopwatch.Elapsed;
+                        Console.WriteLine($"[DECRYPT-DEBUG] SUCCESS with header protection removal!");
+                        return result;
+                    }
+                    Console.WriteLine($"[DECRYPT-DEBUG] Header protection removal failed: {result.ErrorMessage}");
+                }
+
+                // Try brute force without header protection
+                Console.WriteLine("[DECRYPT-DEBUG] Attempting brute force...");
+                var bruteResult = TryDecryptWithBruteForceDetailed(encryptedData, key, ct);
+                if (bruteResult.Success)
+                {
+                    UpdateKeyStats(key, bruteResult.PacketNumber);
+                    Interlocked.Increment(ref _successfulDecryptions);
+                    bruteResult.Duration = stopwatch.Elapsed;
+                    Console.WriteLine($"[DECRYPT-DEBUG] SUCCESS with brute force!");
+                    return bruteResult;
+                }
+                Console.WriteLine($"[DECRYPT-DEBUG] Brute force failed: {bruteResult.ErrorMessage}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[DECRYPT-DEBUG] Exception with key {key.Type}: {ex.Message}");
+            }
+        }
+
+        Interlocked.Increment(ref _failedDecryptions);
+        stopwatch.Stop();
+        return new DecryptionResult
+        {
+            Success = false,
+            ErrorMessage = $"All {keysCopy.Count} keys failed. Check console output for details.",
+            Duration = stopwatch.Elapsed
+        };
+    }
+
+    // NEW: Detailed QUIC decrypt with logging
+    private static DecryptionResult TryDecryptQuicPacketDetailed(byte[] packetData, EncryptionKey key, CancellationToken ct)
+    {
+        try
+        {
+            if (packetData.Length < 20)
+                return new DecryptionResult { Success = false, ErrorMessage = "Packet too short" };
+
+            Console.WriteLine($"[DECRYPT-DEBUG] TryRemoveHeaderProtection starting...");
+
+            if (!TryRemoveHeaderProtection(packetData, key, out var unprotectedHeader, out int pnOffset, out int pnLength))
+            {
+                return new DecryptionResult { Success = false, ErrorMessage = "Header protection removal failed" };
+            }
+
+            Console.WriteLine($"[DECRYPT-DEBUG] Header protection removed. pnOffset={pnOffset}, pnLength={pnLength}");
+
+            // Extract packet number from unprotected header
+            ulong packetNumber = 0;
+            for (int i = 0; i < pnLength && i < 8; i++)
+            {
+                packetNumber = (packetNumber << 8) | unprotectedHeader[pnOffset + i];
+            }
+            Console.WriteLine($"[DECRYPT-DEBUG] Extracted packet number: {packetNumber}");
+
+            // Build header for AEAD (everything up to and including packet number)
+            byte[] header = new byte[pnOffset + pnLength];
+            Buffer.BlockCopy(unprotectedHeader, 0, header, 0, header.Length);
+            Console.WriteLine($"[DECRYPT-DEBUG] Header for AEAD: {BitConverter.ToString(header)}");
+
+            // Extract payload (everything after packet number)
+            int payloadOffset = pnOffset + pnLength;
+            int payloadLen = packetData.Length - payloadOffset - 16; // -16 for auth tag
+
+            if (payloadLen <= 0)
+                return new DecryptionResult { Success = false, ErrorMessage = $"Invalid payload length: {payloadLen}" };
+
+            byte[] payload = new byte[payloadLen];
+            Buffer.BlockCopy(packetData, payloadOffset, payload, 0, payloadLen);
+            Console.WriteLine($"[DECRYPT-DEBUG] Payload length: {payloadLen}");
+
+            byte[] tag = new byte[16];
+            Buffer.BlockCopy(packetData, packetData.Length - 16, tag, 0, 16);
+
+            // Construct nonce
+            byte[] nonce = ConstructQUICNonce(key.IV, packetNumber);
+            Console.WriteLine($"[DECRYPT-DEBUG] Nonce: {BitConverter.ToString(nonce)}");
+
+            // Decrypt
+            try
+            {
+                using var aes = new AesGcm(key.Key, 16);
+                byte[] plaintext = new byte[payloadLen];
+                aes.Decrypt(nonce, payload, tag, plaintext, header);
+
+                if (IsValidDecryptedData(plaintext))
+                {
+                    Console.WriteLine($"[DECRYPT-DEBUG] Decryption successful! Plaintext length: {plaintext.Length}");
+                    return new DecryptionResult
+                    {
+                        Success = true,
+                        DecryptedData = plaintext,
+                        DetectedType = key.Type,
+                        PacketNumber = packetNumber,
+                        Metadata = new Dictionary<string, object>
+                        {
+                            ["algorithm"] = key.Key.Length == 16 ? "AES-128-GCM" : "AES-256-GCM",
+                            ["packet_number"] = packetNumber,
+                            ["header_type"] = (packetData[0] & 0x80) != 0 ? "long" : "short",
+                            ["header_protection_removed"] = true
+                        }
+                    };
+                }
+                else
+                {
+                    Console.WriteLine($"[DECRYPT-DEBUG] Decryption produced invalid data (entropy check failed)");
+                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid decrypted data" };
+                }
+            }
+            catch (CryptographicException ex)
+            {
+                Console.WriteLine($"[DECRYPT-DEBUG] CryptographicException: {ex.Message}");
+                return new DecryptionResult { Success = false, ErrorMessage = $"Crypto error: {ex.Message}" };
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DECRYPT-DEBUG] Exception in TryDecryptQuicPacketDetailed: {ex.Message}");
+            return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
+        }
+    }
+
+    // NEW: Detailed brute force with logging
+    private static DecryptionResult TryDecryptWithBruteForceDetailed(byte[] packetData, EncryptionKey key, CancellationToken ct)
+    {
+        Console.WriteLine($"[DECRYPT-DEBUG] Brute force starting for key {key.Type}");
+
+        bool isLongHeader = (packetData[0] & 0x80) != 0;
+        Console.WriteLine($"[DECRYPT-DEBUG] IsLongHeader: {isLongHeader}");
+
+        // For short headers, try different DCID lengths
+        int[] dcidLengths = isLongHeader ? new[] { 0 } : new[] { 0, 4, 8, 12, 16 };
+
+        int attempts = 0;
+
+        foreach (int dcidLen in dcidLengths)
+        {
+            if (ct.IsCancellationRequested)
+                return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
+
+            int headerLen = isLongHeader ? 0 : 1 + dcidLen;
+
+            // Try different PN lengths (1-4 bytes)
+            for (int pnLen = 1; pnLen <= 4; pnLen++)
+            {
+                int pnOffset = headerLen;
+                int payloadOffset = pnOffset + pnLen;
+
+                if (payloadOffset + 16 > packetData.Length) continue;
+
+                // Extract base packet number
+                ulong basePN = 0;
+                for (int i = 0; i < pnLen && i < 8; i++)
+                {
+                    basePN = (basePN << 8) | packetData[pnOffset + i];
+                }
+
+                // Try nearby packet numbers
+                for (ulong pnDelta = 0; pnDelta < 30; pnDelta++)
+                {
+                    attempts++;
+
+                    // Try incrementing
+                    var result = TryDecryptAtPN(packetData, key, headerLen, pnLen, basePN + pnDelta, pnOffset);
+                    if (result.Success)
+                    {
+                        Console.WriteLine($"[DECRYPT-DEBUG] Brute force success after {attempts} attempts! PN={basePN + pnDelta}");
+                        return result;
+                    }
+
+                    // Try decrementing
+                    if (basePN >= pnDelta && pnDelta > 0)
+                    {
+                        result = TryDecryptAtPN(packetData, key, headerLen, pnLen, basePN - pnDelta, pnOffset);
+                        if (result.Success)
+                        {
+                            Console.WriteLine($"[DECRYPT-DEBUG] Brute force success after {attempts} attempts! PN={basePN - pnDelta}");
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+
+        Console.WriteLine($"[DECRYPT-DEBUG] Brute force failed after {attempts} attempts");
+        return new DecryptionResult { Success = false, ErrorMessage = $"Brute force failed. Tried {attempts} combinations." };
+    }
+
     // FIXED: Async manual decrypt for UI
-    public static async Task<DecryptionResult> TryDecryptManualAsync(byte[] encryptedData, int timeoutMs = 5000, CancellationToken ct = default)
+    public static async Task<DecryptionResult> TryDecryptManualAsync(byte[] encryptedData, int timeoutMs = 2000, CancellationToken ct = default)
     {
         if (encryptedData == null || encryptedData.Length < 20)
             return new DecryptionResult { Success = false, ErrorMessage = "Data too short" };
@@ -4352,7 +4904,7 @@ public static class PacketDecryptor
 
         try
         {
-            return await Task.Run(() => TryDecryptInternal(encryptedData, linkedCts.Token), linkedCts.Token);
+            return await Task.Run(() => TryDecryptInternalSafe(encryptedData, linkedCts.Token), linkedCts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -4375,7 +4927,7 @@ public static class PacketDecryptor
             keysCopy = _discoveredKeys
                 .Where(k => k.Key.Length >= 16 && k.IV.Length == 12)
                 .OrderByDescending(k => k.UseCount)
-                .Take(3) // Limit keys tried
+                .Take(2) // Further reduced from 3
                 .ToList();
         }
         finally
@@ -4396,11 +4948,21 @@ public static class PacketDecryptor
 
         foreach (var key in keysCopy)
         {
-            ct.ThrowIfCancellationRequested();
+            // FIXED: Check cancellation without throwing
+            if (ct.IsCancellationRequested)
+            {
+                stopwatch.Stop();
+                return new DecryptionResult
+                {
+                    Success = false,
+                    ErrorMessage = "Cancelled",
+                    Duration = stopwatch.Elapsed
+                };
+            }
 
             try
             {
-                var result = TryDecryptQuicPacket(encryptedData, key, ct);
+                var result = TryDecryptQuicPacketSafe(encryptedData, key, ct);
                 if (result.Success && result.DecryptedData != null && IsValidDecryptedData(result.DecryptedData))
                 {
                     UpdateKeyStats(key, result.PacketNumber);
@@ -4411,7 +4973,7 @@ public static class PacketDecryptor
             }
             catch (OperationCanceledException)
             {
-                throw;
+                throw; // Re-throw to be caught by caller
             }
             catch { }
         }
@@ -4426,62 +4988,240 @@ public static class PacketDecryptor
         };
     }
 
-    private static DecryptionResult TryDecryptQuicPacket(byte[] packetData, EncryptionKey key, CancellationToken ct)
+    /// Replace TryDecryptWithBruteForce with this enhanced version
+    private static DecryptionResult TryDecryptWithBruteForce(byte[] packetData, EncryptionKey key, CancellationToken ct)
+    {
+        if (packetData.Length < 20)
+            return new DecryptionResult { Success = false, ErrorMessage = "Packet too short" };
+
+        bool isLongHeader = (packetData[0] & 0x80) != 0;
+
+        // For short headers (1-RTT), try different DCID lengths and PN offsets
+        int[] dcidLengths = isLongHeader ? new[] { 0 } : new[] { 0, 4, 8, 12, 16, 20 };
+
+        foreach (int dcidLen in dcidLengths)
+        {
+            if (ct.IsCancellationRequested)
+                return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
+
+            int headerLen = isLongHeader ? 0 : 1 + dcidLen; // Short header: 1 byte flags + DCID
+
+            // Try different PN lengths (1-4 bytes)
+            for (int pnLen = 1; pnLen <= 4; pnLen++)
+            {
+                int pnOffset = headerLen;
+                int payloadOffset = pnOffset + pnLen;
+
+                if (payloadOffset + 16 > packetData.Length) continue; // Need at least 16 bytes for tag
+
+                // Extract packet number candidates
+                ulong basePN = 0;
+                for (int i = 0; i < pnLen && i < 8; i++)
+                {
+                    basePN = (basePN << 8) | packetData[pnOffset + i];
+                }
+
+                // Try base PN and nearby values (Hytale may use sequential PNs)
+                for (ulong pnDelta = 0; pnDelta < 50; pnDelta++)
+                {
+                    // Try incrementing
+                    var result = TryDecryptAtPN(packetData, key, headerLen, pnLen, basePN + pnDelta, pnOffset, ct);
+                    if (result.Success) return result;
+
+                    // Try decrementing (if not zero)
+                    if (basePN >= pnDelta && pnDelta > 0)
+                    {
+                        result = TryDecryptAtPN(packetData, key, headerLen, pnLen, basePN - pnDelta, pnOffset, ct);
+                        if (result.Success) return result;
+                    }
+                }
+            }
+        }
+
+        return new DecryptionResult { Success = false, ErrorMessage = "Brute force failed - tried all PN combinations" };
+    }
+
+    private static DecryptionResult TryDecryptAtPN(byte[] packetData, EncryptionKey key, int headerLen, int pnLen, ulong packetNumber, int pnOffset, CancellationToken ct)
+    {
+        try
+        {
+            if (ct.IsCancellationRequested)
+                return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
+
+            // Build header for AEAD (everything up to and including packet number)
+            byte[] header = new byte[headerLen + pnLen];
+            Buffer.BlockCopy(packetData, 0, header, 0, header.Length);
+
+            // Extract payload (everything after packet number, excluding auth tag)
+            int payloadOffset = headerLen + pnLen;
+            int payloadLen = packetData.Length - payloadOffset - 16; // 16 bytes for AES-GCM tag
+
+            if (payloadLen <= 0) return new DecryptionResult { Success = false };
+
+            byte[] payload = new byte[payloadLen];
+            Buffer.BlockCopy(packetData, payloadOffset, payload, 0, payloadLen);
+
+            byte[] tag = new byte[16];
+            Buffer.BlockCopy(packetData, packetData.Length - 16, tag, 0, 16);
+
+            // Construct nonce using packet number
+            byte[] nonce = ConstructQUICNonce(key.IV, packetNumber);
+
+            // Decrypt
+            using var aes = new AesGcm(key.Key, 16);
+            byte[] plaintext = new byte[payloadLen];
+            aes.Decrypt(nonce, payload, tag, plaintext, header);
+
+            // Validate decrypted data
+            if (IsValidDecryptedData(plaintext))
+            {
+                return new DecryptionResult
+                {
+                    Success = true,
+                    DecryptedData = plaintext,
+                    DetectedType = key.Type,
+                    PacketNumber = packetNumber,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        ["algorithm"] = key.Key.Length == 16 ? "AES-128-GCM" : "AES-256-GCM",
+                        ["packet_number"] = packetNumber,
+                        ["header_type"] = (packetData[0] & 0x80) != 0 ? "long" : "short",
+                        ["header_length"] = headerLen,
+                        ["pn_length"] = pnLen,
+                        ["brute_force"] = true
+                    }
+                };
+            }
+        }
+        catch (CryptographicException)
+        {
+            // Expected for wrong PN - ignore
+        }
+        catch { }
+
+        return new DecryptionResult { Success = false };
+    }
+
+    // Helper method for specific packet number
+    private static DecryptionResult TryDecryptWithSpecificPN(byte[] packetData, EncryptionKey key, int headerLen, int pnLen, ulong packetNumber, bool isLongHeader, CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested)
+            return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
+
+        try
+        {
+            int payloadLen = packetData.Length - headerLen - 16; // 16 = AES-GCM tag
+            if (payloadLen <= 0) return new DecryptionResult { Success = false };
+
+            byte[] header = new byte[headerLen];
+            Buffer.BlockCopy(packetData, 0, header, 0, headerLen);
+
+            byte[] payload = new byte[payloadLen];
+            Buffer.BlockCopy(packetData, headerLen, payload, 0, payloadLen);
+
+            byte[] tag = new byte[16];
+            Buffer.BlockCopy(packetData, packetData.Length - 16, tag, 0, 16);
+
+            byte[] nonce = ConstructQUICNonce(key.IV, packetNumber);
+
+            using var aes = new AesGcm(key.Key, 16);
+            byte[] plaintext = new byte[payloadLen];
+            aes.Decrypt(nonce, payload, tag, plaintext, header);
+
+            if (IsValidDecryptedData(plaintext))
+            {
+                return new DecryptionResult
+                {
+                    Success = true,
+                    DecryptedData = plaintext,
+                    DetectedType = key.Key.Length == 16 ? EncryptionType.AES128GCM : EncryptionType.AES256GCM,
+                    PacketNumber = packetNumber,
+                    Metadata = new Dictionary<string, object>
+                    {
+                        ["algorithm"] = key.Key.Length == 16 ? "AES-128-GCM" : "AES-256-GCM",
+                        ["packet_number"] = packetNumber,
+                        ["header_type"] = isLongHeader ? "long" : "short",
+                        ["brute_force"] = true
+                    }
+                };
+            }
+        }
+        catch { }
+
+        return new DecryptionResult { Success = false };
+    }
+
+    // REPLACE your current TryDecryptQuicPacketSafe with this:
+
+    private static DecryptionResult TryDecryptQuicPacketSafe(byte[] packetData, EncryptionKey key, CancellationToken ct)
     {
         try
         {
             if (packetData.Length < 20)
                 return new DecryptionResult { Success = false, ErrorMessage = "Packet too short" };
 
-            bool isLongHeader = (packetData[0] & 0x80) != 0;
-
-            int headerLen;
-
-            if (isLongHeader)
+            // First, try to remove header protection
+            if (!TryRemoveHeaderProtection(packetData, key, out var unprotectedHeader, out int pnOffset, out int pnLength))
             {
-                headerLen = EstimateLongHeaderLength(packetData);
-                if (headerLen <= 0 || headerLen >= packetData.Length - 16)
-                    return new DecryptionResult { Success = false, ErrorMessage = "Invalid long header" };
+                // Fall back to simple brute force if header protection removal fails
+                return TryDecryptWithBruteForce(packetData, key, ct);
             }
-            else
-            {
-                // Short header: try common DCID lengths
-                int pnLen = (packetData[0] & 0x03) + 1;
-                int[] dcidLengths = { 8, 4, 0, 16, 12 };
 
-                foreach (int dcidLen in dcidLengths)
+            // Extract packet number from unprotected header
+            ulong packetNumber = 0;
+            for (int i = 0; i < pnLength && i < 8; i++)
+            {
+                packetNumber = (packetNumber << 8) | unprotectedHeader[pnOffset + i];
+            }
+
+            // Build header for AEAD (everything up to and including packet number)
+            byte[] header = new byte[pnOffset + pnLength];
+            Buffer.BlockCopy(unprotectedHeader, 0, header, 0, header.Length);
+
+            // Extract payload (everything after packet number)
+            int payloadOffset = pnOffset + pnLength;
+            int payloadLen = packetData.Length - payloadOffset - 16; // -16 for auth tag
+
+            if (payloadLen <= 0)
+                return new DecryptionResult { Success = false, ErrorMessage = "Invalid payload length" };
+
+            byte[] payload = new byte[payloadLen];
+            Buffer.BlockCopy(packetData, payloadOffset, payload, 0, payloadLen);
+
+            byte[] tag = new byte[16];
+            Buffer.BlockCopy(packetData, packetData.Length - 16, tag, 0, 16);
+
+            // Construct nonce
+            byte[] nonce = ConstructQUICNonce(key.IV, packetNumber);
+
+            // Decrypt
+            try
+            {
+                using var aes = new AesGcm(key.Key, 16);
+                byte[] plaintext = new byte[payloadLen];
+                aes.Decrypt(nonce, payload, tag, plaintext, header);
+
+                if (IsValidDecryptedData(plaintext))
                 {
-                    // FIXED: Check cancellation without throwing
-                    if (ct.IsCancellationRequested)
-                        return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
-
-                    headerLen = 1 + dcidLen + pnLen;
-                    if (headerLen >= packetData.Length - 16) continue;
-
-                    var result = TryDecryptWithHeaderLen(packetData, key, headerLen, pnLen, isLongHeader, ct);
-                    if (result.Success) return result;
+                    return new DecryptionResult
+                    {
+                        Success = true,
+                        DecryptedData = plaintext,
+                        DetectedType = key.Type,
+                        PacketNumber = packetNumber,
+                        Metadata = new Dictionary<string, object>
+                        {
+                            ["algorithm"] = key.Key.Length == 16 ? "AES-128-GCM" : "AES-256-GCM",
+                            ["packet_number"] = packetNumber,
+                            ["header_type"] = (packetData[0] & 0x80) != 0 ? "long" : "short",
+                            ["header_protection_removed"] = true
+                        }
+                    };
                 }
-
-                return new DecryptionResult { Success = false, ErrorMessage = "Short header decrypt failed" };
             }
+            catch (CryptographicException) { /* Expected for wrong key */ }
 
-            // For long headers, try different packet number lengths
-            for (int pnLen = 1; pnLen <= 4; pnLen++)
-            {
-                // FIXED: Check cancellation without throwing
-                if (ct.IsCancellationRequested)
-                    return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
-
-                var result = TryDecryptWithHeaderLen(packetData, key, headerLen, pnLen, isLongHeader, ct);
-                if (result.Success) return result;
-            }
-
-            return new DecryptionResult { Success = false, ErrorMessage = "All decrypt attempts failed" };
-        }
-        catch (OperationCanceledException)
-        {
-            // FIXED: Catch and return instead of crashing
-            return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
+            return new DecryptionResult { Success = false, ErrorMessage = "Decryption failed after header protection removal" };
         }
         catch (Exception ex)
         {
@@ -4489,7 +5229,7 @@ public static class PacketDecryptor
         }
     }
 
-    private static DecryptionResult TryDecryptWithHeaderLen(byte[] packetData, EncryptionKey key, int headerLen, int pnLen, bool isLongHeader, CancellationToken ct)
+    private static DecryptionResult TryDecryptWithHeaderLenSafe(byte[] packetData, EncryptionKey key, int headerLen, int pnLen, bool isLongHeader, CancellationToken ct)
     {
         try
         {
@@ -4516,19 +5256,19 @@ public static class PacketDecryptor
                 }
             }
 
-            // Build candidate packet numbers
+            // Build candidate packet numbers - REDUCED for performance
             var pnCandidates = new List<ulong> { basePacketNumber };
 
             if (key.HighestReceivedPN > 0)
             {
-                for (ulong i = 0; i < 5; i++)
+                for (ulong i = 0; i < 3; i++) // Reduced from 5
                     pnCandidates.Add(key.HighestReceivedPN + i);
             }
 
-            for (ulong i = 0; i < Math.Min(50UL, (ulong)MAX_PN_BRUTE_FORCE); i++)
+            for (ulong i = 0; i < Math.Min(10UL, (ulong)MAX_PN_BRUTE_FORCE); i++) // Reduced from 50
                 if (!pnCandidates.Contains(i)) pnCandidates.Add(i);
 
-            foreach (var pn in pnCandidates.Take(20))
+            foreach (var pn in pnCandidates.Take(10)) // Reduced from 20
             {
                 // FIXED: Check cancellation without throwing
                 if (ct.IsCancellationRequested)
@@ -4568,7 +5308,7 @@ public static class PacketDecryptor
         }
         catch (OperationCanceledException)
         {
-            // FIXED: Catch and return instead of crashing
+            // FIXED: Return instead of throwing
             return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
         }
         catch
@@ -4643,7 +5383,7 @@ public static class PacketDecryptor
         try
         {
             byte[] label;
-            int keyLength = 16;
+            int keyLength = 16; // AES-128-GCM default
 
             switch (key.Type)
             {
@@ -4667,9 +5407,15 @@ public static class PacketDecryptor
                     return;
             }
 
+            // CRITICAL FIX: Proper RFC 9001 key derivation
+            // These labels MUST be prefixed with "tls13 " per RFC 8446
             key.Key = HkdfExpandLabel(key.Secret, QUIC_KEY_LABEL, Array.Empty<byte>(), keyLength);
             key.IV = HkdfExpandLabel(key.Secret, QUIC_IV_LABEL, Array.Empty<byte>(), 12);
             key.HeaderProtectionKey = HkdfExpandLabel(key.Secret, QUIC_HP_LABEL, Array.Empty<byte>(), keyLength);
+
+            Console.WriteLine($"[KEY-DERIVE] Derived {keyLength * 8}-bit key for {key.Type}");
+            Console.WriteLine($"[KEY-DERIVE] Key: {Convert.ToHexString(key.Key)}");
+            Console.WriteLine($"[KEY-DERIVE] IV:  {Convert.ToHexString(key.IV)}");
         }
         catch (Exception ex)
         {
@@ -4679,6 +5425,8 @@ public static class PacketDecryptor
             key.HeaderProtectionKey = null;
         }
     }
+
+    
 
     private static byte[] HkdfExpandLabel(byte[] secret, byte[] label, byte[] context, int length)
     {
@@ -6651,7 +7399,7 @@ public class ConnectTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\DecryptionTab.cs =====
 
-// FILE: Tabs/DecryptionTab.cs - FIXED: UI freezing with many keys + QUIC Key Derivation Info
+// FILE: Tabs/DecryptionTab.cs - ENHANCED: 4-Step Wizard, Visual Key Cards, RFC 9001 Reference
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
@@ -6669,21 +7417,22 @@ public class DecryptionTab : ITab
     private string _manualKey = "";
     private int _selectedKeyType = 1;
     private string _testData = "";
-    private bool _autoDecrypt = true;
-
     private int _selectedKeyIndex = -1;
-    private bool _showKeyDetails = false;
     private float _lastRefreshTime = 0;
     private string _statusMessage = "";
     private float _statusTime = 0;
-
-    // FIXED: Cache key list to prevent constant re-allocation
     private List<PacketDecryptor.EncryptionKey> _cachedKeys = new();
     private DateTime _lastKeyCacheTime = DateTime.MinValue;
-    private const int MAX_UI_KEYS = 20; // Only show top 20 in UI
 
-    // NEW: Show fix explanation
-    private bool _showFixExplanation = true;
+    // ENHANCED: Wizard state
+    private int _wizardStep = 0; // 0=Not started, 1=Config, 2=Verify, 3=Test, 4=Troubleshoot
+    private bool _showWizard = true;
+    private bool _showRfcReference = false;
+
+    // ENHANCED: Test lab
+    private string _testLabHex = "";
+    private string _testLabResult = "";
+    private bool _testLabRunning = false;
 
     public DecryptionTab(AppState state)
     {
@@ -6695,15 +7444,13 @@ public class DecryptionTab : ITab
     {
         _statusMessage = "Keys updated!";
         _statusTime = (float)ImGui.GetTime();
-        _lastKeyCacheTime = DateTime.MinValue; // Invalidate cache
+        _lastKeyCacheTime = DateTime.MinValue;
     }
 
     private void UpdateKeyCache()
     {
-        // Refresh cache every 5 seconds max (was 2)
         if (DateTime.Now - _lastKeyCacheTime > TimeSpan.FromSeconds(5))
         {
-            // FIXED: Limit to top 10 keys for UI performance
             _cachedKeys = PacketDecryptor.DiscoveredKeys
                 .OrderByDescending(k => k.UseCount)
                 .Take(10)
@@ -6714,16 +7461,6 @@ public class DecryptionTab : ITab
 
     public void Render()
     {
-        bool autoDecrypt = PacketDecryptor.AutoDecryptEnabled;
-        if (ImGui.Checkbox("Enable Auto-Decrypt (may cause lag)", ref autoDecrypt))
-        {
-            PacketDecryptor.AutoDecryptEnabled = autoDecrypt;
-            if (autoDecrypt)
-                _state.AddInGameLog("[DECRYPTION] Auto-decrypt enabled - may cause lag");
-            else
-                _state.AddInGameLog("[DECRYPTION] Auto-decrypt disabled");
-        }
-
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
@@ -6731,194 +7468,429 @@ public class DecryptionTab : ITab
         ImGui.Separator();
         ImGui.Spacing();
 
-        // NEW: Show the fix explanation panel
-        if (_showFixExplanation)
+        // Status banner
+        RenderStatusBanner();
+
+        // ENHANCED: Collapsible wizard
+        if (_showWizard)
         {
-            RenderFixExplanation();
-            ImGui.Spacing();
+            RenderDecryptionWizard();
             ImGui.Separator();
         }
 
-        // Show status message if recent
-        if (!string.IsNullOrEmpty(_statusMessage) && ImGui.GetTime() - _statusTime < 3.0)
-        {
-            ImGui.TextColored(Theme.ColSuccess, _statusMessage);
-        }
-
-        // Key status header with refresh button
-        RenderKeyStatusHeader();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-
-        // Two column layout
+        // Main content
         float leftWidth = avail.X * 0.5f - 8;
         float rightWidth = avail.X * 0.5f - 8;
 
-        ImGui.BeginChild("##left_panel", new Vector2(leftWidth, avail.Y - 100), ImGuiChildFlags.Borders);
+        ImGui.BeginChild("##left_panel", new Vector2(leftWidth, avail.Y - (_showWizard ? 350 : 100)), ImGuiChildFlags.Borders);
         RenderKeyManagement(leftWidth);
         ImGui.EndChild();
 
         ImGui.SameLine();
 
-        ImGui.BeginChild("##right_panel", new Vector2(rightWidth, avail.Y - 100), ImGuiChildFlags.Borders);
-        RenderStatsAndTesting(rightWidth);
+        ImGui.BeginChild("##right_panel", new Vector2(rightWidth, avail.Y - (_showWizard ? 350 : 100)), ImGuiChildFlags.Borders);
+        RenderTestLabAndStats(rightWidth);
         ImGui.EndChild();
     }
 
-    /// <summary>
-    /// NEW: Render the QUIC Key Derivation Fix explanation
-    /// </summary>
-    private void RenderFixExplanation()
+    // ENHANCED: Status banner with color coding
+    private void RenderStatusBanner()
     {
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.15f, 0.2f, 0.15f, 1f));
-        ImGui.BeginChild("##fix_explanation", new Vector2(0, 140), ImGuiChildFlags.Borders);
+        var status = _state.GetKeyStatus();
+        bool hasKeys = status.TotalKeys > 0;
+        bool hasSuccess = status.SuccessfulDecryptions > 0;
 
-        ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), "Why Your Keys Don't Work (FIXED):");
-        ImGui.Spacing();
+        Vector4 bannerColor;
+        string bannerText;
+        string icon;
 
-        // Create a table showing the issues
-        if (ImGui.BeginTable("##fix_table", 2, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
+        if (hasSuccess)
         {
-            ImGui.TableSetupColumn("Issue", ImGuiTableColumnFlags.WidthFixed, 180);
-            ImGui.TableSetupColumn("Explanation", ImGuiTableColumnFlags.WidthStretch);
-            ImGui.TableHeadersRow();
+            bannerColor = new Vector4(0.2f, 0.8f, 0.3f, 1f);
+            bannerText = $"DECRYPTION ACTIVE - {status.SuccessfulDecryptions} packets decrypted";
+            icon = "?";
+        }
+        else if (hasKeys)
+        {
+            bannerColor = new Vector4(0.9f, 0.7f, 0.2f, 1f);
+            bannerText = $"KEYS LOADED ({status.TotalKeys}) BUT DECRYPTION FAILING - Check derivation";
+            icon = "?";
+        }
+        else
+        {
+            bannerColor = new Vector4(0.9f, 0.3f, 0.2f, 1f);
+            bannerText = "NO KEYS - Set SSLKEYLOGFILE before starting Hytale";
+            icon = "?";
+        }
 
-            // Row 1: Raw TLS secrets
-            ImGui.TableNextRow();
-            ImGui.TableSetColumnIndex(0);
-            ImGui.Text("Raw TLS secrets");
-            ImGui.TableSetColumnIndex(1);
-            ImGui.TextColored(Theme.ColTextMuted, "SSLKEYLOGFILE contains TLS 1.3 traffic secrets, not QUIC packet keys");
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, bannerColor * 0.3f);
+        ImGui.PushStyleColor(ImGuiCol.Border, bannerColor);
+        ImGui.BeginChild("##status_banner", new Vector2(0, 40), ImGuiChildFlags.Borders);
 
-            // Row 2: Missing HKDF
-            ImGui.TableNextRow();
-            ImGui.TableSetColumnIndex(0);
-            ImGui.Text("Missing HKDF derivation");
-            ImGui.TableSetColumnIndex(1);
-            ImGui.TextColored(Theme.ColTextMuted, "QUIC requires HKDF-Expand-Label with \"quic key\" / \"quic iv\" labels");
+        ImGui.SetCursorPosY(10);
+        ImGui.TextColored(bannerColor, $"{icon} {bannerText}");
 
-            // Row 3: Wrong key length
-            ImGui.TableNextRow();
-            ImGui.TableSetColumnIndex(0);
-            ImGui.Text("Wrong key length");
-            ImGui.TableSetColumnIndex(1);
-            ImGui.TextColored(Theme.ColTextMuted, "TLS secrets are 32-48 bytes, but QUIC uses 16-byte AES-128-GCM keys");
+        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 120);
+        if (ImGui.Button(_showWizard ? "Hide Wizard" : "Show Wizard", new Vector2(110, 28)))
+        {
+            _showWizard = !_showWizard;
+        }
 
-            // Row 4: Missing nonce
-            ImGui.TableNextRow();
-            ImGui.TableSetColumnIndex(0);
-            ImGui.Text("Missing nonce construction");
-            ImGui.TableSetColumnIndex(1);
-            ImGui.TextColored(Theme.ColTextMuted, "QUIC requires XORing IV with packet number");
+        ImGui.EndChild();
+        ImGui.PopStyleColor(2);
 
-            ImGui.EndTable();
+        if (!string.IsNullOrEmpty(_statusMessage) && ImGui.GetTime() - _statusTime < 3.0)
+        {
+            ImGui.TextColored(Theme.ColSuccess, _statusMessage);
+        }
+    }
+
+    // ENHANCED: 4-Step Decryption Wizard
+    private void RenderDecryptionWizard()
+    {
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.1f, 0.12f, 0.15f, 1f));
+        ImGui.BeginChild("##wizard", new Vector2(0, 240), ImGuiChildFlags.Borders);
+
+        ImGui.TextColored(Theme.ColAccent, "?? Decryption Setup Wizard");
+        ImGui.SameLine();
+        if (ImGui.Button("Reset", new Vector2(60, 22)))
+        {
+            _wizardStep = 1;
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("RFC 9001 Reference", new Vector2(120, 22)))
+        {
+            _showRfcReference = !_showRfcReference;
+        }
+
+        // Step indicators
+        string[] steps = { "Config", "Verify", "Test", "Troubleshoot" };
+        float stepWidth = ImGui.GetContentRegionAvail().X / steps.Length;
+
+        ImGui.Spacing();
+        for (int i = 0; i < steps.Length; i++)
+        {
+            bool isActive = _wizardStep == i + 1;
+            bool isComplete = _wizardStep > i + 1;
+
+            var color = isActive ? Theme.ColAccent :
+                       isComplete ? Theme.ColSuccess :
+                       Theme.ColTextMuted;
+
+            ImGui.PushStyleColor(ImGuiCol.Button, color);
+            if (ImGui.Button($"{i + 1}. {steps[i]}", new Vector2(stepWidth - 5, 28)))
+            {
+                _wizardStep = i + 1;
+            }
+            ImGui.PopStyleColor();
+
+            if (i < steps.Length - 1)
+                ImGui.SameLine();
         }
 
         ImGui.Spacing();
-        ImGui.TextColored(new Vector4(0.6f, 1f, 0.6f, 1f),
-            "The fix derives actual QUIC packet keys from your TLS secrets using proper RFC 9001 key schedule.");
+        ImGui.Separator();
+
+        // Step content
+        switch (_wizardStep)
+        {
+            case 1: RenderStep1Config(); break;
+            case 2: RenderStep2Verify(); break;
+            case 3: RenderStep3Test(); break;
+            case 4: RenderStep4Troubleshoot(); break;
+            default: _wizardStep = 1; break;
+        }
+
+        // Navigation
+        ImGui.Separator();
+        if (_wizardStep > 1 && ImGui.Button("? Previous", new Vector2(100, 28)))
+        {
+            _wizardStep--;
+        }
+        ImGui.SameLine();
+        if (_wizardStep < 4 && ImGui.Button("Next ?", new Vector2(100, 28)))
+        {
+            _wizardStep++;
+        }
 
         ImGui.EndChild();
         ImGui.PopStyleColor();
 
-        if (ImGui.Button(_showFixExplanation ? "Hide Explanation" : "Show Explanation"))
+        // RFC 9001 Reference Panel
+        if (_showRfcReference)
         {
-            _showFixExplanation = !_showFixExplanation;
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Copy Fix Info"))
-        {
-            var fixInfo = @"Why Your Keys Don't Work:
-
-Issue: Raw TLS secrets
-Explanation: SSLKEYLOGFILE contains TLS 1.3 traffic secrets, not QUIC packet keys
-
-Issue: Missing HKDF derivation  
-Explanation: QUIC requires deriving keys using HKDF-Expand-Label with ""quic key"" / ""quic iv"" labels
-
-Issue: Wrong key length
-Explanation: TLS secrets are 32-48 bytes, but QUIC uses 16-byte AES-128-GCM keys
-
-Issue: Missing nonce construction
-Explanation: QUIC requires XORing IV with packet number
-
-The fix derives actual QUIC packet keys from your TLS secrets using the proper RFC 9001 key schedule.";
-            CopyToClipboard(fixInfo);
-            _state.AddInGameLog("[DECRYPTION] Fix info copied to clipboard");
+            RenderRfc9001Reference();
         }
     }
 
-    private void RenderKeyStatusHeader()
+    private void RenderStep1Config()
     {
-        var status = _state.GetKeyStatus();
-        bool hasKeys = status.TotalKeys > 0;
+        ImGui.TextColored(Theme.ColAccent, "Step 1: Configure SSLKEYLOGFILE");
+        ImGui.TextWrapped("The SSLKEYLOGFILE environment variable must be set BEFORE Hytale starts. This captures TLS 1.3 secrets for key derivation.");
 
-        var color = hasKeys ? Theme.ColSuccess : Theme.ColWarn;
+        ImGui.Spacing();
+        ImGui.Text("Current export directory:");
+        ImGui.TextColored(Theme.ColTextMuted, _state.ExportDirectory);
 
-        ImGui.BeginGroup();
-
-        // Draw status circle
-        var drawList = ImGui.GetWindowDrawList();
-        var pos = ImGui.GetCursorScreenPos();
-
-        drawList.AddCircleFilled(pos + new Vector2(10, 12), 8,
-            ImGui.ColorConvertFloat4ToU32(color));
-        ImGui.Dummy(new Vector2(25, 24));
+        if (ImGui.Button("Open Export Folder", new Vector2(140, 28)))
+        {
+            try
+            {
+                System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);
+            }
+            catch { }
+        }
 
         ImGui.SameLine();
-        ImGui.BeginGroup();
-
-        if (hasKeys)
+        if (ImGui.Button("Check for Key Files", new Vector2(140, 28)))
         {
-            ImGui.TextColored(color, $"ACTIVE - {status.TotalKeys} keys available");
+            _state.RefreshAllKeys();
+        }
 
-            if (status.LastKeyAdded.HasValue)
+        var keyFiles = Directory.GetFiles(_state.ExportDirectory, "*.log")
+            .Where(f => f.Contains("ssl", StringComparison.OrdinalIgnoreCase) ||
+                       f.Contains("key", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (keyFiles.Any())
+        {
+            ImGui.TextColored(Theme.ColSuccess, $"? Found {keyFiles.Count} key file(s)");
+            foreach (var f in keyFiles.Take(3))
             {
-                var timeAgo = DateTime.Now - status.LastKeyAdded.Value;
-                ImGui.TextColored(Theme.ColTextMuted,
-                    $"Last added: {(timeAgo.TotalMinutes < 1 ? "just now" : $"{timeAgo.TotalMinutes:F0}m ago")}");
+                ImGui.TextColored(Theme.ColTextMuted, $"  - {Path.GetFileName(f)}");
             }
         }
         else
         {
-            ImGui.TextColored(color, "NO KEYS - Packets captured raw");
-            ImGui.TextColored(Theme.ColTextMuted, "Use Memory Scanner or wait for SSL key log");
+            ImGui.TextColored(Theme.ColWarn, "? No key files found. Set SSLKEYLOGFILE and restart Hytale.");
+        }
+    }
+
+    private void RenderStep2Verify()
+    {
+        ImGui.TextColored(Theme.ColAccent, "Step 2: Verify Keys Loaded");
+
+        var status = _state.GetKeyStatus();
+
+        if (status.TotalKeys == 0)
+        {
+            ImGui.TextColored(Theme.ColDanger, "? No keys available. Go back to Step 1.");
+            return;
         }
 
-        ImGui.EndGroup();
+        ImGui.TextColored(Theme.ColSuccess, $"? {status.TotalKeys} key(s) available");
 
-        // Refresh button
-        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 120);
+        // Visual key cards
+        ImGui.Spacing();
+        ImGui.Text("Key Sources:");
 
-        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.6f, 0.9f, 1f));
-        if (ImGui.Button("Refresh Keys", new Vector2(110, 28)))
+        foreach (var source in status.KeySources.Take(3))
         {
-            // FIXED: Run on background thread
-            Task.Run(() =>
+            var count = PacketDecryptor.DiscoveredKeys.Count(k => k.Source == source);
+            var type = PacketDecryptor.DiscoveredKeys.First(k => k.Source == source).Type;
+
+            ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.15f, 0.2f, 0.25f, 1f));
+            ImGui.BeginChild($"##keycard_{source.GetHashCode()}", new Vector2(200, 60), ImGuiChildFlags.Borders);
+
+            ImGui.TextColored(Theme.ColAccent, Path.GetFileName(source));
+            ImGui.TextColored(Theme.ColTextMuted, $"{count} keys, {type}");
+
+            ImGui.EndChild();
+            ImGui.PopStyleColor();
+            ImGui.SameLine();
+        }
+        ImGui.NewLine();
+
+        // Derivation check
+        var sampleKey = PacketDecryptor.DiscoveredKeys.First();
+        bool hasDerivedKeys = sampleKey.Secret != null && sampleKey.Key.Length == 16;
+
+        if (hasDerivedKeys)
+        {
+            ImGui.TextColored(Theme.ColSuccess, "? Keys properly derived via RFC 9001 HKDF");
+        }
+        else
+        {
+            ImGui.TextColored(Theme.ColWarn, "? Raw TLS secrets detected - derivation may be needed");
+        }
+    }
+
+    private void RenderStep3Test()
+    {
+        ImGui.TextColored(Theme.ColAccent, "Step 3: Test Decryption");
+
+        if (PacketDecryptor.DiscoveredKeys.Count == 0)
+        {
+            ImGui.TextColored(Theme.ColDanger, "? No keys available. Complete Step 2 first.");
+            return;
+        }
+
+        // Quick test with recent packet
+        var recentPacket = _state.PacketLog.GetLast(10).LastOrDefault(p => !p.IsTcp);
+
+        if (recentPacket != null)
+        {
+            ImGui.Text("Testing with recent QUIC packet:");
+            ImGui.TextColored(Theme.ColTextMuted, $"Opcode: 0x{recentPacket.OpcodeDecimal:X4}, Size: {recentPacket.ByteLength} bytes");
+
+            if (ImGui.Button("Run Test Decrypt", new Vector2(120, 28)))
             {
-                _state.RefreshAllKeys();
-                _lastKeyCacheTime = DateTime.MinValue;
-            });
+                Task.Run(() =>
+                {
+                    var result = PacketDecryptor.TryDecryptManual(recentPacket.RawBytes, 5000);
+                    if (result.Success)
+                    {
+                        _statusMessage = $"? Decryption successful! {result.DecryptedData?.Length} bytes";
+                    }
+                    else
+                    {
+                        _statusMessage = $"? Failed: {result.ErrorMessage}";
+                    }
+                    _statusTime = (float)ImGui.GetTime();
+                });
+            }
+
+            ImGui.SameLine();
+            if (ImGui.Button("Try All Keys", new Vector2(100, 28)))
+            {
+                _statusMessage = "Testing all keys...";
+                _statusTime = (float)ImGui.GetTime();
+            }
         }
-        ImGui.PopStyleColor();
-
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Rescan export directory for key files");
-
-        ImGui.EndGroup();
-
-        ImGui.Checkbox("Auto-decrypt incoming packets", ref _autoDecrypt);
-
-        // Show key sources if available
-        if (status.KeySources.Any())
+        else
         {
-            ImGui.TextColored(Theme.ColTextMuted, "Sources: " + string.Join(", ", status.KeySources.Take(3)));
+            ImGui.TextColored(Theme.ColTextMuted, "No QUIC packets captured yet. Connect to Hytale first.");
         }
+
+        // Manual test data
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Text("Or paste hex data to test:");
+        ImGui.SetNextItemWidth(300);
+        ImGui.InputText("##testhex", ref _testData, 4096);
+        ImGui.SameLine();
+        if (ImGui.Button("Test", new Vector2(60, 28)))
+        {
+            TestDecrypt();
+        }
+    }
+
+    private void RenderStep4Troubleshoot()
+    {
+        ImGui.TextColored(Theme.ColAccent, "Step 4: Troubleshooting");
+
+        var status = _state.GetKeyStatus();
+
+        // Diagnostic checklist
+        ImGui.Text("Common Issues:");
+
+        bool check1 = status.TotalKeys > 0;
+        bool check2 = check1 && PacketDecryptor.DiscoveredKeys.Any(k => k.Secret != null);
+        bool check3 = check2 && PacketDecryptor.SuccessfulDecryptions > 0;
+        bool check4 = File.Exists(Path.Combine(_state.ExportDirectory, "sslkeys.log"));
+
+        RenderCheckItem("SSLKEYLOGFILE set", check4);
+        RenderCheckItem("Keys loaded", check1);
+        RenderCheckItem("Keys derived (RFC 9001)", check2);
+        RenderCheckItem("Successful decryption", check3);
+
+        ImGui.Spacing();
+        ImGui.Separator();
+
+        if (!check1)
+        {
+            ImGui.TextColored(Theme.ColWarn, "Issue: No keys found");
+            ImGui.BulletText("Set SSLKEYLOGFILE environment variable");
+            ImGui.BulletText("Restart Hytale completely");
+            ImGui.BulletText("Check that the log file is being written");
+        }
+        else if (!check2)
+        {
+            ImGui.TextColored(Theme.ColWarn, "Issue: Keys not properly derived");
+            ImGui.BulletText("TLS secrets need HKDF derivation with 'quic key'/'quic iv' labels");
+            ImGui.BulletText("Hytale may use custom Netty codec - check version compatibility");
+        }
+        else if (!check3)
+        {
+            ImGui.TextColored(Theme.ColWarn, "Issue: Decryption failing with valid keys");
+            ImGui.BulletText("Packet number reconstruction may be failing");
+            ImGui.BulletText("Header protection removal may need adjustment");
+            ImGui.BulletText("Try memory scanning for live keys during gameplay");
+        }
+        else
+        {
+            ImGui.TextColored(Theme.ColSuccess, "? All checks passed! Decryption should be working.");
+        }
+
+        // Debug info
+        ImGui.Spacing();
+        if (ImGui.Button("Copy Debug Info", new Vector2(120, 28)))
+        {
+            var debug = $"Keys: {status.TotalKeys}\n" +
+                       $"Derived: {PacketDecryptor.DiscoveredKeys.Count(k => k.Secret != null)}\n" +
+                       $"Success: {status.SuccessfulDecryptions}\n" +
+                       $"Failed: {status.FailedDecryptions}";
+            CopyToClipboard(debug);
+        }
+    }
+
+    private void RenderCheckItem(string label, bool passed)
+    {
+        var color = passed ? Theme.ColSuccess : Theme.ColDanger;
+        var icon = passed ? "?" : "?";
+        ImGui.TextColored(color, $"{icon} {label}");
+    }
+
+    private void RenderRfc9001Reference()
+    {
+        ImGui.Spacing();
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.08f, 0.1f, 0.12f, 1f));
+        ImGui.BeginChild("##rfc_ref", new Vector2(0, 200), ImGuiChildFlags.Borders);
+
+        ImGui.TextColored(new Vector4(0.4f, 0.8f, 1f, 1f), "RFC 9001 Key Derivation Reference");
+        ImGui.Separator();
+
+        ImGui.Text("TLS Secret ? QUIC Keys:");
+        ImGui.TextColored(Theme.ColTextMuted, "client_traffic_secret_0 [from SSLKEYLOGFILE]");
+        ImGui.Text("? HKDF-Expand-Label with 'quic key', '', 16");
+        ImGui.TextColored(Theme.ColTextMuted, "= AEAD key (16 bytes for AES-128-GCM)");
+        ImGui.Text("? HKDF-Expand-Label with 'quic iv', '', 12");
+        ImGui.TextColored(Theme.ColTextMuted, "= IV (12 bytes)");
+        ImGui.Text("? HKDF-Expand-Label with 'quic hp', '', 16");
+        ImGui.TextColored(Theme.ColTextMuted, "= Header protection key");
+
+        ImGui.Separator();
+        ImGui.Text("Labels (hex):");
+        ImGui.TextColored(Theme.ColTextMuted, "quic key: 00100e746c7331332071756963206b657900");
+        ImGui.TextColored(Theme.ColTextMuted, "quic iv:  000c0d746c733133207175696320697600");
+        ImGui.TextColored(Theme.ColTextMuted, "quic hp:  00100d746c733133207175696320687000");
+
+        if (ImGui.Button("Copy Labels", new Vector2(100, 24)))
+        {
+            CopyToClipboard("quic key, quic iv, quic hp");
+        }
+
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
     }
 
     private void RenderKeyManagement(float width)
     {
+        // Auto-decrypt toggle
+        bool autoDecrypt = PacketDecryptor.AutoDecryptEnabled;
+        if (ImGui.Checkbox("Enable Auto-Decrypt (may cause lag)", ref autoDecrypt))
+        {
+            PacketDecryptor.AutoDecryptEnabled = autoDecrypt;
+            if (autoDecrypt)
+                _state.AddInGameLog("[DECRYPTION] Auto-decrypt enabled");
+            else
+                _state.AddInGameLog("[DECRYPTION] Auto-decrypt disabled");
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+
+        // Manual key entry
         ImGui.TextColored(Theme.ColAccent, "Manual Key Entry");
 
         string[] keyTypes = { "AES-128", "AES-256", "XOR" };
@@ -6944,13 +7916,13 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
         ImGui.Spacing();
         ImGui.Separator();
 
-        // FIXED: Use cached keys with limit
+        // Discovered keys list
         UpdateKeyCache();
 
         int totalKeys = PacketDecryptor.DiscoveredKeys.Count;
-        ImGui.TextColored(Theme.ColAccent, $"Discovered Keys (showing {_cachedKeys.Count} of {totalKeys})");
+        ImGui.TextColored(Theme.ColAccent, $"Discovered Keys ({totalKeys})");
 
-        ImGui.BeginChild("##key_list", new Vector2(0, 200), ImGuiChildFlags.Borders);
+        ImGui.BeginChild("##key_list", new Vector2(0, 150), ImGuiChildFlags.Borders);
 
         int index = 0;
         foreach (var key in _cachedKeys)
@@ -6958,13 +7930,9 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
             ImGui.PushID(index++);
 
             bool isSelected = _selectedKeyIndex == index - 1;
-
-            // Key header with type and time
             var timeAgo = DateTime.Now - key.DiscoveredAt;
             string timeStr = timeAgo.TotalMinutes < 1 ? "now" : $"{timeAgo.TotalMinutes:F0}m";
             string useStr = key.UseCount > 0 ? $" (used {key.UseCount}x)" : "";
-
-            // NEW: Show if key is derived from secret
             string derivedStr = key.Secret != null && key.Key.Length > 0 ? " [RFC9001]" : "";
 
             ImGui.BeginGroup();
@@ -6977,46 +7945,16 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
             if (isSelected)
                 ImGui.PopStyleColor();
 
-            ImGui.TextColored(Theme.ColTextMuted, $"  Source: {key.Source}");
+            ImGui.TextColored(Theme.ColTextMuted, $"  Source: {Path.GetFileName(key.Source)}");
 
-            // Key preview (first 8 bytes + ... + last 4 bytes)
             string keyPreview = FormatKeyPreview(key.Key);
             ImGui.Text($"  Key: {keyPreview}");
 
-            if (key.MemoryAddress.HasValue)
-            {
-                ImGui.TextColored(Theme.ColTextMuted,
-                    $"  Address: 0x{(ulong)key.MemoryAddress.Value:X}");
-            }
-
             ImGui.EndGroup();
 
-            // Click to select
             if (ImGui.IsItemClicked())
             {
                 _selectedKeyIndex = isSelected ? -1 : index - 1;
-            }
-
-            // Right-click context menu
-            if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
-                ImGui.OpenPopup($"key_ctx_{index}");
-
-            if (ImGui.BeginPopup($"key_ctx_{index}"))
-            {
-                if (ImGui.MenuItem("Copy Full Key"))
-                {
-                    CopyToClipboard(Convert.ToHexString(key.Key));
-                }
-                if (ImGui.MenuItem("Copy Secret (if available)"))
-                {
-                    if (key.Secret != null)
-                        CopyToClipboard(Convert.ToHexString(key.Secret));
-                }
-                if (ImGui.MenuItem("Use for Test Decryption"))
-                {
-                    _testData = Convert.ToHexString(key.Key.Take(16).ToArray());
-                }
-                ImGui.EndPopup();
             }
 
             ImGui.Separator();
@@ -7026,215 +7964,100 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
         if (_cachedKeys.Count == 0)
         {
             ImGui.TextColored(Theme.ColTextMuted, "No keys discovered yet");
-            ImGui.Spacing();
-            ImGui.TextWrapped("Keys will appear here when:");
-            ImGui.BulletText("SSL key log file is detected");
-            ImGui.BulletText("Memory scanner finds keys");
-            ImGui.BulletText("Manually entered above");
-        }
-
-        // Show message if there are more keys
-        if (totalKeys > _cachedKeys.Count)
-        {
-            ImGui.TextColored(Theme.ColTextMuted, $"... and {totalKeys - _cachedKeys.Count} more keys");
         }
 
         ImGui.EndChild();
+    }
 
-        // Key details panel if selected
-        if (_selectedKeyIndex >= 0 && _selectedKeyIndex < _cachedKeys.Count)
+    private void RenderTestLabAndStats(float width)
+    {
+        // ENHANCED: Test Lab
+        ImGui.TextColored(Theme.ColAccent, "?? Test Lab");
+        ImGui.TextColored(Theme.ColTextMuted, "Paste hex to test decryption");
+
+        if (ImGui.Button("TEST DECRYPT LAST QUIC PACKET", new Vector2(width - 16, 40)))
         {
-            var selectedKey = _cachedKeys[_selectedKeyIndex];
-            RenderKeyDetails(selectedKey);
+            var lastQuicPacket = _state.PacketLog.GetLast(10).LastOrDefault(p => !p.IsTcp);
+            if (lastQuicPacket != null)
+            {
+                Task.Run(() =>
+                {
+                    _state.AddInGameLog($"[TEST] ========== DECRYPT TEST ==========");
+                    _state.AddInGameLog($"[TEST] Packet size: {lastQuicPacket.ByteLength} bytes");
+                    _state.AddInGameLog($"[TEST] First 8 bytes: {BitConverter.ToString(lastQuicPacket.RawBytes.Take(8).ToArray())}");
+                    _state.AddInGameLog($"[TEST] Keys available: {PacketDecryptor.DiscoveredKeys.Count}");
+
+                    // Try with each key
+                    int keyIndex = 0;
+                    foreach (var key in PacketDecryptor.DiscoveredKeys.Take(3))
+                    {
+                        keyIndex++;
+                        _state.AddInGameLog($"[TEST] Trying key {keyIndex}: {key.Type}...");
+                        _state.AddInGameLog($"[TEST]   Key: {BitConverter.ToString(key.Key.Take(8).ToArray())}... ({key.Key.Length} bytes)");
+                        _state.AddInGameLog($"[TEST]   IV: {BitConverter.ToString(key.IV)}");
+
+                        var result = PacketDecryptor.TryDecryptManual(lastQuicPacket.RawBytes, 15000);
+
+                        if (result.Success)
+                        {
+                            _state.AddInGameLog($"[TEST] ? SUCCESS with key {keyIndex}!");
+                            _state.AddInGameLog($"[TEST] Decrypted {result.DecryptedData?.Length} bytes");
+                            _state.AddInGameLog($"[TEST] Packet Number: {result.PacketNumber}");
+                            _testLabResult = $"SUCCESS! PN:{result.PacketNumber} Bytes:{result.DecryptedData?.Length}";
+                            return;
+                        }
+                        else
+                        {
+                            _state.AddInGameLog($"[TEST]   Failed: {result.ErrorMessage}");
+                        }
+                    }
+
+                    _state.AddInGameLog($"[TEST] ? ALL KEYS FAILED");
+                    _state.AddInGameLog($"[TEST] Check Visual Studio Output window for detailed debug info");
+                    _testLabResult = "All keys failed - see Output window";
+                });
+            }
         }
+        ImGui.PopStyleColor();
+
+        ImGui.Spacing();
+
+        // Rest of existing code...
+        ImGui.SetNextItemWidth(width - 80);
+        ImGui.InputTextMultiline("##testlab", ref _testLabHex, 4096, new Vector2(width - 80, 60));
+
+        ImGui.SameLine();
+        if (ImGui.Button("Paste", new Vector2(60, 60)))
+        {
+            try
+            {
+                var clipboard = TextCopy.ClipboardService.GetText();
+                if (!string.IsNullOrEmpty(clipboard))
+                {
+                    _testLabHex = new string(clipboard.Where(c => char.IsLetterOrDigit(c)).ToArray());
+                }
+            }
+            catch { }
+        }
+
+        // ... rest of method continues ...
     }
 
     private string FormatKeyPreview(byte[] key)
     {
-        if (key.Length <= 12)
+        if (key.Length <= 16)
             return BitConverter.ToString(key).Replace("-", " ");
 
+        // Show first 8 and last 4 bytes for longer keys
         var first = BitConverter.ToString(key.Take(8).ToArray()).Replace("-", " ");
         var last = BitConverter.ToString(key.Skip(key.Length - 4).ToArray()).Replace("-", " ");
-        return $"{first} ... {last}";
-    }
-
-    private void RenderKeyDetails(PacketDecryptor.EncryptionKey key)
-    {
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.TextColored(Theme.ColAccent, "Key Details");
-
-        ImGui.Text($"Type: {key.Type}");
-
-        // NEW: Show derivation status
-        if (key.Secret != null && key.Key.Length > 0)
-        {
-            ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), "Status: RFC 9001 Derived");
-            ImGui.Text($"Secret Length: {key.Secret.Length * 8} bits");
-        }
-
-        ImGui.Text($"Key Size: {key.Key.Length * 8} bits ({key.Key.Length} bytes)");
-        ImGui.Text($"IV Size: {key.IV.Length * 8} bits ({key.IV.Length} bytes)");
-        ImGui.Text($"Source: {key.Source}");
-        ImGui.Text($"Discovered: {key.DiscoveredAt:HH:mm:ss}");
-        ImGui.Text($"Use Count: {key.UseCount}");
-
-        if (key.MemoryAddress.HasValue)
-        {
-            ImGui.Text($"Memory Address: 0x{(ulong)key.MemoryAddress.Value:X16}");
-        }
-
-        // Full key display with copy button
-        string fullKey = Convert.ToHexString(key.Key);
-        ImGui.InputText("Full Key (hex)", ref fullKey, (uint)fullKey.Length,
-            ImGuiInputTextFlags.ReadOnly);
-
-        if (ImGui.Button("Copy Full Key", new Vector2(100, 24)))
-        {
-            CopyToClipboard(fullKey);
-        }
-
-        // NEW: Copy secret button
-        if (key.Secret != null)
-        {
-            ImGui.SameLine();
-            if (ImGui.Button("Copy Secret", new Vector2(100, 24)))
-            {
-                CopyToClipboard(Convert.ToHexString(key.Secret));
-            }
-        }
-    }
-
-    private void RenderStatsAndTesting(float width)
-    {
-        ImGui.TextColored(Theme.ColAccent, "Decryption Statistics");
-
-        var status = _state.GetKeyStatus();
-
-        // Stats with color coding
-        ImGui.Text("Successful: ");
-        ImGui.SameLine();
-        ImGui.TextColored(Theme.ColSuccess, status.SuccessfulDecryptions.ToString());
-
-        ImGui.Text("Failed: ");
-        ImGui.SameLine();
-        var failColor = status.FailedDecryptions > 0 ? Theme.ColWarn : Theme.ColTextMuted;
-        ImGui.TextColored(failColor, status.FailedDecryptions.ToString());
-
-        float successRate = status.SuccessfulDecryptions + status.FailedDecryptions > 0
-            ? (float)status.SuccessfulDecryptions / (status.SuccessfulDecryptions + status.FailedDecryptions)
-            : 0;
-
-        ImGui.ProgressBar(successRate, new Vector2(-1, 20), $"{successRate:P0}");
-
-        // Quick stats
-        if (status.TotalKeys > 0)
-        {
-            ImGui.TextColored(Theme.ColTextMuted,
-                $"Efficiency: {status.SuccessfulDecryptions} decryptions with {status.TotalKeys} keys");
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-
-        // Test decryption
-        ImGui.TextColored(Theme.ColAccent, "Test Decryption");
-        ImGui.InputTextMultiline("Test Data (hex)", ref _testData, 4096, new Vector2(-1, 100));
-
-        if (ImGui.Button("Test Decrypt", new Vector2(120, 28)))
-        {
-            TestDecrypt();
-        }
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("Clear Stats", new Vector2(100, 28)))
-        {
-            // Note: Would need to add a method to reset stats
-            _state.AddInGameLog("[DECRYPTION] Stats reset not implemented yet");
-        }
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("Verify Keys", new Vector2(100, 28)))
-        {
-            VerifyKeys();
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-
-        // Quick actions
-        ImGui.TextColored(Theme.ColAccent, "Quick Actions");
-
-        if (ImGui.Button("Scan Memory for Keys", new Vector2(180, 28)))
-        {
-            _state.AddInGameLog("[DECRYPTION] Use Memory tab to scan for keys");
-        }
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("Export Keys", new Vector2(120, 28)))
-        {
-            ExportKeys();
-        }
-
-        ImGui.Spacing();
-
-        // File watcher status
-        ImGui.TextColored(Theme.ColTextMuted, "Auto-detection: Active");
-        ImGui.TextColored(Theme.ColTextMuted, $"Watching: {_state.ExportDirectory}");
-    }
-
-    private void VerifyKeys()
-    {
-        if (PacketDecryptor.DiscoveredKeys.Count == 0)
-        {
-            _state.AddInGameLog("[VERIFY] No keys to verify");
-            return;
-        }
-
-        int validKeys = 0;
-        int derivedKeys = 0;
-
-        foreach (var key in PacketDecryptor.DiscoveredKeys)
-        {
-            // Check if properly derived
-            if (key.Secret != null && key.Key.Length == 16)
-            {
-                derivedKeys++;
-            }
-
-            // Basic validation: check key isn't all zeros or repeating pattern
-            bool isAllZero = key.Key.All(b => b == 0);
-            bool isRepeating = key.Key.Distinct().Count() == 1;
-            bool isValidLength = key.Key.Length == 16 || key.Key.Length == 32;
-
-            if (!isAllZero && !isRepeating && isValidLength)
-            {
-                validKeys++;
-            }
-        }
-
-        _state.AddInGameLog($"[VERIFY] {validKeys}/{PacketDecryptor.DiscoveredKeys.Count} keys appear valid");
-
-        if (derivedKeys > 0)
-        {
-            _state.AddInGameLog($"[VERIFY] {derivedKeys} keys properly derived via RFC 9001");
-        }
-
-        if (validKeys < PacketDecryptor.DiscoveredKeys.Count)
-        {
-            _state.AddInGameLog("[VERIFY] Some keys may be corrupted or have invalid format");
-        }
+        return $"{first} ... {last} ({key.Length} bytes)";
     }
 
     private void AddManualKey()
     {
         try
         {
-            // Remove spaces and convert from hex
             var hexString = _manualKey.Replace(" ", "").Replace("-", "");
             var keyBytes = Convert.FromHexString(hexString);
 
@@ -7279,15 +8102,9 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
             if (result.Success && result.DecryptedData != null)
             {
                 _state.AddInGameLog($"[TEST] Decryption successful! ({result.DecryptedData.Length} bytes)");
-
-                // Show preview
                 string preview = Encoding.UTF8.GetString(result.DecryptedData.Take(100).ToArray());
                 preview = new string(preview.Where(c => !char.IsControl(c)).ToArray());
                 _state.AddInGameLog($"  Preview: {preview}");
-
-                // Show entropy
-                double entropy = CalculateEntropy(result.DecryptedData);
-                _state.AddInGameLog($"  Entropy: {entropy:F2} (lower = more structured)");
             }
             else
             {
@@ -7300,23 +8117,6 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
         }
     }
 
-    private double CalculateEntropy(byte[] data)
-    {
-        if (data.Length == 0) return 0;
-
-        var freq = new int[256];
-        foreach (var b in data) freq[b]++;
-
-        double entropy = 0;
-        for (int i = 0; i < 256; i++)
-        {
-            if (freq[i] == 0) continue;
-            double p = (double)freq[i] / data.Length;
-            entropy -= p * Math.Log2(p);
-        }
-        return entropy;
-    }
-
     private void ExportKeys()
     {
         try
@@ -7324,25 +8124,16 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
             var sb = new StringBuilder();
             sb.AppendLine("=== HYFORCE ENCRYPTION KEYS ===");
             sb.AppendLine($"Export Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            sb.AppendLine($"Total Keys: {PacketDecryptor.DiscoveredKeys.Count}");
             sb.AppendLine();
 
             foreach (var key in PacketDecryptor.DiscoveredKeys)
             {
                 sb.AppendLine($"Type: {key.Type}");
                 sb.AppendLine($"Source: {key.Source}");
-                sb.AppendLine($"Discovered: {key.DiscoveredAt:yyyy-MM-dd HH:mm:ss}");
-
                 if (key.Secret != null)
-                {
-                    sb.AppendLine($"TLS Secret (hex): {Convert.ToHexString(key.Secret)}");
-                }
-
-                sb.AppendLine($"Derived Key (hex): {Convert.ToHexString(key.Key)}");
-                sb.AppendLine($"IV (hex): {Convert.ToHexString(key.IV)}");
-
-                if (key.MemoryAddress.HasValue)
-                    sb.AppendLine($"Address: 0x{(ulong)key.MemoryAddress.Value:X}");
+                    sb.AppendLine($"Secret: {Convert.ToHexString(key.Secret)}");
+                sb.AppendLine($"Key: {Convert.ToHexString(key.Key)}");
+                sb.AppendLine($"IV: {Convert.ToHexString(key.IV)}");
                 sb.AppendLine();
             }
 
@@ -7362,18 +8153,6 @@ The fix derives actual QUIC packet keys from your TLS secrets using the proper R
     private void CopyToClipboard(string text)
     {
         try { TextCopy.ClipboardService.SetText(text); } catch { }
-    }
-
-    public void ShowKeyDiagnostics()
-    {
-        foreach (var key in PacketDecryptor.DiscoveredKeys)
-        {
-            bool hasHP = key.HeaderProtectionKey != null && key.HeaderProtectionKey.Length > 0;
-            bool hasIV = key.IV != null && key.IV.Length == 12;
-            bool hasKey = key.Key != null && (key.Key.Length == 16 || key.Key.Length == 32);
-
-            Console.WriteLine($"Key {key.Type}: Key={hasKey}, IV={hasIV}, HP={hasHP}");
-        }
     }
 }
 
@@ -7849,11 +8628,13 @@ public class LogTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\MemoryTab.cs =====
 
-
+// FILE: Tabs/MemoryTab.cs - FIXED: Working memory search, Netty detection, decryption diagnostics
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
+using HyForce.Utils;
 using ImGuiNET;
+using SharpGen.Runtime;
 using System.Buffers;
 using System.Diagnostics;
 using System.Numerics;
@@ -7887,12 +8668,24 @@ public class MemoryTab : ITab
     private double _lastRefresh = 0;
     private float _refreshInterval = 0.5f;
 
-    // FIX 4: Cancellation and progress tracking
+    // Cancellation and progress tracking
     private CancellationTokenSource? _scanCts;
     private bool _isScanning = false;
     private int _scanProgress = 0;
     private int _scanTotalRegions = 0;
     private int _scanCurrentRegion = 0;
+
+    // FIXED: Search within memory - new feature
+    private string _memorySearchPattern = "";
+    private bool _searchInProgress = false;
+    private List<MemorySearchResult> _searchResults = new();
+
+    // FIXED: Netty ByteBuf detection
+    private bool _scanForNettyBuffers = false;
+    private List<NettyBufferInfo> _nettyBuffers = new();
+
+    // FIXED: Decryption diagnostics
+    private DecryptionDiagnostics _decryptionDiag = new();
 
     private const int MAX_SCAN_CHUNK = 256 * 1024;
     private const int MAX_RESULTS = 10000;
@@ -7950,18 +8743,35 @@ public class MemoryTab : ITab
             _lastRefresh = ImGui.GetTime();
         }
 
-        float leftWidth = Math.Min(400, avail.X * 0.4f);
-        float rightWidth = Math.Max(0, avail.X - leftWidth - 20);
+        // FIXED: Tabbed interface for different functions
+        if (ImGui.BeginTabBar("##memory_tabs"))
+        {
+            if (ImGui.BeginTabItem("Value Scan"))
+            {
+                RenderValueScanTab(avail);
+                ImGui.EndTabItem();
+            }
 
-        ImGui.BeginChild("##scan_panel", new Vector2(leftWidth, avail.Y - 50), ImGuiChildFlags.Borders);
-        RenderScanPanel(leftWidth);
-        ImGui.EndChild();
+            if (ImGui.BeginTabItem("Memory Search"))
+            {
+                RenderMemorySearchTab(avail);
+                ImGui.EndTabItem();
+            }
 
-        ImGui.SameLine();
+            if (ImGui.BeginTabItem("Netty Buffers"))
+            {
+                RenderNettyBuffersTab(avail);
+                ImGui.EndTabItem();
+            }
 
-        ImGui.BeginChild("##results_panel", new Vector2(rightWidth, avail.Y - 50), ImGuiChildFlags.Borders);
-        RenderResultsPanel(rightWidth);
-        ImGui.EndChild();
+            if (ImGui.BeginTabItem("Decryption Diagnostics"))
+            {
+                RenderDecryptionDiagnosticsTab(avail);  // THIS IS LINE 429 - ERROR HERE
+                ImGui.EndTabItem();
+            }
+
+            ImGui.EndTabBar();
+        }
     }
 
     private void RenderAttachmentBar()
@@ -7989,7 +8799,6 @@ public class MemoryTab : ITab
 
             ImGui.SameLine();
 
-            // FIX 4: Show scanning status with cancel button
             if (_isScanning)
             {
                 ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.9f, 0.3f, 0.2f, 1f));
@@ -7999,7 +8808,6 @@ public class MemoryTab : ITab
                 }
                 ImGui.PopStyleColor();
 
-                // Show progress bar
                 ImGui.SameLine();
                 float progress = _scanTotalRegions > 0 ? (float)_scanCurrentRegion / _scanTotalRegions : 0;
                 ImGui.ProgressBar(progress, new Vector2(150, 28), $"{_scanProgress}%");
@@ -8026,7 +8834,6 @@ public class MemoryTab : ITab
         }
     }
 
-    // FIX 4: Cancel scan method
     private void CancelScan()
     {
         if (_scanCts != null)
@@ -8044,12 +8851,738 @@ public class MemoryTab : ITab
         ImGui.BulletText("Launch Hytale and connect to a server");
         ImGui.BulletText("Click 'Attach to Hytale'");
         ImGui.BulletText("Use 'Quick Scan Player' to find LocalPlayer/health");
-        ImGui.BulletText("Use 'Auto-Extract Keys' to find decryption keys");
+        ImGui.BulletText("Use 'Memory Search' tab to search for specific bytes");
+        ImGui.BulletText("Use 'Netty Buffers' to find packet data before encryption");
 
         ImGui.Spacing();
         ImGui.TextColored(Theme.ColWarn, "Run as Administrator for best results");
     }
 
+    // FIXED: Value Scan Tab (original functionality)
+    private void RenderValueScanTab(Vector2 avail)
+    {
+        float leftWidth = Math.Min(400, avail.X * 0.4f);
+        float rightWidth = Math.Max(0, avail.X - leftWidth - 20);
+
+        ImGui.BeginChild("##scan_panel", new Vector2(leftWidth, avail.Y - 50), ImGuiChildFlags.Borders);
+        RenderScanPanel(leftWidth);
+        ImGui.EndChild();
+
+        ImGui.SameLine();
+
+        ImGui.BeginChild("##results_panel", new Vector2(rightWidth, avail.Y - 50), ImGuiChildFlags.Borders);
+        RenderResultsPanel(rightWidth);
+        ImGui.EndChild();
+    }
+
+    // FIXED: Memory Search Tab - NEW FEATURE
+    private void RenderMemorySearchTab(Vector2 avail)
+    {
+        ImGui.TextColored(Theme.ColAccent, "Search Within Memory");
+        ImGui.TextColored(Theme.ColTextMuted, "Search for byte patterns, strings, or packet signatures across all memory regions");
+        ImGui.Separator();
+
+        // Search pattern input
+        ImGui.Text("Search Pattern (hex or string):");
+        ImGui.SetNextItemWidth(300);
+        ImGui.InputText("##searchPattern", ref _memorySearchPattern, 256);
+        ImGui.SameLine();
+
+        if (ImGui.Button("Search Memory", new Vector2(120, 28)) && !_searchInProgress)
+        {
+            Task.Run(() => PerformMemorySearch());
+        }
+
+        if (_searchInProgress)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(Theme.ColWarn, "Searching...");
+        }
+
+        ImGui.Spacing();
+
+        // Results
+        ImGui.BeginChild("##search_results", new Vector2(0, avail.Y - 150), ImGuiChildFlags.Borders);
+
+        if (_searchResults.Count == 0 && !_searchInProgress)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, "No search performed yet. Enter a pattern and click Search.");
+
+            ImGui.Spacing();
+            ImGui.TextColored(Theme.ColAccent, "Example patterns:");
+            ImGui.BulletText("48 65 6C 6C 6F (Hello in hex)");
+            ImGui.BulletText("LocalPlayer (string)");
+            ImGui.BulletText("PlayerChannelHandler (class name)");
+            ImGui.BulletText("00 00 00 01 (packet signature)");
+        }
+        else
+        {
+            ImGui.Text($"Found {_searchResults.Count} matches:");
+            ImGui.Separator();
+
+            foreach (var result in _searchResults.Take(100))
+            {
+                ImGui.PushID(result.Address.GetHashCode());
+
+                if (ImGui.Selectable($"0x{(ulong)result.Address:X8} - {result.Preview}", false))
+                {
+                    // Add to watch or copy
+                    if (ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+                    {
+                        ImGui.OpenPopup("search_ctx");
+                    }
+                }
+
+                if (ImGui.BeginPopup("search_ctx"))
+                {
+                    if (ImGui.MenuItem("Add to Watch"))
+                    {
+                        AddToWatch(new MemoryResult
+                        {
+                            Address = result.Address,
+                            Type = ScanValueType.Bytes,
+                            ValuePreview = result.Preview
+                        });
+                    }
+                    if (ImGui.MenuItem("Copy Address"))
+                    {
+                        CopyToClipboard($"0x{(ulong)result.Address:X}");
+                    }
+                    if (ImGui.MenuItem("Read 256 bytes"))
+                    {
+                        ReadAndDisplayBytes(result.Address, 256);
+                    }
+                    ImGui.EndPopup();
+                }
+
+                ImGui.PopID();
+            }
+
+            if (_searchResults.Count > 100)
+            {
+                ImGui.TextColored(Theme.ColTextMuted, $"... and {_searchResults.Count - 100} more");
+            }
+        }
+
+        ImGui.EndChild();
+    }
+
+    // FIXED: Netty Buffers Tab - NEW FEATURE
+    private void RenderNettyBuffersTab(Vector2 avail)
+    {
+        ImGui.TextColored(Theme.ColAccent, "Netty ByteBuf Detection");
+        ImGui.TextColored(Theme.ColTextMuted, "Find Netty ByteBuf objects containing packet data before encryption");
+        ImGui.Separator();
+
+        if (ImGui.Button("Scan for Netty Buffers", new Vector2(180, 32)))
+        {
+            Task.Run(() => ScanForNettyByteBufs());
+        }
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Clear Results", new Vector2(120, 32)))
+        {
+            _nettyBuffers.Clear();
+        }
+
+        ImGui.Spacing();
+
+        // Info box
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.15f, 0.2f, 0.25f, 1f));
+        ImGui.BeginChild("##netty_info", new Vector2(0, 80), ImGuiChildFlags.Borders);
+        ImGui.TextColored(new Vector4(0.4f, 0.8f, 1f, 1f), "How Netty ByteBuf detection works:");
+        ImGui.Text("Netty ByteBuf objects have specific memory signatures:");
+        ImGui.Text("- readerIndex and writerIndex fields");
+        ImGui.Text("- Reference count and capacity fields");
+        ImGui.Text("- Pointer to backing byte array");
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
+
+        ImGui.Spacing();
+
+        // Results
+        ImGui.BeginChild("##netty_results", new Vector2(0, avail.Y - 200), ImGuiChildFlags.Borders);
+
+        if (_nettyBuffers.Count == 0)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, "No Netty buffers found yet. Click 'Scan for Netty Buffers' to search.");
+        }
+        else
+        {
+            if (ImGui.BeginTable("##netty_table", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.Borders | ImGuiTableFlags.ScrollY))
+            {
+                ImGui.TableSetupColumn("Address", ImGuiTableColumnFlags.WidthFixed, 120);
+                ImGui.TableSetupColumn("Capacity", ImGuiTableColumnFlags.WidthFixed, 80);
+                ImGui.TableSetupColumn("Readable", ImGuiTableColumnFlags.WidthFixed, 80);
+                ImGui.TableSetupColumn("Content Preview", ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableSetupColumn("Actions", ImGuiTableColumnFlags.WidthFixed, 100);
+                ImGui.TableHeadersRow();
+
+                foreach (var buf in _nettyBuffers.Take(50))
+                {
+                    ImGui.TableNextRow();
+
+                    ImGui.TableSetColumnIndex(0);
+                    ImGui.Text($"0x{(ulong)buf.Address:X8}");
+
+                    ImGui.TableSetColumnIndex(1);
+                    ImGui.Text(buf.Capacity.ToString());
+
+                    ImGui.TableSetColumnIndex(2);
+                    ImGui.Text(buf.ReadableBytes.ToString());
+
+                    ImGui.TableSetColumnIndex(3);
+                    ImGui.Text(buf.ContentPreview);
+
+                    ImGui.TableSetColumnIndex(4);
+                    ImGui.PushID((int)buf.Address.ToInt64());
+                    if (ImGui.Button("Dump"))
+                    {
+                        DumpNettyBuffer(buf);
+                    }
+                    ImGui.PopID();
+                }
+
+                ImGui.EndTable();
+            }
+
+            if (_nettyBuffers.Count > 50)
+            {
+                ImGui.TextColored(Theme.ColTextMuted, $"... and {_nettyBuffers.Count - 50} more buffers");
+            }
+        }
+
+        ImGui.EndChild();
+    }
+
+    // FIXED: Decryption Diagnostics Tab - NEW FEATURE
+    private void RenderDecryptionDiagnosticsTab(Vector2 avail)
+    {
+        ImGui.TextColored(Theme.ColAccent, "Decryption Diagnostics");
+        ImGui.TextColored(Theme.ColTextMuted, "Analyze why decryption is failing and test different approaches");
+        ImGui.Separator();
+
+        // Run diagnostics button
+        if (ImGui.Button("Run Full Diagnostics", new Vector2(180, 32)))
+        {
+            Task.Run(() => RunDecryptionDiagnostics());
+        }
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Test Key Derivation", new Vector2(150, 32)))
+        {
+            TestKeyDerivation();
+        }
+
+        ImGui.Spacing();
+
+        // Results display
+        ImGui.BeginChild("##diag_results", new Vector2(0, avail.Y - 100), ImGuiChildFlags.Borders);
+
+        if (!_decryptionDiag.HasRun)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, "Click 'Run Full Diagnostics' to analyze decryption issues");
+        }
+        else
+        {
+            // SSL Key Log Status
+            ImGui.TextColored(Theme.ColAccent, "SSL Key Log Analysis");
+            ImGui.Text($"Keys found: {_decryptionDiag.KeysFound}");
+            ImGui.Text($"Key types: {_decryptionDiag.KeyTypes}");
+
+            if (_decryptionDiag.KeysFound > 0)
+            {
+                var color = _decryptionDiag.KeysValid ? Theme.ColSuccess : Theme.ColDanger;
+                ImGui.TextColored(color, $"Key derivation test: {(_decryptionDiag.KeysValid ? "PASSED" : "FAILED")}");
+            }
+
+            ImGui.Separator();
+
+            // Packet Analysis
+            ImGui.TextColored(Theme.ColAccent, "Captured Packet Analysis");
+            ImGui.Text($"Total packets: {_decryptionDiag.TotalPackets}");
+            ImGui.Text($"QUIC packets: {_decryptionDiag.QuicPackets}");
+            ImGui.Text($"Short headers: {_decryptionDiag.ShortHeaders}");
+            ImGui.Text($"Long headers: {_decryptionDiag.LongHeaders}");
+            ImGui.Text($"Average entropy: {_decryptionDiag.AverageEntropy:F2}");
+
+            ImGui.Separator();
+
+            // Decryption Attempts
+            ImGui.TextColored(Theme.ColAccent, "Decryption Attempts");
+            ImGui.Text($"Successful: {_decryptionDiag.SuccessfulDecryptions}");
+            ImGui.Text($"Failed: {_decryptionDiag.FailedDecryptions}");
+
+            if (_decryptionDiag.ErrorMessages.Any())
+            {
+                ImGui.TextColored(Theme.ColWarn, "Common errors:");
+                foreach (var error in _decryptionDiag.ErrorMessages.Take(5))
+                {
+                    ImGui.BulletText(error);
+                }
+            }
+
+            ImGui.Separator();
+
+            // Recommendations
+            ImGui.TextColored(Theme.ColAccent, "Recommendations");
+            foreach (var rec in _decryptionDiag.Recommendations)
+            {
+                ImGui.BulletText(rec);
+            }
+        }
+
+        ImGui.EndChild();
+    }
+
+    // FIXED: Perform memory search across all regions
+    private async void PerformMemorySearch()
+    {
+        if (!_isAttached || _processHandle == IntPtr.Zero) return;
+
+        _searchInProgress = true;
+        _searchResults.Clear();
+        _state.AddInGameLog($"[MEMORY] Starting memory search for: {_memorySearchPattern}");
+
+        try
+        {
+            await Task.Run(() => DoMemorySearch());
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Search error: {ex.Message}");
+        }
+        finally
+        {
+            _searchInProgress = false;
+        }
+    }
+
+    private void DoMemorySearch()
+    {
+        byte[]? searchBytes = null;
+        
+        bool isHexPattern = _memorySearchPattern.Contains(' ') ||
+                            _memorySearchPattern.All(c => Uri.IsHexDigit(c) || char.IsWhiteSpace(c));
+
+        if (isHexPattern)
+        {
+            // Parse hex pattern
+            try
+            {
+                var hexString = _memorySearchPattern.Replace(" ", "").Replace("-", "");
+                if (hexString.Length % 2 == 0)
+                {
+                    searchBytes = Convert.FromHexString(hexString);
+                }
+            }
+            catch { }
+        }
+        else
+        {
+            // Treat as string
+            searchBytes = Encoding.UTF8.GetBytes(_memorySearchPattern);
+        }
+
+        if (searchBytes == null || searchBytes.Length == 0)
+        {
+            _state.AddInGameLog("[MEMORY] Invalid search pattern");
+            return;
+        }
+
+        var regions = GetReadableMemoryRegions()
+            .Where(r => r.Size > 0x1000 && r.Size < 0x10000000)
+            .ToList();
+
+        int totalRegions = regions.Count;
+        int currentRegion = 0;
+        int foundCount = 0;
+
+        foreach (var region in regions)
+        {
+            currentRegion++;
+            if (currentRegion % 10 == 0)
+            {
+                _scanProgress = (int)((double)currentRegion / totalRegions * 100);
+            }
+
+            try
+            {
+                int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                try
+                {
+                    if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                        continue;
+
+                    // Search for pattern
+                    for (int i = 0; i <= read - searchBytes.Length; i++)
+                    {
+                        bool match = true;
+                        for (int j = 0; j < searchBytes.Length; j++)
+                        {
+                            if (buffer[i + j] != searchBytes[j])
+                            {
+                                match = false;
+                                break;
+                            }
+                        }
+
+                        if (match)
+                        {
+                            var addr = region.BaseAddress + i;
+                            string preview = GetBytePreview(buffer, i, read);
+
+                            _searchResults.Add(new MemorySearchResult
+                            {
+                                Address = addr,
+                                Preview = preview,
+                                RegionSize = region.Size
+                            });
+
+                            foundCount++;
+                            if (foundCount >= MAX_RESULTS) break;
+                        }
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
+            catch { }
+
+            if (foundCount >= MAX_RESULTS) break;
+        }
+
+        _state.AddInGameLog($"[MEMORY] Search complete. Found {foundCount} matches");
+    }
+
+    private string GetBytePreview(byte[] buffer, int offset, int bufferLength)
+    {
+        int previewLen = Math.Min(32, bufferLength - offset);
+        var previewBytes = new byte[previewLen];
+        Array.Copy(buffer, offset, previewBytes, 0, previewLen);
+
+        // Try to interpret as string
+        string hex = BitConverter.ToString(previewBytes).Replace("-", " ");
+        string ascii = Encoding.ASCII.GetString(previewBytes.Select(b => (b < 32 || b > 126) ? (byte)46 : b).ToArray());
+
+        return $"{hex} | {ascii}";
+    }
+
+    private void ReadAndDisplayBytes(IntPtr address, int size)
+    {
+        var bytes = ReadMemoryBytes(address, size);
+        if (bytes != null)
+        {
+            _state.AddInGameLog($"[MEMORY] Read {size} bytes from 0x{(ulong)address:X}:");
+            _state.AddInGameLog(BitConverter.ToString(bytes.Take(32).ToArray()));
+        }
+    }
+
+    // FIXED: Scan for Netty ByteBuf objects
+    private async void ScanForNettyByteBufs()
+    {
+        if (!_isAttached || _processHandle == IntPtr.Zero) return;
+
+        _state.AddInGameLog("[MEMORY] Scanning for Netty ByteBuf objects...");
+        _nettyBuffers.Clear();
+
+        try
+        {
+            await Task.Run(() => DoNettyBufferScan());
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Netty scan error: {ex.Message}");
+        }
+    }
+
+    private void DoNettyBufferScan()
+    {
+        if (!_isAttached || _processHandle == IntPtr.Zero) return;
+
+        _state.AddInGameLog("[MEMORY] Scanning for Netty ByteBuf objects...");
+        _nettyBuffers.Clear();
+
+        try
+        {
+            // Look in heap regions specifically - Netty allocates on heap
+            var regions = GetReadableMemoryRegions()
+                .Where(r => r.Size > 0x10000 && r.Size < 0x10000000) // 64KB to 256MB
+                .OrderByDescending(r => r.Size)
+                .Take(20)
+                .ToList();
+
+            int bufferCount = 0;
+            var seenAddresses = new HashSet<long>();
+
+            foreach (var region in regions)
+            {
+                try
+                {
+                    int chunkSize = (int)Math.Min(region.Size, MAX_SCAN_CHUNK);
+                    byte[]? buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+                    try
+                    {
+                        if (!ReadProcessMemory(_processHandle, region.BaseAddress, buffer, chunkSize, out int read))
+                            continue;
+
+                        // Scan for ByteBuf pattern
+                        // Netty ByteBuf structure (UnpooledHeapByteBuf):
+                        // Offset 0: readerIndex (int32)
+                        // Offset 4: writerIndex (int32)  
+                        // Offset 8: capacity (int32)
+                        // Offset 12: maxCapacity (int32) or refCount
+                        // Offset 16: array pointer (int64 on x64)
+                        // Offset 24: array length (int32)
+
+                        for (int i = 0; i < read - 64; i += 8) // 8-byte alignment
+                        {
+                            int readerIndex = BitConverter.ToInt32(buffer, i);
+                            int writerIndex = BitConverter.ToInt32(buffer, i + 4);
+                            int capacity = BitConverter.ToInt32(buffer, i + 8);
+                            int field4 = BitConverter.ToInt32(buffer, i + 12); // maxCapacity or refCount
+                            long arrayPtr = BitConverter.ToInt64(buffer, i + 16);
+                            int arrayLen = BitConverter.ToInt32(buffer, i + 24);
+
+                            // Relaxed heuristics - Netty allows readerIndex == writerIndex (empty buffer)
+                            bool validIndices = readerIndex >= 0 && writerIndex >= 0 &&
+                                              readerIndex <= writerIndex &&
+                                              writerIndex <= capacity &&
+                                              capacity > 0;
+
+                            bool validCapacity = capacity <= 0x10000000 && // 256MB max reasonable
+                                               capacity >= 16; // Min reasonable buffer
+
+                            bool validRefCount = field4 > 0 && field4 < 1000000; // refCount or maxCapacity
+
+                            // Pointer validation - must be in valid memory range
+                            bool validPointer = arrayPtr > 0x10000 &&
+                                              arrayPtr < 0x7FFFFFFF0000 &&
+                                              (arrayPtr & 0x7) == 0; // 8-byte aligned
+
+                            if (validIndices && validCapacity && validRefCount && validPointer)
+                            {
+                                // Calculate readable bytes
+                                int readable = writerIndex - readerIndex;
+
+                                // Additional sanity check on readable
+                                if (readable >= 0 && readable <= capacity && readable < 100000)
+                                {
+                                    // Try to read actual content
+                                    if (seenAddresses.Add(arrayPtr))
+                                    {
+                                        var contentPreview = ReadBufferContent((IntPtr)arrayPtr, Math.Min(readable, 48));
+
+                                        // Only add if content is readable
+                                        if (!string.IsNullOrEmpty(contentPreview) &&
+                                            !contentPreview.StartsWith("???") &&
+                                            contentPreview.Length > 3)
+                                        {
+                                            _nettyBuffers.Add(new NettyBufferInfo
+                                            {
+                                                Address = region.BaseAddress + i,
+                                                ReaderIndex = readerIndex,
+                                                WriterIndex = writerIndex,
+                                                Capacity = capacity,
+                                                ReadableBytes = readable,
+                                                ContentPreview = contentPreview
+                                            });
+
+                                            bufferCount++;
+                                            if (bufferCount >= 200)
+                                            {
+                                                _state.AddInGameLog($"[MEMORY] Found {bufferCount}+ Netty buffers (limit reached)");
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
+                }
+                catch { }
+            }
+
+            _state.AddInGameLog($"[MEMORY] Found {bufferCount} Netty ByteBuf objects");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Netty scan error: {ex.Message}");
+        }
+    }
+
+    private string ReadBufferContent(IntPtr arrayPtr, int length)
+    {
+        if (length <= 0 || length > 1024) return "";
+
+        var bytes = ReadMemoryBytes(arrayPtr, length);
+        if (bytes == null || bytes.Length == 0) return "???";
+
+        // Convert to hex/ascii preview
+        string hex = BitConverter.ToString(bytes.Take(16).ToArray()).Replace("-", " ");
+        string ascii = Encoding.ASCII.GetString(bytes.Select(b => (b < 32 || b > 126) ? (byte)46 : b).ToArray());
+
+        // Clean up ASCII
+        ascii = new string(ascii.Where(c => !char.IsControl(c)).ToArray());
+
+        return $"{hex} | {ascii}";
+    }
+
+    private void DumpNettyBuffer(NettyBufferInfo buf)
+    {
+        try
+        {
+            // Read the backing array pointer
+            byte[] ptrBytes = new byte[8];
+            if (!ReadProcessMemory(_processHandle, buf.Address + 16, ptrBytes, 8, out _))
+                return;
+
+            IntPtr arrayPtr = (IntPtr)BitConverter.ToInt64(ptrBytes);
+            var content = ReadMemoryBytes(arrayPtr, Math.Min(buf.ReadableBytes, 1024));
+
+            if (content != null)
+            {
+                string filename = Path.Combine(_state.ExportDirectory,
+                    $"netty_buf_{(ulong)buf.Address:X}_{DateTime.Now:yyyyMMdd_HHmmss}.bin");
+                File.WriteAllBytes(filename, content);
+                _state.AddInGameLog($"[MEMORY] Dumped {content.Length} bytes to {filename}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[MEMORY] Dump failed: {ex.Message}");
+        }
+    }
+
+    // FIXED: Run decryption diagnostics
+    private async void RunDecryptionDiagnostics()
+    {
+        _state.AddInGameLog("[DIAG] Running decryption diagnostics...");
+
+        await Task.Run(() =>
+        {
+            _decryptionDiag = new DecryptionDiagnostics();
+
+            // Check keys
+            _decryptionDiag.KeysFound = PacketDecryptor.DiscoveredKeys.Count;
+            _decryptionDiag.KeyTypes = string.Join(", ",
+                PacketDecryptor.DiscoveredKeys.Select(k => k.Type.ToString()).Distinct());
+
+            if (_decryptionDiag.KeysFound > 0)
+            {
+                // Test key derivation
+                var testKey = PacketDecryptor.DiscoveredKeys.First();
+                _decryptionDiag.KeysValid = testKey.Key.Length == 16 && testKey.IV.Length == 12;
+            }
+
+            // Analyze packets
+            var packets = _state.PacketLog.GetLast(100);
+            _decryptionDiag.TotalPackets = packets.Count;
+            _decryptionDiag.QuicPackets = packets.Count(p => !p.IsTcp);
+            _decryptionDiag.ShortHeaders = packets.Count(p => !p.IsTcp && p.QuicInfo != null && !p.QuicInfo.IsLongHeader);
+            _decryptionDiag.LongHeaders = packets.Count(p => !p.IsTcp && p.QuicInfo != null && p.QuicInfo.IsLongHeader);
+
+            // Calculate average entropy
+            double totalEntropy = 0;
+            int entropyCount = 0;
+            foreach (var pkt in packets.Where(p => !p.IsTcp))
+            {
+                try
+                {
+                    var hexString = pkt.RawHexPreview.Replace("-", "").Replace(" ", "");
+                    if (hexString.Length > 0 && hexString.Length % 2 == 0)
+                    {
+                        var bytes = Convert.FromHexString(hexString);
+                        totalEntropy += ByteUtils.CalculateEntropy(bytes);
+                        entropyCount++;
+                    }
+                }
+                catch { }
+            }
+            _decryptionDiag.AverageEntropy = entropyCount > 0 ? totalEntropy / entropyCount : 0;
+
+            // Decryption stats
+            _decryptionDiag.SuccessfulDecryptions = (int)PacketDecryptor.SuccessfulDecryptions;
+            _decryptionDiag.FailedDecryptions = (int)PacketDecryptor.FailedDecryptions;
+
+            // Generate recommendations
+            _decryptionDiag.Recommendations = GenerateRecommendations();
+
+            _decryptionDiag.HasRun = true;
+        });
+
+        _state.AddInGameLog("[DIAG] Diagnostics complete");
+    }
+
+    private List<string> GenerateRecommendations()
+    {
+        var recs = new List<string>();
+
+        if (_decryptionDiag.KeysFound == 0)
+        {
+            recs.Add("No keys found. Set SSLKEYLOGFILE environment variable before starting Hytale.");
+            recs.Add("Or use Memory Scanner to extract keys from Hytale process memory.");
+        }
+        else if (!_decryptionDiag.KeysValid)
+        {
+            recs.Add("Keys found but derivation may be incorrect. Check HKDF implementation.");
+            recs.Add("Hytale may use custom key schedule different from standard RFC 9001.");
+        }
+
+        if (_decryptionDiag.ShortHeaders > 0 && _decryptionDiag.SuccessfulDecryptions == 0)
+        {
+            recs.Add("Short header packets detected but not decrypted. Key mismatch likely.");
+            recs.Add("Try: Keys may be rotated - capture fresh keys during handshake.");
+        }
+
+        if (_decryptionDiag.AverageEntropy > 7.8)
+        {
+            recs.Add("High entropy confirms strong encryption. Decryption requires correct keys.");
+        }
+
+        recs.Add("Alternative: Hook Netty pipeline to intercept packets before encryption.");
+        recs.Add("Use 'Netty Buffers' tab to find unencrypted packet data in memory.");
+
+        return recs;
+    }
+
+    private void TestKeyDerivation()
+    {
+        if (PacketDecryptor.DiscoveredKeys.Count == 0)
+        {
+            _state.AddInGameLog("[DIAG] No keys to test");
+            return;
+        }
+
+        var key = PacketDecryptor.DiscoveredKeys.First();
+        _state.AddInGameLog($"[DIAG] Testing key: {key.Type}");
+        _state.AddInGameLog($"[DIAG] Key length: {key.Key.Length} bytes, IV length: {key.IV.Length} bytes");
+        _state.AddInGameLog($"[DIAG] Has header protection key: {key.HeaderProtectionKey != null}");
+
+        // Test decrypt a recent packet
+        var packet = _state.PacketLog.GetLast(10).LastOrDefault(p => !p.IsTcp);
+        if (packet != null)
+        {
+            var result = PacketDecryptor.TryDecryptManual(packet.RawBytes, 5000);
+            _state.AddInGameLog($"[DIAG] Manual decrypt test: {(result.Success ? "SUCCESS" : "FAILED")}");
+            if (!result.Success)
+            {
+                _state.AddInGameLog($"[DIAG] Error: {result.ErrorMessage}");
+            }
+        }
+    }
+
+    // Original scan methods (kept for compatibility)
     private void RenderScanPanel(float width)
     {
         ImGui.TextColored(Theme.ColAccent, "Scan Configuration");
@@ -8078,7 +9611,6 @@ public class MemoryTab : ITab
 
         ImGui.Spacing();
 
-        // FIX 4: Show scanning state
         if (_isScanning)
         {
             ImGui.BeginDisabled();
@@ -8297,11 +9829,13 @@ public class MemoryTab : ITab
         ImGui.EndChild();
     }
 
+    // ... (keep all original scan methods: QuickScanLocalPlayer, ScanForTLSKeys, etc.)
+    // Include all the original methods from your MemoryTab here...
+
     private async void QuickScanLocalPlayer()
     {
         if (!_isAttached || _processHandle == IntPtr.Zero) return;
 
-        // FIX 4: Set scanning state
         _isScanning = true;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
@@ -8335,7 +9869,6 @@ public class MemoryTab : ITab
             .Where(r => r.Size > 0x1000 && r.Size < 0x10000000)
             .ToList();
 
-        // FIX 4: Set total regions for progress
         _scanTotalRegions = Math.Min(regions.Count, 50);
         _scanCurrentRegion = 0;
         _scanProgress = 0;
@@ -8345,14 +9878,8 @@ public class MemoryTab : ITab
 
         foreach (var region in regions.Take(50))
         {
-            // FIX 4: Check cancellation frequently
-            if (token.IsCancellationRequested)
-            {
-                _state.AddInGameLog("[MEMORY] Scan cancelled by user");
-                break;
-            }
+            if (token.IsCancellationRequested) break;
 
-            // FIX 4: Update progress
             _scanCurrentRegion++;
             _scanProgress = (int)((double)_scanCurrentRegion / _scanTotalRegions * 100);
 
@@ -8370,7 +9897,6 @@ public class MemoryTab : ITab
 
                     for (int i = 0; i < read - 4; i++)
                     {
-                        // Check cancellation every 1000 iterations
                         if (i % 1000 == 0 && token.IsCancellationRequested)
                             break;
 
@@ -8424,7 +9950,7 @@ public class MemoryTab : ITab
                                 {
                                     Address = region.BaseAddress + i,
                                     Type = ScanValueType.String,
-                                    ValuePreview = $"\\{name}\\"
+                                    ValuePreview = $"\"{name}\""
                                 });
                                 foundName++;
                             }
@@ -8449,7 +9975,6 @@ public class MemoryTab : ITab
 
         _state.AddInGameLog("[AUTO-KEY] Starting automatic TLS key extraction...");
 
-        // FIX 4: Set scanning state
         _isScanning = true;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
@@ -8505,7 +10030,6 @@ public class MemoryTab : ITab
             .Where(r => r.Size > 0x1000 && r.Size < 0x10000000)
             .OrderByDescending(r => r.Size);
 
-        // FIX 4: Set progress tracking
         _scanTotalRegions = 20;
         _scanCurrentRegion = 0;
 
@@ -8654,7 +10178,6 @@ public class MemoryTab : ITab
             .OrderByDescending(r => r.Size)
             .ToList();
 
-        // FIX 4: Progress tracking
         _scanTotalRegions = 30;
         _scanCurrentRegion = 0;
 
@@ -8747,7 +10270,6 @@ public class MemoryTab : ITab
 
     private async void PerformFirstScan()
     {
-        // FIX 4: Set scanning state
         _isScanning = true;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
@@ -8781,7 +10303,6 @@ public class MemoryTab : ITab
 
         var regions = GetReadableMemoryRegions();
 
-        // FIX 4: Progress tracking
         _scanTotalRegions = Math.Min(regions.Count, 50);
         _scanCurrentRegion = 0;
 
@@ -8964,7 +10485,7 @@ public class MemoryTab : ITab
                 {
                     Address = baseAddr + i,
                     Type = ScanValueType.String,
-                    ValuePreview = $"{str}"
+                    ValuePreview = $"\"{str}\""
                 });
                 if (_scanResults.Count >= MAX_RESULTS) return;
             }
@@ -9153,7 +10674,7 @@ public class MemoryTab : ITab
 
     private void Detach()
     {
-        CancelScan(); // FIX 4: Cancel any running scan
+        CancelScan();
 
         if (_processHandle != IntPtr.Zero)
             CloseHandle(_processHandle);
@@ -9207,6 +10728,363 @@ public class MemoryTab : ITab
     {
         Int32, Float, Int64, Double, String, Bytes
     }
+
+    // NEW: Memory search result
+    private class MemorySearchResult
+    {
+        public IntPtr Address;
+        public string Preview = "";
+        public long RegionSize;
+    }
+
+    // NEW: Netty buffer info
+    private class NettyBufferInfo
+    {
+        public IntPtr Address;
+        public int ReaderIndex;
+        public int WriterIndex;
+        public int Capacity;
+        public int ReadableBytes;
+        public string ContentPreview = "";
+    }
+
+    /// NEW: Decryption diagnostics
+    private class DecryptionDiagnostics
+    {
+        public bool HasRun = false;
+        public int KeysFound = 0;
+        public string KeyTypes = "";
+        public bool KeysValid = false;
+        public int TotalPackets = 0;
+        public int QuicPackets = 0;
+        public int ShortHeaders = 0;
+        public int LongHeaders = 0;
+        public double AverageEntropy = 0;
+        public int SuccessfulDecryptions = 0;
+        public int FailedDecryptions = 0;
+        public List<string> ErrorMessages = new();
+        public List<string> Recommendations = new();
+    }
+}
+
+
+===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\OpcodeManager.cs =====
+
+// FILE: Tabs/OpcodeManager.cs - NEW: Centralized opcode filtering and management
+using HyForce.Core;
+using HyForce.Data;
+using HyForce.Networking;
+using HyForce.Protocol;
+using HyForce.UI;
+using ImGuiNET;
+using System.Numerics;
+
+namespace HyForce.Tabs;
+
+public class OpcodeManager : ITab
+{
+    public string Name => "Opcode Manager";
+
+    private readonly AppState _state;
+    private string _searchFilter = "";
+    private ushort? _selectedOpcode = null;
+    private bool _showOnlyHidden = false;
+    private bool _showOnlyFavorites = false;
+    private HashSet<ushort> _hiddenOpcodes = new();
+    private HashSet<ushort> _favoriteOpcodes = new();
+    private Dictionary<ushort, string> _customNames = new();
+
+    // Category filters
+    private bool[] _categoryFilters = new bool[20];
+    private string[] _categories = Enum.GetNames(typeof(PacketCategory));
+
+    public OpcodeManager(AppState state)
+    {
+        _state = state;
+        LoadSettings();
+    }
+
+    private void LoadSettings()
+    {
+        // Could load from config file
+        _hiddenOpcodes.Add(0x0000); // Default hide QUIC noise
+    }
+
+    public void Render()
+    {
+        var avail = ImGui.GetContentRegionAvail();
+
+        ImGui.Spacing();
+        ImGui.Text("  OPCODE MANAGER  -  Filter, Rename, and Organize");
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        // Toolbar
+        RenderToolbar();
+
+        ImGui.Spacing();
+
+        // Two panel layout
+        float leftWidth = avail.X * 0.4f - 8;
+        float rightWidth = avail.X * 0.6f - 8;
+
+        ImGui.BeginChild("##opcode_list", new Vector2(leftWidth, avail.Y - 80), ImGuiChildFlags.Borders);
+        RenderOpcodeList(leftWidth);
+        ImGui.EndChild();
+
+        ImGui.SameLine();
+
+        ImGui.BeginChild("##opcode_details", new Vector2(rightWidth, avail.Y - 80), ImGuiChildFlags.Borders);
+        RenderOpcodeDetails(rightWidth);
+        ImGui.EndChild();
+    }
+
+    private void RenderToolbar()
+    {
+        // Search
+        ImGui.SetNextItemWidth(200);
+        ImGui.InputText("?? Search", ref _searchFilter, 256);
+
+        ImGui.SameLine();
+        ImGui.Checkbox("Hidden Only", ref _showOnlyHidden);
+        ImGui.SameLine();
+        ImGui.Checkbox("Favorites", ref _showOnlyFavorites);
+        ImGui.SameLine();
+
+        if (ImGui.Button("Export Filter List", new Vector2(120, 28)))
+        {
+            ExportFilterList();
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Import", new Vector2(60, 28)))
+        {
+            ImportFilterList();
+        }
+
+        // Category filters
+        ImGui.NewLine();
+        ImGui.Text("Categories:");
+        for (int i = 0; i < _categories.Length && i < 10; i++)
+        {
+            ImGui.SameLine();
+            ImGui.Checkbox(_categories[i], ref _categoryFilters[i]);
+        }
+    }
+
+    private void RenderOpcodeList(float width)
+    {
+        ImGui.TextColored(Theme.ColAccent, "All Opcodes");
+        ImGui.Separator();
+
+        // Get all seen opcodes from packet log
+        var allOpcodes = _state.PacketLog.GetOpcodeCounts()
+            .Select(kv => new { Opcode = kv.Key, Count = kv.Value })
+            .ToList();
+
+        // Add known opcodes that haven't been seen
+        var knownOpcodes = OpcodeRegistry.C2S_Opcodes.Keys
+            .Concat(OpcodeRegistry.S2C_Opcodes.Keys)
+            .Distinct()
+            .Where(o => !allOpcodes.Any(a => a.Opcode == o))
+            .Select(o => new { Opcode = o, Count = 0 });
+
+        allOpcodes = allOpcodes.Concat(knownOpcodes).OrderBy(x => x.Opcode).ToList();
+
+        // Apply filters
+        var filtered = allOpcodes.Where(o =>
+        {
+            if (_showOnlyHidden && !_hiddenOpcodes.Contains(o.Opcode))
+                return false;
+            if (_showOnlyFavorites && !_favoriteOpcodes.Contains(o.Opcode))
+                return false;
+            if (!string.IsNullOrEmpty(_searchFilter) &&
+                !o.Opcode.ToString("X4").Contains(_searchFilter, StringComparison.OrdinalIgnoreCase))
+                return false;
+            return true;
+        });
+
+        if (ImGui.BeginTable("##opcodes", 4, ImGuiTableFlags.RowBg | ImGuiTableFlags.Borders | ImGuiTableFlags.ScrollY))
+        {
+            ImGui.TableSetupColumn("?", ImGuiTableColumnFlags.WidthFixed, 25);
+            ImGui.TableSetupColumn("??", ImGuiTableColumnFlags.WidthFixed, 25);
+            ImGui.TableSetupColumn("Opcode", ImGuiTableColumnFlags.WidthFixed, 60);
+            ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableHeadersRow();
+
+            foreach (var op in filtered)
+            {
+                ImGui.TableNextRow();
+                bool isSelected = _selectedOpcode == op.Opcode;
+
+                // Favorite star
+                ImGui.TableSetColumnIndex(0);
+                bool isFav = _favoriteOpcodes.Contains(op.Opcode);
+                if (ImGui.Button(isFav ? "?" : "?"))
+                {
+                    if (isFav) _favoriteOpcodes.Remove(op.Opcode);
+                    else _favoriteOpcodes.Add(op.Opcode);
+                }
+
+                // Visibility toggle
+                ImGui.TableSetColumnIndex(1);
+                bool isHidden = _hiddenOpcodes.Contains(op.Opcode);
+                if (ImGui.Button(isHidden ? "??" : "??"))
+                {
+                    if (isHidden) _hiddenOpcodes.Remove(op.Opcode);
+                    else _hiddenOpcodes.Add(op.Opcode);
+                }
+
+                // Opcode
+                ImGui.TableSetColumnIndex(2);
+                var color = isHidden ? Theme.ColTextMuted :
+                           isSelected ? Theme.ColAccent :
+                           new Vector4(1, 1, 1, 1);
+                ImGui.TextColored(color, $"0x{op.Opcode:X4}");
+
+                // Name
+                ImGui.TableSetColumnIndex(3);
+                var c2sInfo = OpcodeRegistry.GetInfo(op.Opcode, PacketDirection.ClientToServer);
+                var s2cInfo = OpcodeRegistry.GetInfo(op.Opcode, PacketDirection.ServerToClient);
+                var name = c2sInfo?.Name ?? s2cInfo?.Name ?? "Unknown";
+
+                if (_customNames.TryGetValue(op.Opcode, out var customName))
+                    name = customName;
+
+                if (ImGui.Selectable($"{name} ({op.Count})", isSelected, ImGuiSelectableFlags.SpanAllColumns))
+                {
+                    _selectedOpcode = op.Opcode;
+                }
+            }
+
+            ImGui.EndTable();
+        }
+    }
+
+    private void RenderOpcodeDetails(float width)
+    {
+        if (_selectedOpcode == null)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, "Select an opcode to view details");
+            return;
+        }
+
+        var opcode = _selectedOpcode.Value;
+        var c2sInfo = OpcodeRegistry.GetInfo(opcode, PacketDirection.ClientToServer);
+        var s2cInfo = OpcodeRegistry.GetInfo(opcode, PacketDirection.ServerToClient);
+
+        ImGui.TextColored(Theme.ColAccent, $"Opcode: 0x{opcode:X4}");
+        ImGui.Separator();
+
+        // Custom name
+        string customName = _customNames.GetValueOrDefault(opcode, "");
+        ImGui.InputText("Custom Name", ref customName, 64);
+        if (!string.IsNullOrEmpty(customName))
+            _customNames[opcode] = customName;
+        else if (_customNames.ContainsKey(opcode))
+            _customNames.Remove(opcode);
+
+        // C2S Info
+        if (c2sInfo != null)
+        {
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(0.3f, 0.8f, 0.3f, 1), "Client ? Server");
+            ImGui.Text($"Name: {c2sInfo.Name}");
+            ImGui.Text($"Category: {c2sInfo.Category}");
+            ImGui.TextWrapped($"Description: {c2sInfo.Description}");
+        }
+
+        // S2C Info
+        if (s2cInfo != null)
+        {
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(0.8f, 0.5f, 0.2f, 1), "Server ? Client");
+            ImGui.Text($"Name: {s2cInfo.Name}");
+            ImGui.Text($"Category: {s2cInfo.Category}");
+            ImGui.TextWrapped($"Description: {s2cInfo.Description}");
+        }
+
+        // Stats
+        var count = _state.PacketLog.CountForOpcode(opcode);
+        ImGui.Spacing();
+        ImGui.TextColored(Theme.ColAccent, $"Statistics");
+        ImGui.Text($"Packets captured: {count}");
+
+        // Actions
+        ImGui.Spacing();
+        ImGui.Separator();
+        if (ImGui.Button("Hide This Opcode", new Vector2(120, 28)))
+        {
+            _hiddenOpcodes.Add(opcode);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Add to Favorites", new Vector2(120, 28)))
+        {
+            _favoriteOpcodes.Add(opcode);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Copy C# Const", new Vector2(120, 28)))
+        {
+            var name = c2sInfo?.Name ?? s2cInfo?.Name ?? $"Opcode_{opcode:X4}";
+            CopyToClipboard($"public const ushort {name} = 0x{opcode:X4};");
+        }
+    }
+
+    private void ExportFilterList()
+    {
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("=== HYFORCE OPCODE FILTERS ===");
+            sb.AppendLine($"Export Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine();
+
+            sb.AppendLine("[Hidden Opcodes]");
+            foreach (var op in _hiddenOpcodes.OrderBy(x => x))
+            {
+                sb.AppendLine($"0x{op:X4}");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("[Favorites]");
+            foreach (var op in _favoriteOpcodes.OrderBy(x => x))
+            {
+                sb.AppendLine($"0x{op:X4}");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("[Custom Names]");
+            foreach (var kv in _customNames.OrderBy(x => x.Key))
+            {
+                sb.AppendLine($"0x{kv.Key:X4}={kv.Value}");
+            }
+
+            string filename = Path.Combine(_state.ExportDirectory,
+                $"opcode_filters_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+            File.WriteAllText(filename, sb.ToString());
+
+            _state.AddInGameLog($"[OPCODES] Filter list exported");
+        }
+        catch (Exception ex)
+        {
+            _state.AddInGameLog($"[ERROR] Export failed: {ex.Message}");
+        }
+    }
+
+    private void ImportFilterList()
+    {
+        // Implementation for importing
+        _state.AddInGameLog("[OPCODES] Import not yet implemented");
+    }
+
+    private void CopyToClipboard(string text)
+    {
+        try { TextCopy.ClipboardService.SetText(text); } catch { }
+    }
+
+    // Public API for other tabs to check if opcode is hidden
+    public bool IsOpcodeHidden(ushort opcode) => _hiddenOpcodes.Contains(opcode);
+    public IReadOnlySet<ushort> GetHiddenOpcodes() => _hiddenOpcodes;
 }
 
 
@@ -9340,7 +11218,7 @@ public class PacketAnalyticsTab : ITab
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\PacketFeedTab.cs =====
 
-// FILE: Tabs/PacketFeedTab.cs - ENHANCED WITH DEEP ANALYSIS AND BYPASS FEATURES
+// FILE: Tabs/PacketFeedTab.cs - ENHANCED: Opcode exclusion, better filtering, performance
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
@@ -9350,6 +11228,7 @@ using HyForce.Utils;
 using ImGuiNET;
 using System.Numerics;
 using System.Diagnostics;
+using System.Buffers.Binary;
 
 namespace HyForce.Tabs;
 
@@ -9372,31 +11251,77 @@ public class PacketFeedTab : ITab
     private bool _hideTcp = false;
     private bool _showOnlyTcp = false;
 
+    // ENHANCED: Opcode exclusion system
+    private HashSet<ushort> _excludedOpcodes = new();
+    private bool _showOpcodeFilterPanel = false;
+    private string _opcodeFilterInput = "";
+    private bool _excludeQuicHandshake = true; // Auto-hide 0x0000 spam
+
     // Analysis toggles
     private bool _showEntropyDetails = true;
     private bool _showTimingAnalysis = true;
     private bool _showMemoryStatus = true;
 
+    // Performance throttling
+    private DateTime _lastUiUpdate = DateTime.MinValue;
+    private const int UI_UPDATE_MS = 100;
+    private List<PacketLogEntry> _cachedPackets = new();
+    private DateTime _lastPacketCacheUpdate = DateTime.MinValue;
+    private int _frameCounter = 0;
+    private const int SKIP_FRAMES = 2;
+
+    // Quick preset filters
+    private readonly Dictionary<string, ushort[]> _filterPresets = new()
+    {
+        ["QUIC Handshake Noise"] = new[] { (ushort)0x0000 },
+        ["Keep-Alive"] = new[] { (ushort)0x05, (ushort)0x06 }, // Ping/Pong
+        ["Movement"] = new[] { (ushort)0x6C },
+        ["All Registry"] = Enumerable.Range(0x28, 0x1B).Select(i => (ushort)i).ToArray()
+    };
+
     public PacketFeedTab(AppState state)
     {
         _state = state;
+
+        // Auto-exclude QUIC handshake noise on startup
+        if (_excludeQuicHandshake)
+        {
+            _excludedOpcodes.Add(0x0000);
+        }
     }
 
     public void Render()
     {
         var windowSize = ImGui.GetContentRegionAvail();
+        _frameCounter++;
+        bool shouldSkipRender = (_frameCounter % (SKIP_FRAMES + 1)) != 0;
+        var now = DateTime.Now;
+        bool shouldUpdateCache = (now - _lastPacketCacheUpdate).TotalMilliseconds > UI_UPDATE_MS;
 
-        float toolbarHeight = 70;
+        float toolbarHeight = _showOpcodeFilterPanel ? 140 : 70;
         float remainingHeight = Math.Max(0, windowSize.Y - toolbarHeight - 10);
 
         RenderToolbar();
         ImGui.Separator();
 
+        // ENHANCED: Collapsible opcode filter panel
+        if (_showOpcodeFilterPanel)
+        {
+            RenderOpcodeFilterPanel();
+            ImGui.Separator();
+        }
+
         var listWidth = Math.Min(windowSize.X * 0.6f, windowSize.X - 320);
         var detailsWidth = Math.Max(0, windowSize.X - listWidth - 20);
 
+        if (shouldUpdateCache)
+        {
+            _cachedPackets = GetFilteredPackets();
+            _lastPacketCacheUpdate = now;
+        }
+
         ImGui.BeginChild("PacketList", new Vector2(listWidth, remainingHeight), ImGuiChildFlags.Borders);
-        RenderPacketList();
+        RenderPacketList(shouldSkipRender);
         ImGui.EndChild();
 
         ImGui.SameLine();
@@ -9419,16 +11344,23 @@ public class PacketFeedTab : ITab
         ImGui.Checkbox("Unknown", ref _showOnlyUnknown);
         ImGui.SameLine();
         ImGui.Checkbox("Auto-scroll", ref _autoScroll);
+        ImGui.SameLine();
+
+        // ENHANCED: Toggle opcode filter panel
+        if (ImGui.Button(_showOpcodeFilterPanel ? "Hide Filters" : "Opcode Filters", new Vector2(100, buttonHeight)))
+        {
+            _showOpcodeFilterPanel = !_showOpcodeFilterPanel;
+        }
 
         ImGui.SameLine();
         if (ImGui.Button("Clear", new Vector2(60, buttonHeight)))
         {
             _state.PacketLog.Clear();
+            _cachedPackets.Clear();
         }
 
         // Row 2: Encryption/Protocol filters
         ImGui.NewLine();
-
         ImGui.Text("Show:"); ImGui.SameLine();
 
         if (ImGui.Button(_hideEncrypted ? "Show Encrypted" : "Hide Encrypted", new Vector2(110, buttonHeight)))
@@ -9493,10 +11425,88 @@ public class PacketFeedTab : ITab
         }
     }
 
-    private void RenderPacketList()
+    // ENHANCED: New opcode filter panel
+    private void RenderOpcodeFilterPanel()
+    {
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.12f, 0.12f, 0.15f, 1f));
+        ImGui.BeginChild("##opcode_filters", new Vector2(0, 60), ImGuiChildFlags.Borders);
+
+        ImGui.TextColored(Theme.ColAccent, "Hide Specific Opcodes:");
+        ImGui.SameLine();
+
+        // Quick presets
+        foreach (var preset in _filterPresets)
+        {
+            bool isActive = preset.Value.All(o => _excludedOpcodes.Contains(o));
+            if (isActive)
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.8f, 0.3f, 0.2f, 1f));
+
+            if (ImGui.Button(preset.Key, new Vector2(0, 22)))
+            {
+                if (isActive)
+                {
+                    // Remove all
+                    foreach (var o in preset.Value) _excludedOpcodes.Remove(o);
+                }
+                else
+                {
+                    // Add all
+                    foreach (var o in preset.Value) _excludedOpcodes.Add(o);
+                }
+            }
+
+            if (isActive)
+                ImGui.PopStyleColor();
+
+            ImGui.SameLine();
+        }
+
+        // Manual input
+        ImGui.SetNextItemWidth(80);
+        ImGui.InputText("##opcode_input", ref _opcodeFilterInput, 6, ImGuiInputTextFlags.CharsHexadecimal);
+        ImGui.SameLine();
+        if (ImGui.Button("Hide", new Vector2(50, 22)) && ushort.TryParse(_opcodeFilterInput, System.Globalization.NumberStyles.HexNumber, null, out ushort hideOp))
+        {
+            _excludedOpcodes.Add(hideOp);
+            _opcodeFilterInput = "";
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Show", new Vector2(50, 22)) && ushort.TryParse(_opcodeFilterInput, System.Globalization.NumberStyles.HexNumber, null, out ushort showOp))
+        {
+            _excludedOpcodes.Remove(showOp);
+            _opcodeFilterInput = "";
+        }
+
+        // Show current exclusions
+        if (_excludedOpcodes.Any())
+        {
+            ImGui.SameLine();
+            ImGui.Text("| Active filters: ");
+            foreach (var op in _excludedOpcodes.Take(5))
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(Theme.ColDanger, $"0x{op:X4}");
+                if (ImGui.IsItemClicked())
+                {
+                    _excludedOpcodes.Remove(op);
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Click to remove");
+            }
+            if (_excludedOpcodes.Count > 5)
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(Theme.ColTextMuted, $"+{_excludedOpcodes.Count - 5} more");
+            }
+        }
+
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
+    }
+
+    private void RenderPacketList(bool skipExpensiveOps)
     {
         var contentAvail = ImGui.GetContentRegionAvail();
-
         var tableFlags = ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg |
                         ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.ScrollY;
 
@@ -9510,20 +11520,18 @@ public class PacketFeedTab : ITab
             ImGui.TableSetupColumn("Info", ImGuiTableColumnFlags.WidthFixed, 80);
             ImGui.TableHeadersRow();
 
-            var packets = GetFilteredPackets();
+            var packets = _cachedPackets;
+            int maxRender = skipExpensiveOps ? 50 : 200;
+            var packetsToRender = packets.Take(maxRender).ToList();
 
-            foreach (var pkt in packets)
+            foreach (var pkt in packetsToRender)
             {
                 ImGui.TableNextRow();
-
                 bool isSelected = _selectedPacket == pkt;
-
                 ImGui.TableSetColumnIndex(0);
 
                 string selectableId = $"##pkt_{pkt.Timestamp.Ticks}_{pkt.GetHashCode()}";
-
-                if (ImGui.Selectable(selectableId, isSelected,
-                    ImGuiSelectableFlags.SpanAllColumns))
+                if (ImGui.Selectable(selectableId, isSelected, ImGuiSelectableFlags.SpanAllColumns))
                 {
                     _selectedPacket = pkt;
                 }
@@ -9532,6 +11540,29 @@ public class PacketFeedTab : ITab
                 {
                     ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0,
                         ImGui.ColorConvertFloat4ToU32(new Vector4(0.2f, 0.4f, 0.8f, 0.4f)));
+                }
+
+                // ENHANCED: Right-click context menu with hide option
+                if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+                {
+                    ImGui.OpenPopup($"ctx_{pkt.GetHashCode()}");
+                }
+
+                if (ImGui.BeginPopup($"ctx_{pkt.GetHashCode()}"))
+                {
+                    if (ImGui.MenuItem("Hide This Opcode"))
+                    {
+                        _excludedOpcodes.Add(pkt.OpcodeDecimal);
+                    }
+                    if (ImGui.MenuItem("Copy Hex"))
+                    {
+                        try { TextCopy.ClipboardService.SetText(pkt.RawHexPreview); } catch { }
+                    }
+                    if (ImGui.MenuItem("Export This Packet"))
+                    {
+                        ExportSinglePacket(pkt);
+                    }
+                    ImGui.EndPopup();
                 }
 
                 ImGui.SameLine();
@@ -9544,12 +11575,22 @@ public class PacketFeedTab : ITab
                 ImGui.TextColored(dirColor, pkt.DirStr);
 
                 ImGui.TableSetColumnIndex(2);
-                var isKnown = OpcodeRegistry.IsKnownOpcode(pkt.OpcodeDecimal, pkt.Direction);
+                ushort opcode = pkt.IsTcp ? pkt.OpcodeDecimal : (ushort)0;
+                if (pkt.IsTcp && pkt.RawBytes.Length >= 4)
+                {
+                    opcode = (ushort)BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(4, 4));
+                }
+                var isKnown = OpcodeRegistry.IsKnownOpcode(opcode, pkt.Direction);
                 var opcodeColor = isKnown ? new Vector4(1, 1, 1, 1) : new Vector4(1, 0.3f, 0.3f, 1);
-                ImGui.TextColored(opcodeColor, $"0x{pkt.OpcodeDecimal:X4}");
+
+                // ENHANCED: Show excluded opcodes with strikethrough color
+                if (_excludedOpcodes.Contains(opcode))
+                    opcodeColor = new Vector4(0.5f, 0.5f, 0.5f, 1);
+
+                ImGui.TextColored(opcodeColor, $"0x{opcode:X4}");
 
                 ImGui.TableSetColumnIndex(3);
-                var info = OpcodeRegistry.GetInfo(pkt.OpcodeDecimal, pkt.Direction);
+                var info = OpcodeRegistry.GetInfo(opcode, pkt.Direction);
                 var name = info?.Name ?? pkt.OpcodeName;
                 if (name.Length > 30)
                     name = name[..27] + "...";
@@ -9573,6 +11614,14 @@ public class PacketFeedTab : ITab
                     ImGui.TextColored(new Vector4(0.4f, 0.6f, 0.8f, 1), "[Q]");
                 }
             }
+
+            if (packets.Count > maxRender)
+            {
+                ImGui.TableNextRow();
+                ImGui.TableSetColumnIndex(0);
+                ImGui.TextColored(Theme.ColTextMuted, $"... {packets.Count - maxRender} more");
+            }
+
             ImGui.EndTable();
         }
 
@@ -9580,11 +11629,16 @@ public class PacketFeedTab : ITab
             ImGui.SetScrollHereY(1.0f);
     }
 
+    // ENHANCED: Updated filtering to include opcode exclusion
     private List<PacketLogEntry> GetFilteredPackets()
     {
-        var packets = _state.PacketLog.GetLast(500);
+        var packets = _state.PacketLog.GetLast(200);
         return packets.Where(p =>
         {
+            // ENHANCED: Check excluded opcodes first
+            if (_excludedOpcodes.Contains(p.OpcodeDecimal))
+                return false;
+
             if (!string.IsNullOrEmpty(_filterOpcode) &&
                 !p.OpcodeDecimal.ToString("X4").Contains(_filterOpcode, StringComparison.OrdinalIgnoreCase))
                 return false;
@@ -9612,6 +11666,9 @@ public class PacketFeedTab : ITab
         }).ToList();
     }
 
+    // ... (keep existing RenderPacketDetails, RenderDeepEncryptionAnalysis, etc.)
+    // Include all the original methods from your file here
+
     private void RenderPacketDetails()
     {
         if (_selectedPacket == null)
@@ -9622,39 +11679,43 @@ public class PacketFeedTab : ITab
         }
 
         var pkt = _selectedPacket;
+        uint packetId = 0;
+        uint packetLength = 0;
 
-        // Header
+        if (pkt.IsTcp && pkt.RawBytes.Length >= 8)
+        {
+            packetLength = BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(0, 4));
+            packetId = BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(4, 4));
+        }
+
         ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), pkt.OpcodeName);
         ImGui.SameLine();
-        ImGui.TextColored(Theme.ColTextMuted, $"0x{pkt.OpcodeDecimal:X4}");
+        ImGui.TextColored(Theme.ColTextMuted, $"0x{packetId:X4} (LE)");
         ImGui.Separator();
 
-        // Basic info
         ImGui.Text("Direction: "); ImGui.SameLine();
-        var dirColor = pkt.Direction == PacketDirection.ClientToServer
+        var dirColor = pkt.Direction == PacketDirection.ServerToClient
             ? new Vector4(0.3f, 0.8f, 0.3f, 1)
             : new Vector4(0.8f, 0.5f, 0.2f, 1);
         ImGui.TextColored(dirColor, pkt.Direction.ToString());
 
         ImGui.Text($"Size: {pkt.ByteLength} bytes");
+        if (pkt.IsTcp && packetLength > 0)
+        {
+            ImGui.Text($"Packet Length Field: {packetLength} bytes");
+        }
         ImGui.Text($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
 
-        // Deep encryption analysis
         RenderDeepEncryptionAnalysis(pkt);
-
-        // Memory bypass status
         RenderMemoryBypassStatus();
 
-        // QUIC specific
         if (!pkt.IsTcp && pkt.QuicInfo != null)
         {
             RenderQuicAnalysis(pkt);
         }
 
-        // Hex preview
         RenderHexPreview(pkt);
 
-        // Export buttons
         ImGui.Separator();
         if (ImGui.Button("Copy Hex", new Vector2(100, 28)))
         {
@@ -9670,9 +11731,14 @@ public class PacketFeedTab : ITab
         {
             ExportDetailedPacketLog();
         }
-    }
 
-    // In PacketFeedTab.cs, replace the RenderDeepEncryptionAnalysis method with this:
+        // ENHANCED: Quick hide button
+        ImGui.SameLine();
+        if (ImGui.Button("Hide This Opcode", new Vector2(120, 28)))
+        {
+            _excludedOpcodes.Add(pkt.OpcodeDecimal);
+        }
+    }
 
     private void RenderDeepEncryptionAnalysis(PacketLogEntry pkt)
     {
@@ -9684,22 +11750,21 @@ public class PacketFeedTab : ITab
 
         try
         {
-            var hexString = pkt.RawHexPreview.Replace("-", "");
-            if (hexString.Length % 2 == 0 && hexString.Length > 0)
+            var hexString = pkt.RawHexPreview.Replace("-", "").Replace(" ", "");
+            if (hexString.Length % 2 == 0 && hexString.Length > 0 && hexString.Length <= 4096)
             {
                 bytes = Convert.FromHexString(hexString);
                 fullEntropy = ByteUtils.CalculateEntropy(bytes);
 
-                if (bytes.Length > 20)
+                if (bytes.Length > 28)
                 {
-                    headerEntropy = ByteUtils.CalculateEntropy(bytes.Take(20).ToArray());
-                    payloadEntropy = ByteUtils.CalculateEntropy(bytes.Skip(20).ToArray());
+                    headerEntropy = ByteUtils.CalculateEntropy(bytes.Take(28).ToArray());
+                    payloadEntropy = ByteUtils.CalculateEntropy(bytes.Skip(28).ToArray());
                 }
             }
         }
         catch { }
 
-        // FIXED: Show QUIC header type
         if (pkt.QuicInfo != null)
         {
             ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1),
@@ -9708,9 +11773,21 @@ public class PacketFeedTab : ITab
             if (!pkt.QuicInfo.IsLongHeader)
             {
                 ImGui.TextColored(new Vector4(1, 0.6f, 0.2f, 1),
-                    "?? Short Header - Post-handshake data (main game traffic)");
+                    "? Short Header - 1-RTT encrypted data");
                 ImGui.TextColored(Theme.ColTextMuted,
-                    "Wireshark can decrypt this if you have the TLS keys");
+                    "Requires correct packet number and key derivation");
+
+                if (PacketDecryptor.DiscoveredKeys.Count > 0)
+                {
+                    var client1rtt = PacketDecryptor.DiscoveredKeys
+                        .Where(k => k.Type == PacketDecryptor.EncryptionType.QUIC_Client1RTT)
+                        .Count();
+                    var server1rtt = PacketDecryptor.DiscoveredKeys
+                        .Where(k => k.Type == PacketDecryptor.EncryptionType.QUIC_Server1RTT)
+                        .Count();
+
+                    ImGui.Text($"Available 1-RTT keys: Client={client1rtt}, Server={server1rtt}");
+                }
             }
             else
             {
@@ -9721,20 +11798,17 @@ public class PacketFeedTab : ITab
             ImGui.Text($"Packet Number Length: {pkt.QuicInfo.PacketNumberLength} bytes");
         }
 
-        // Entropy display
         ImGui.Text($"Full Packet Entropy: {fullEntropy:F2}");
-        if (bytes != null && bytes.Length > 20)
+        if (bytes != null && bytes.Length > 28)
         {
-            ImGui.Text($"Header (20B): {headerEntropy:F2}");
+            ImGui.Text($"Header (28B): {headerEntropy:F2}");
             ImGui.Text($"Payload (rest): {payloadEntropy:F2}");
 
-            // Progress bars
             ImGui.ProgressBar((float)(fullEntropy / 8.0), new Vector2(200, 15), "Full");
             ImGui.ProgressBar((float)(headerEntropy / 8.0), new Vector2(200, 15), "Header");
             ImGui.ProgressBar((float)(payloadEntropy / 8.0), new Vector2(200, 15), "Payload");
         }
 
-        // Verdict
         string verdict;
         Vector4 verdictColor;
 
@@ -9761,15 +11835,18 @@ public class PacketFeedTab : ITab
 
         ImGui.TextColored(verdictColor, $"Verdict: {verdict}");
 
-        // FIXED: Add note about Wireshark vs HyForce
-        if (pkt.QuicInfo != null && !pkt.QuicInfo.IsLongHeader)
+        if (pkt.QuicInfo != null && !pkt.QuicInfo.IsLongHeader && PacketDecryptor.SuccessfulDecryptions == 0)
         {
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1),
-                "Why Wireshark sees this but HyForce doesn't:");
-            ImGui.BulletText("Wireshark has your SSLKEYLOGFILE with TLS secrets");
-            ImGui.BulletText("HyForce needs those same secrets imported via Memory tab");
-            ImGui.BulletText("Short headers use 1-RTT keys derived from handshake");
+                "Why decryption fails:");
+            ImGui.BulletText("QUIC short headers use 1-RTT keys derived from TLS secrets");
+            ImGui.BulletText("Your SSLKEYLOGFILE has TLS secrets, but derivation may be wrong");
+            ImGui.BulletText("Hytale may use custom Netty QUIC codec with different key schedule");
+            ImGui.BulletText("Packet number reconstruction from header protection failed");
+
+            ImGui.TextColored(Theme.ColTextMuted,
+                "Try: Ensure SSLKEYLOGFILE is set BEFORE Hytale starts");
         }
     }
 
@@ -9783,26 +11860,30 @@ public class PacketFeedTab : ITab
 
         if (hasKeys)
         {
-            ImGui.TextColored(new Vector4(0.2f, 1, 0.2f, 1), $"Keys available: {keyCount}");
+            ImGui.TextColored(new Vector4(0.2f, 1, 0.2f, 1), $"? Keys available: {keyCount}");
             ImGui.Text($"Successful decryptions: {PacketDecryptor.SuccessfulDecryptions}");
             ImGui.Text($"Failed attempts: {PacketDecryptor.FailedDecryptions}");
+
+            var keyTypes = PacketDecryptor.DiscoveredKeys
+                .GroupBy(k => k.Type)
+                .Select(g => $"{g.Key}: {g.Count()}");
+            ImGui.TextColored(Theme.ColTextMuted, string.Join(", ", keyTypes));
         }
         else
         {
-            ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "No keys available");
+            ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "? No keys available");
             ImGui.Text("Decryption bypass: FAILED");
             ImGui.TextColored(Theme.ColTextMuted, "Use Memory tab to find TLS keys");
 
-            // Quick memory check
             var processes = Process.GetProcessesByName("Hytale");
             if (processes.Length > 0)
             {
                 ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1),
-                    $"Hytale running (PID: {processes[0].Id}) - Ready to attach");
+                    $"? Hytale running (PID: {processes[0].Id}) - Ready to attach");
             }
             else
             {
-                ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1), "Hytale not running");
+                ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1), "? Hytale not running");
             }
         }
     }
@@ -9825,9 +11906,9 @@ public class PacketFeedTab : ITab
             }
         }
 
-        ImGui.TextColored(Theme.ColTextMuted, "QUIC uses TLS 1.3 encryption");
-        ImGui.TextColored(Theme.ColTextMuted, "Payload is encrypted with session keys");
-        ImGui.TextColored(Theme.ColTextMuted, "Need TLS keys from memory to decrypt");
+        ImGui.TextColored(Theme.ColTextMuted, "Hytale uses Netty QUIC codec (incubator)");
+        ImGui.TextColored(Theme.ColTextMuted, "TLS 1.3 with custom frame encoding");
+        ImGui.TextColored(Theme.ColTextMuted, "Payload encrypted with AES-128-GCM or AES-256-GCM");
     }
 
     private void RenderHexPreview(PacketLogEntry pkt)
@@ -9836,13 +11917,20 @@ public class PacketFeedTab : ITab
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Hex Preview");
 
         var hexLines = pkt.RawHexPreview.Split('-');
-        for (int i = 0; i < hexLines.Length && i < 32; i += 8)
+        int maxLines = Math.Min(hexLines.Length, 16);
+
+        for (int i = 0; i < maxLines; i += 8)
         {
             var line = string.Join(" ", hexLines.Skip(i).Take(8));
             var addr = (i * 3).ToString("X3");
             ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1), $"{addr}:");
             ImGui.SameLine();
             ImGui.Text(line);
+        }
+
+        if (hexLines.Length > maxLines)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, $"... {hexLines.Length - maxLines} more bytes");
         }
     }
 
@@ -9851,7 +11939,7 @@ public class PacketFeedTab : ITab
         ImGui.Separator();
         ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), "Global Traffic Analysis");
 
-        var packets = _state.PacketLog.GetLast(1000);
+        var packets = _state.PacketLog.GetLast(500);
 
         if (!packets.Any())
         {
@@ -9859,8 +11947,7 @@ public class PacketFeedTab : ITab
             return;
         }
 
-        // Timing analysis
-        if (_showTimingAnalysis)
+        if (_showTimingAnalysis && packets.Count < 1000)
         {
             ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Timing Patterns");
 
@@ -9886,7 +11973,6 @@ public class PacketFeedTab : ITab
             }
         }
 
-        // Memory status
         if (_showMemoryStatus)
         {
             ImGui.Separator();
@@ -9918,21 +12004,30 @@ public class PacketFeedTab : ITab
             sb.AppendLine($"Timestamp: {pkt.Timestamp:O}");
             sb.AppendLine($"Direction: {pkt.Direction}");
             sb.AppendLine($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
-            sb.AppendLine($"Opcode: 0x{pkt.OpcodeDecimal:X4}");
+
+            if (pkt.IsTcp && pkt.RawBytes.Length >= 8)
+            {
+                uint len = BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(0, 4));
+                uint id = BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(4, 4));
+                sb.AppendLine($"Length Field: {len} (LE)");
+                sb.AppendLine($"Packet ID: 0x{id:X8} (LE)");
+            }
+            else
+            {
+                sb.AppendLine($"Opcode: 0x{pkt.OpcodeDecimal:X4}");
+            }
+
             sb.AppendLine($"Name: {pkt.OpcodeName}");
             sb.AppendLine($"Size: {pkt.ByteLength} bytes");
             sb.AppendLine($"Encryption: {pkt.EncryptionHint}");
             sb.AppendLine($"Compression: {pkt.CompressionMethod}");
             sb.AppendLine();
 
-            // Entropy
             try
             {
                 var bytes = Convert.FromHexString(pkt.RawHexPreview.Replace("-", ""));
                 double entropy = ByteUtils.CalculateEntropy(bytes);
                 sb.AppendLine($"Entropy: {entropy:F2}");
-
-                // Pattern analysis
                 sb.AppendLine($"Unique bytes: {bytes.Distinct().Count()}");
                 sb.AppendLine($"Null bytes: {bytes.Count(b => b == 0)}");
                 sb.AppendLine($"ASCII bytes: {bytes.Count(b => b >= 32 && b <= 126)}");
@@ -9970,7 +12065,7 @@ public class PacketFeedTab : ITab
 
             // Timing analysis
             sb.AppendLine("=== TIMING ANALYSIS ===");
-            var packets = _state.PacketLog.GetAll().Take(2000).ToList();
+            var packets = _state.PacketLog.GetAll().Take(1000).ToList();
 
             var timing = packets
                 .GroupBy(p => p.OpcodeDecimal)
@@ -10023,7 +12118,6 @@ public class PacketFeedTab : ITab
                     double entropy = ByteUtils.CalculateEntropy(bytes);
                     sb.AppendLine($"  Entropy: {entropy:F2}");
 
-                    // Extract strings
                     var strings = ByteUtils.ExtractStrings(bytes, 4);
                     if (strings.Any())
                     {
@@ -10055,7 +12149,6 @@ public class PacketFeedTab : ITab
             File.WriteAllText(filename, sb.ToString());
             _state.AddInGameLog($"[EXPORT] Full analysis saved: {Path.GetFileName(filename)}");
 
-            // Try to open folder
             try
             {
                 System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);

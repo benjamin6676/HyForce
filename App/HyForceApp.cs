@@ -54,6 +54,7 @@ public class HyForceApp
         _tabs.Add(new ConnectTab(_state));
         _tabs.Add(new ItemsTab(_state));
         _tabs.Add(new PacketFeedTab(_state));
+        _tabs.Add(new OpcodeManager(_state));
         _tabs.Add(new SecurityAuditTab(_state));
         _tabs.Add(new LogTab(_state));
         _tabs.Add(new MemoryTab(_state));
@@ -63,7 +64,7 @@ public class HyForceApp
         _tabs.Add(new PacketAnalyticsTab(_state));
         _tabs.Add(new PacketInspectorTab(_state));
         _tabs.Add(new RegistryTab(_state));
-
+        _tabs.Add(new DecryptionStatsWindow(_state));
     }
 
     private void SetupImGuiStyle()

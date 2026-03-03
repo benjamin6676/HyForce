@@ -1,0 +1,17 @@
+=== SINGLE PACKET EXPORT ===
+Timestamp: 2026-03-03T02:42:38.5004259+01:00
+Direction: ClientToServer
+Protocol: UDP/QUIC
+Opcode: 0x0078
+Name: QUIC_Encrypted
+Size: 86 bytes
+Encryption: encrypted
+Compression: none
+
+Entropy: 4,50
+Unique bytes: 23
+Null bytes: 0
+ASCII bytes: 8
+
+=== RAW HEX ===
+78-08-55-4F-D4-20-0F-2A-BF-92-EC-77-F7-9D-85-06-FC-53-D6-19-1F-D4-76-05

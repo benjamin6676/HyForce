@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/PacketFeedTab.cs - ENHANCED WITH DEEP ANALYSIS AND BYPASS FEATURES
+﻿// FILE: Tabs/PacketFeedTab.cs - ENHANCED: Opcode exclusion, better filtering, performance
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
@@ -8,6 +8,7 @@ using HyForce.Utils;
 using ImGuiNET;
 using System.Numerics;
 using System.Diagnostics;
+using System.Buffers.Binary;
 
 namespace HyForce.Tabs;
 
@@ -30,31 +31,77 @@ public class PacketFeedTab : ITab
     private bool _hideTcp = false;
     private bool _showOnlyTcp = false;
 
+    // ENHANCED: Opcode exclusion system
+    private HashSet<ushort> _excludedOpcodes = new();
+    private bool _showOpcodeFilterPanel = false;
+    private string _opcodeFilterInput = "";
+    private bool _excludeQuicHandshake = true; // Auto-hide 0x0000 spam
+
     // Analysis toggles
     private bool _showEntropyDetails = true;
     private bool _showTimingAnalysis = true;
     private bool _showMemoryStatus = true;
 
+    // Performance throttling
+    private DateTime _lastUiUpdate = DateTime.MinValue;
+    private const int UI_UPDATE_MS = 100;
+    private List<PacketLogEntry> _cachedPackets = new();
+    private DateTime _lastPacketCacheUpdate = DateTime.MinValue;
+    private int _frameCounter = 0;
+    private const int SKIP_FRAMES = 2;
+
+    // Quick preset filters
+    private readonly Dictionary<string, ushort[]> _filterPresets = new()
+    {
+        ["QUIC Handshake Noise"] = new[] { (ushort)0x0000 },
+        ["Keep-Alive"] = new[] { (ushort)0x05, (ushort)0x06 }, // Ping/Pong
+        ["Movement"] = new[] { (ushort)0x6C },
+        ["All Registry"] = Enumerable.Range(0x28, 0x1B).Select(i => (ushort)i).ToArray()
+    };
+
     public PacketFeedTab(AppState state)
     {
         _state = state;
+
+        // Auto-exclude QUIC handshake noise on startup
+        if (_excludeQuicHandshake)
+        {
+            _excludedOpcodes.Add(0x0000);
+        }
     }
 
     public void Render()
     {
         var windowSize = ImGui.GetContentRegionAvail();
+        _frameCounter++;
+        bool shouldSkipRender = (_frameCounter % (SKIP_FRAMES + 1)) != 0;
+        var now = DateTime.Now;
+        bool shouldUpdateCache = (now - _lastPacketCacheUpdate).TotalMilliseconds > UI_UPDATE_MS;
 
-        float toolbarHeight = 70;
+        float toolbarHeight = _showOpcodeFilterPanel ? 140 : 70;
         float remainingHeight = Math.Max(0, windowSize.Y - toolbarHeight - 10);
 
         RenderToolbar();
         ImGui.Separator();
 
+        // ENHANCED: Collapsible opcode filter panel
+        if (_showOpcodeFilterPanel)
+        {
+            RenderOpcodeFilterPanel();
+            ImGui.Separator();
+        }
+
         var listWidth = Math.Min(windowSize.X * 0.6f, windowSize.X - 320);
         var detailsWidth = Math.Max(0, windowSize.X - listWidth - 20);
 
+        if (shouldUpdateCache)
+        {
+            _cachedPackets = GetFilteredPackets();
+            _lastPacketCacheUpdate = now;
+        }
+
         ImGui.BeginChild("PacketList", new Vector2(listWidth, remainingHeight), ImGuiChildFlags.Borders);
-        RenderPacketList();
+        RenderPacketList(shouldSkipRender);
         ImGui.EndChild();
 
         ImGui.SameLine();
@@ -77,16 +124,23 @@ public class PacketFeedTab : ITab
         ImGui.Checkbox("Unknown", ref _showOnlyUnknown);
         ImGui.SameLine();
         ImGui.Checkbox("Auto-scroll", ref _autoScroll);
+        ImGui.SameLine();
+
+        // ENHANCED: Toggle opcode filter panel
+        if (ImGui.Button(_showOpcodeFilterPanel ? "Hide Filters" : "Opcode Filters", new Vector2(100, buttonHeight)))
+        {
+            _showOpcodeFilterPanel = !_showOpcodeFilterPanel;
+        }
 
         ImGui.SameLine();
         if (ImGui.Button("Clear", new Vector2(60, buttonHeight)))
         {
             _state.PacketLog.Clear();
+            _cachedPackets.Clear();
         }
 
         // Row 2: Encryption/Protocol filters
         ImGui.NewLine();
-
         ImGui.Text("Show:"); ImGui.SameLine();
 
         if (ImGui.Button(_hideEncrypted ? "Show Encrypted" : "Hide Encrypted", new Vector2(110, buttonHeight)))
@@ -151,10 +205,88 @@ public class PacketFeedTab : ITab
         }
     }
 
-    private void RenderPacketList()
+    // ENHANCED: New opcode filter panel
+    private void RenderOpcodeFilterPanel()
+    {
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.12f, 0.12f, 0.15f, 1f));
+        ImGui.BeginChild("##opcode_filters", new Vector2(0, 60), ImGuiChildFlags.Borders);
+
+        ImGui.TextColored(Theme.ColAccent, "Hide Specific Opcodes:");
+        ImGui.SameLine();
+
+        // Quick presets
+        foreach (var preset in _filterPresets)
+        {
+            bool isActive = preset.Value.All(o => _excludedOpcodes.Contains(o));
+            if (isActive)
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.8f, 0.3f, 0.2f, 1f));
+
+            if (ImGui.Button(preset.Key, new Vector2(0, 22)))
+            {
+                if (isActive)
+                {
+                    // Remove all
+                    foreach (var o in preset.Value) _excludedOpcodes.Remove(o);
+                }
+                else
+                {
+                    // Add all
+                    foreach (var o in preset.Value) _excludedOpcodes.Add(o);
+                }
+            }
+
+            if (isActive)
+                ImGui.PopStyleColor();
+
+            ImGui.SameLine();
+        }
+
+        // Manual input
+        ImGui.SetNextItemWidth(80);
+        ImGui.InputText("##opcode_input", ref _opcodeFilterInput, 6, ImGuiInputTextFlags.CharsHexadecimal);
+        ImGui.SameLine();
+        if (ImGui.Button("Hide", new Vector2(50, 22)) && ushort.TryParse(_opcodeFilterInput, System.Globalization.NumberStyles.HexNumber, null, out ushort hideOp))
+        {
+            _excludedOpcodes.Add(hideOp);
+            _opcodeFilterInput = "";
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Show", new Vector2(50, 22)) && ushort.TryParse(_opcodeFilterInput, System.Globalization.NumberStyles.HexNumber, null, out ushort showOp))
+        {
+            _excludedOpcodes.Remove(showOp);
+            _opcodeFilterInput = "";
+        }
+
+        // Show current exclusions
+        if (_excludedOpcodes.Any())
+        {
+            ImGui.SameLine();
+            ImGui.Text("| Active filters: ");
+            foreach (var op in _excludedOpcodes.Take(5))
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(Theme.ColDanger, $"0x{op:X4}");
+                if (ImGui.IsItemClicked())
+                {
+                    _excludedOpcodes.Remove(op);
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Click to remove");
+            }
+            if (_excludedOpcodes.Count > 5)
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(Theme.ColTextMuted, $"+{_excludedOpcodes.Count - 5} more");
+            }
+        }
+
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
+    }
+
+    private void RenderPacketList(bool skipExpensiveOps)
     {
         var contentAvail = ImGui.GetContentRegionAvail();
-
         var tableFlags = ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg |
                         ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.ScrollY;
 
@@ -168,20 +300,18 @@ public class PacketFeedTab : ITab
             ImGui.TableSetupColumn("Info", ImGuiTableColumnFlags.WidthFixed, 80);
             ImGui.TableHeadersRow();
 
-            var packets = GetFilteredPackets();
+            var packets = _cachedPackets;
+            int maxRender = skipExpensiveOps ? 50 : 200;
+            var packetsToRender = packets.Take(maxRender).ToList();
 
-            foreach (var pkt in packets)
+            foreach (var pkt in packetsToRender)
             {
                 ImGui.TableNextRow();
-
                 bool isSelected = _selectedPacket == pkt;
-
                 ImGui.TableSetColumnIndex(0);
 
                 string selectableId = $"##pkt_{pkt.Timestamp.Ticks}_{pkt.GetHashCode()}";
-
-                if (ImGui.Selectable(selectableId, isSelected,
-                    ImGuiSelectableFlags.SpanAllColumns))
+                if (ImGui.Selectable(selectableId, isSelected, ImGuiSelectableFlags.SpanAllColumns))
                 {
                     _selectedPacket = pkt;
                 }
@@ -190,6 +320,29 @@ public class PacketFeedTab : ITab
                 {
                     ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0,
                         ImGui.ColorConvertFloat4ToU32(new Vector4(0.2f, 0.4f, 0.8f, 0.4f)));
+                }
+
+                // ENHANCED: Right-click context menu with hide option
+                if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+                {
+                    ImGui.OpenPopup($"ctx_{pkt.GetHashCode()}");
+                }
+
+                if (ImGui.BeginPopup($"ctx_{pkt.GetHashCode()}"))
+                {
+                    if (ImGui.MenuItem("Hide This Opcode"))
+                    {
+                        _excludedOpcodes.Add(pkt.OpcodeDecimal);
+                    }
+                    if (ImGui.MenuItem("Copy Hex"))
+                    {
+                        try { TextCopy.ClipboardService.SetText(pkt.RawHexPreview); } catch { }
+                    }
+                    if (ImGui.MenuItem("Export This Packet"))
+                    {
+                        ExportSinglePacket(pkt);
+                    }
+                    ImGui.EndPopup();
                 }
 
                 ImGui.SameLine();
@@ -202,12 +355,22 @@ public class PacketFeedTab : ITab
                 ImGui.TextColored(dirColor, pkt.DirStr);
 
                 ImGui.TableSetColumnIndex(2);
-                var isKnown = OpcodeRegistry.IsKnownOpcode(pkt.OpcodeDecimal, pkt.Direction);
+                ushort opcode = pkt.IsTcp ? pkt.OpcodeDecimal : (ushort)0;
+                if (pkt.IsTcp && pkt.RawBytes.Length >= 4)
+                {
+                    opcode = (ushort)BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(4, 4));
+                }
+                var isKnown = OpcodeRegistry.IsKnownOpcode(opcode, pkt.Direction);
                 var opcodeColor = isKnown ? new Vector4(1, 1, 1, 1) : new Vector4(1, 0.3f, 0.3f, 1);
-                ImGui.TextColored(opcodeColor, $"0x{pkt.OpcodeDecimal:X4}");
+
+                // ENHANCED: Show excluded opcodes with strikethrough color
+                if (_excludedOpcodes.Contains(opcode))
+                    opcodeColor = new Vector4(0.5f, 0.5f, 0.5f, 1);
+
+                ImGui.TextColored(opcodeColor, $"0x{opcode:X4}");
 
                 ImGui.TableSetColumnIndex(3);
-                var info = OpcodeRegistry.GetInfo(pkt.OpcodeDecimal, pkt.Direction);
+                var info = OpcodeRegistry.GetInfo(opcode, pkt.Direction);
                 var name = info?.Name ?? pkt.OpcodeName;
                 if (name.Length > 30)
                     name = name[..27] + "...";
@@ -231,6 +394,14 @@ public class PacketFeedTab : ITab
                     ImGui.TextColored(new Vector4(0.4f, 0.6f, 0.8f, 1), "[Q]");
                 }
             }
+
+            if (packets.Count > maxRender)
+            {
+                ImGui.TableNextRow();
+                ImGui.TableSetColumnIndex(0);
+                ImGui.TextColored(Theme.ColTextMuted, $"... {packets.Count - maxRender} more");
+            }
+
             ImGui.EndTable();
         }
 
@@ -238,11 +409,16 @@ public class PacketFeedTab : ITab
             ImGui.SetScrollHereY(1.0f);
     }
 
+    // ENHANCED: Updated filtering to include opcode exclusion
     private List<PacketLogEntry> GetFilteredPackets()
     {
-        var packets = _state.PacketLog.GetLast(500);
+        var packets = _state.PacketLog.GetLast(200);
         return packets.Where(p =>
         {
+            // ENHANCED: Check excluded opcodes first
+            if (_excludedOpcodes.Contains(p.OpcodeDecimal))
+                return false;
+
             if (!string.IsNullOrEmpty(_filterOpcode) &&
                 !p.OpcodeDecimal.ToString("X4").Contains(_filterOpcode, StringComparison.OrdinalIgnoreCase))
                 return false;
@@ -270,6 +446,9 @@ public class PacketFeedTab : ITab
         }).ToList();
     }
 
+    // ... (keep existing RenderPacketDetails, RenderDeepEncryptionAnalysis, etc.)
+    // Include all the original methods from your file here
+
     private void RenderPacketDetails()
     {
         if (_selectedPacket == null)
@@ -280,39 +459,43 @@ public class PacketFeedTab : ITab
         }
 
         var pkt = _selectedPacket;
+        uint packetId = 0;
+        uint packetLength = 0;
 
-        // Header
+        if (pkt.IsTcp && pkt.RawBytes.Length >= 8)
+        {
+            packetLength = BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(0, 4));
+            packetId = BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(4, 4));
+        }
+
         ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), pkt.OpcodeName);
         ImGui.SameLine();
-        ImGui.TextColored(Theme.ColTextMuted, $"0x{pkt.OpcodeDecimal:X4}");
+        ImGui.TextColored(Theme.ColTextMuted, $"0x{packetId:X4} (LE)");
         ImGui.Separator();
 
-        // Basic info
         ImGui.Text("Direction: "); ImGui.SameLine();
-        var dirColor = pkt.Direction == PacketDirection.ClientToServer
+        var dirColor = pkt.Direction == PacketDirection.ServerToClient
             ? new Vector4(0.3f, 0.8f, 0.3f, 1)
             : new Vector4(0.8f, 0.5f, 0.2f, 1);
         ImGui.TextColored(dirColor, pkt.Direction.ToString());
 
         ImGui.Text($"Size: {pkt.ByteLength} bytes");
+        if (pkt.IsTcp && packetLength > 0)
+        {
+            ImGui.Text($"Packet Length Field: {packetLength} bytes");
+        }
         ImGui.Text($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
 
-        // Deep encryption analysis
         RenderDeepEncryptionAnalysis(pkt);
-
-        // Memory bypass status
         RenderMemoryBypassStatus();
 
-        // QUIC specific
         if (!pkt.IsTcp && pkt.QuicInfo != null)
         {
             RenderQuicAnalysis(pkt);
         }
 
-        // Hex preview
         RenderHexPreview(pkt);
 
-        // Export buttons
         ImGui.Separator();
         if (ImGui.Button("Copy Hex", new Vector2(100, 28)))
         {
@@ -328,9 +511,14 @@ public class PacketFeedTab : ITab
         {
             ExportDetailedPacketLog();
         }
-    }
 
-    // In PacketFeedTab.cs, replace the RenderDeepEncryptionAnalysis method with this:
+        // ENHANCED: Quick hide button
+        ImGui.SameLine();
+        if (ImGui.Button("Hide This Opcode", new Vector2(120, 28)))
+        {
+            _excludedOpcodes.Add(pkt.OpcodeDecimal);
+        }
+    }
 
     private void RenderDeepEncryptionAnalysis(PacketLogEntry pkt)
     {
@@ -342,22 +530,21 @@ public class PacketFeedTab : ITab
 
         try
         {
-            var hexString = pkt.RawHexPreview.Replace("-", "");
-            if (hexString.Length % 2 == 0 && hexString.Length > 0)
+            var hexString = pkt.RawHexPreview.Replace("-", "").Replace(" ", "");
+            if (hexString.Length % 2 == 0 && hexString.Length > 0 && hexString.Length <= 4096)
             {
                 bytes = Convert.FromHexString(hexString);
                 fullEntropy = ByteUtils.CalculateEntropy(bytes);
 
-                if (bytes.Length > 20)
+                if (bytes.Length > 28)
                 {
-                    headerEntropy = ByteUtils.CalculateEntropy(bytes.Take(20).ToArray());
-                    payloadEntropy = ByteUtils.CalculateEntropy(bytes.Skip(20).ToArray());
+                    headerEntropy = ByteUtils.CalculateEntropy(bytes.Take(28).ToArray());
+                    payloadEntropy = ByteUtils.CalculateEntropy(bytes.Skip(28).ToArray());
                 }
             }
         }
         catch { }
 
-        // FIXED: Show QUIC header type
         if (pkt.QuicInfo != null)
         {
             ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1),
@@ -366,9 +553,21 @@ public class PacketFeedTab : ITab
             if (!pkt.QuicInfo.IsLongHeader)
             {
                 ImGui.TextColored(new Vector4(1, 0.6f, 0.2f, 1),
-                    "⚠️ Short Header - Post-handshake data (main game traffic)");
+                    "⚠ Short Header - 1-RTT encrypted data");
                 ImGui.TextColored(Theme.ColTextMuted,
-                    "Wireshark can decrypt this if you have the TLS keys");
+                    "Requires correct packet number and key derivation");
+
+                if (PacketDecryptor.DiscoveredKeys.Count > 0)
+                {
+                    var client1rtt = PacketDecryptor.DiscoveredKeys
+                        .Where(k => k.Type == PacketDecryptor.EncryptionType.QUIC_Client1RTT)
+                        .Count();
+                    var server1rtt = PacketDecryptor.DiscoveredKeys
+                        .Where(k => k.Type == PacketDecryptor.EncryptionType.QUIC_Server1RTT)
+                        .Count();
+
+                    ImGui.Text($"Available 1-RTT keys: Client={client1rtt}, Server={server1rtt}");
+                }
             }
             else
             {
@@ -379,20 +578,17 @@ public class PacketFeedTab : ITab
             ImGui.Text($"Packet Number Length: {pkt.QuicInfo.PacketNumberLength} bytes");
         }
 
-        // Entropy display
         ImGui.Text($"Full Packet Entropy: {fullEntropy:F2}");
-        if (bytes != null && bytes.Length > 20)
+        if (bytes != null && bytes.Length > 28)
         {
-            ImGui.Text($"Header (20B): {headerEntropy:F2}");
+            ImGui.Text($"Header (28B): {headerEntropy:F2}");
             ImGui.Text($"Payload (rest): {payloadEntropy:F2}");
 
-            // Progress bars
             ImGui.ProgressBar((float)(fullEntropy / 8.0), new Vector2(200, 15), "Full");
             ImGui.ProgressBar((float)(headerEntropy / 8.0), new Vector2(200, 15), "Header");
             ImGui.ProgressBar((float)(payloadEntropy / 8.0), new Vector2(200, 15), "Payload");
         }
 
-        // Verdict
         string verdict;
         Vector4 verdictColor;
 
@@ -419,15 +615,18 @@ public class PacketFeedTab : ITab
 
         ImGui.TextColored(verdictColor, $"Verdict: {verdict}");
 
-        // FIXED: Add note about Wireshark vs HyForce
-        if (pkt.QuicInfo != null && !pkt.QuicInfo.IsLongHeader)
+        if (pkt.QuicInfo != null && !pkt.QuicInfo.IsLongHeader && PacketDecryptor.SuccessfulDecryptions == 0)
         {
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1),
-                "Why Wireshark sees this but HyForce doesn't:");
-            ImGui.BulletText("Wireshark has your SSLKEYLOGFILE with TLS secrets");
-            ImGui.BulletText("HyForce needs those same secrets imported via Memory tab");
-            ImGui.BulletText("Short headers use 1-RTT keys derived from handshake");
+                "Why decryption fails:");
+            ImGui.BulletText("QUIC short headers use 1-RTT keys derived from TLS secrets");
+            ImGui.BulletText("Your SSLKEYLOGFILE has TLS secrets, but derivation may be wrong");
+            ImGui.BulletText("Hytale may use custom Netty QUIC codec with different key schedule");
+            ImGui.BulletText("Packet number reconstruction from header protection failed");
+
+            ImGui.TextColored(Theme.ColTextMuted,
+                "Try: Ensure SSLKEYLOGFILE is set BEFORE Hytale starts");
         }
     }
 
@@ -441,26 +640,30 @@ public class PacketFeedTab : ITab
 
         if (hasKeys)
         {
-            ImGui.TextColored(new Vector4(0.2f, 1, 0.2f, 1), $"Keys available: {keyCount}");
+            ImGui.TextColored(new Vector4(0.2f, 1, 0.2f, 1), $"✓ Keys available: {keyCount}");
             ImGui.Text($"Successful decryptions: {PacketDecryptor.SuccessfulDecryptions}");
             ImGui.Text($"Failed attempts: {PacketDecryptor.FailedDecryptions}");
+
+            var keyTypes = PacketDecryptor.DiscoveredKeys
+                .GroupBy(k => k.Type)
+                .Select(g => $"{g.Key}: {g.Count()}");
+            ImGui.TextColored(Theme.ColTextMuted, string.Join(", ", keyTypes));
         }
         else
         {
-            ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "No keys available");
+            ImGui.TextColored(new Vector4(1, 0.3f, 0.3f, 1), "✗ No keys available");
             ImGui.Text("Decryption bypass: FAILED");
             ImGui.TextColored(Theme.ColTextMuted, "Use Memory tab to find TLS keys");
 
-            // Quick memory check
             var processes = Process.GetProcessesByName("Hytale");
             if (processes.Length > 0)
             {
                 ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1),
-                    $"Hytale running (PID: {processes[0].Id}) - Ready to attach");
+                    $"⚠ Hytale running (PID: {processes[0].Id}) - Ready to attach");
             }
             else
             {
-                ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1), "Hytale not running");
+                ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1), "○ Hytale not running");
             }
         }
     }
@@ -483,9 +686,9 @@ public class PacketFeedTab : ITab
             }
         }
 
-        ImGui.TextColored(Theme.ColTextMuted, "QUIC uses TLS 1.3 encryption");
-        ImGui.TextColored(Theme.ColTextMuted, "Payload is encrypted with session keys");
-        ImGui.TextColored(Theme.ColTextMuted, "Need TLS keys from memory to decrypt");
+        ImGui.TextColored(Theme.ColTextMuted, "Hytale uses Netty QUIC codec (incubator)");
+        ImGui.TextColored(Theme.ColTextMuted, "TLS 1.3 with custom frame encoding");
+        ImGui.TextColored(Theme.ColTextMuted, "Payload encrypted with AES-128-GCM or AES-256-GCM");
     }
 
     private void RenderHexPreview(PacketLogEntry pkt)
@@ -494,13 +697,20 @@ public class PacketFeedTab : ITab
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Hex Preview");
 
         var hexLines = pkt.RawHexPreview.Split('-');
-        for (int i = 0; i < hexLines.Length && i < 32; i += 8)
+        int maxLines = Math.Min(hexLines.Length, 16);
+
+        for (int i = 0; i < maxLines; i += 8)
         {
             var line = string.Join(" ", hexLines.Skip(i).Take(8));
             var addr = (i * 3).ToString("X3");
             ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1), $"{addr}:");
             ImGui.SameLine();
             ImGui.Text(line);
+        }
+
+        if (hexLines.Length > maxLines)
+        {
+            ImGui.TextColored(Theme.ColTextMuted, $"... {hexLines.Length - maxLines} more bytes");
         }
     }
 
@@ -509,7 +719,7 @@ public class PacketFeedTab : ITab
         ImGui.Separator();
         ImGui.TextColored(new Vector4(0.4f, 0.8f, 1, 1), "Global Traffic Analysis");
 
-        var packets = _state.PacketLog.GetLast(1000);
+        var packets = _state.PacketLog.GetLast(500);
 
         if (!packets.Any())
         {
@@ -517,8 +727,7 @@ public class PacketFeedTab : ITab
             return;
         }
 
-        // Timing analysis
-        if (_showTimingAnalysis)
+        if (_showTimingAnalysis && packets.Count < 1000)
         {
             ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1), "Timing Patterns");
 
@@ -544,7 +753,6 @@ public class PacketFeedTab : ITab
             }
         }
 
-        // Memory status
         if (_showMemoryStatus)
         {
             ImGui.Separator();
@@ -576,21 +784,30 @@ public class PacketFeedTab : ITab
             sb.AppendLine($"Timestamp: {pkt.Timestamp:O}");
             sb.AppendLine($"Direction: {pkt.Direction}");
             sb.AppendLine($"Protocol: {(pkt.IsTcp ? "TCP" : "UDP/QUIC")}");
-            sb.AppendLine($"Opcode: 0x{pkt.OpcodeDecimal:X4}");
+
+            if (pkt.IsTcp && pkt.RawBytes.Length >= 8)
+            {
+                uint len = BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(0, 4));
+                uint id = BinaryPrimitives.ReadUInt32LittleEndian(pkt.RawBytes.AsSpan(4, 4));
+                sb.AppendLine($"Length Field: {len} (LE)");
+                sb.AppendLine($"Packet ID: 0x{id:X8} (LE)");
+            }
+            else
+            {
+                sb.AppendLine($"Opcode: 0x{pkt.OpcodeDecimal:X4}");
+            }
+
             sb.AppendLine($"Name: {pkt.OpcodeName}");
             sb.AppendLine($"Size: {pkt.ByteLength} bytes");
             sb.AppendLine($"Encryption: {pkt.EncryptionHint}");
             sb.AppendLine($"Compression: {pkt.CompressionMethod}");
             sb.AppendLine();
 
-            // Entropy
             try
             {
                 var bytes = Convert.FromHexString(pkt.RawHexPreview.Replace("-", ""));
                 double entropy = ByteUtils.CalculateEntropy(bytes);
                 sb.AppendLine($"Entropy: {entropy:F2}");
-
-                // Pattern analysis
                 sb.AppendLine($"Unique bytes: {bytes.Distinct().Count()}");
                 sb.AppendLine($"Null bytes: {bytes.Count(b => b == 0)}");
                 sb.AppendLine($"ASCII bytes: {bytes.Count(b => b >= 32 && b <= 126)}");
@@ -628,7 +845,7 @@ public class PacketFeedTab : ITab
 
             // Timing analysis
             sb.AppendLine("=== TIMING ANALYSIS ===");
-            var packets = _state.PacketLog.GetAll().Take(2000).ToList();
+            var packets = _state.PacketLog.GetAll().Take(1000).ToList();
 
             var timing = packets
                 .GroupBy(p => p.OpcodeDecimal)
@@ -681,7 +898,6 @@ public class PacketFeedTab : ITab
                     double entropy = ByteUtils.CalculateEntropy(bytes);
                     sb.AppendLine($"  Entropy: {entropy:F2}");
 
-                    // Extract strings
                     var strings = ByteUtils.ExtractStrings(bytes, 4);
                     if (strings.Any())
                     {
@@ -713,7 +929,6 @@ public class PacketFeedTab : ITab
             File.WriteAllText(filename, sb.ToString());
             _state.AddInGameLog($"[EXPORT] Full analysis saved: {Path.GetFileName(filename)}");
 
-            // Try to open folder
             try
             {
                 System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);

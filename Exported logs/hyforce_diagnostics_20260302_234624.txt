@@ -1,0 +1,215 @@
++------------------------------------------------------------------------------+
+                    HYFORCE V22-ENHANCED - TCP+UDP MODE                        
++------------------------------------------------------------------------------+
+
+Generated: 2026-03-02 23:46:24
+Session Duration: 5m 8s
+
+-------------------------------------------------------------------------------
+                              SYSTEM INFORMATION                               
+-------------------------------------------------------------------------------
+OS: Microsoft Windows NT 10.0.19045.0
+.NET Version: 10.0.3
+Machine: DESKTOP-640UJ9D
+Processor Count: 12
+
+-------------------------------------------------------------------------------
+                                CONFIGURATION                                  
+-------------------------------------------------------------------------------
+Mode: TCP+UDP (Hytale Registry + Gameplay)
+Target: 51.195.60.80:5520
+UDP Listen: 0.0.0.0:5521
+TCP Listen: 0.0.0.0:5522
+Export Path: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs
+
+-------------------------------------------------------------------------------
+                                PROXY STATUS                                   
+-------------------------------------------------------------------------------
+UDP Proxy: RUNNING 
+  - Status: Active: 1 sessions
+  - Active Sessions: 1
+  - Total Clients: 1
+
+TCP Proxy: RUNNING 
+  - Status: Listening 0.0.0.0:5522 ? 51.195.60.80:5520
+  - Active Connections: 0
+  - Total Connections: 0
+
+-------------------------------------------------------------------------------
+                              TRAFFIC STATISTICS                               
+-------------------------------------------------------------------------------
+Total Packets: 21 368
+  TCP: 0 (0,00 B bytes) - Registry/Login
+  UDP: 21 368 (7,32 MB bytes) - Gameplay
+
+Bytes Total: 7,32 MB
+  Server->Client: 6,92 MB
+  Client->Server: 409,07 KB
+
+Unique Opcodes: 0
+
+-------------------------------------------------------------------------------
+                             DECRYPTION STATUS                                 
+-------------------------------------------------------------------------------
+Keys Available: 20
+Successful Decryptions: 0
+Failed Decryptions: 65
+
+Key Sources:
+  - C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log: 20 keys
+
+-------------------------------------------------------------------------------
+                                TOP 20 OPCODES                                 
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+                               PLAYER DATABASE                                 
+-------------------------------------------------------------------------------
+Unique Items: 0
+Unique Players: 13 605
+
+-------------------------------------------------------------------------------
+                               SECURITY EVENTS                                 
+-------------------------------------------------------------------------------
+Total Events: 33 889
+By Category: Encryption: 33889
+
+--- Recent Events (Last 20) ---
+[23:44:13] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Server1RTT
+    type: QUIC_Server1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_ServerHandshake
+    type: QUIC_ServerHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_ClientHandshake
+    type: QUIC_ClientHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Server1RTT
+    type: QUIC_Server1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_ServerHandshake
+    type: QUIC_ServerHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_ClientHandshake
+    type: QUIC_ClientHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Server1RTT
+    type: QUIC_Server1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_ServerHandshake
+    type: QUIC_ServerHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_ClientHandshake
+    type: QUIC_ClientHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Server1RTT
+    type: QUIC_Server1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_Client1RTT
+    type: QUIC_Client1RTT
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_ServerHandshake
+    type: QUIC_ServerHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+[23:44:13] [Encryption  ] Key discovered: QUIC_ClientHandshake
+    type: QUIC_ClientHandshake
+    source: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+    key_length: 16
+
+-------------------------------------------------------------------------------
+                                IN-GAME LOG                                    
+-------------------------------------------------------------------------------
+[23:44:13] [Encryption] Key discovered: QUIC_ServerHandshake
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEY] Found QUIC_Server1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Server1RTT
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEY] Found QUIC_ClientHandshake key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_ClientHandshake
+[23:44:13] [KEY] Found QUIC_ServerHandshake key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_ServerHandshake
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEY] Found QUIC_Server1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Server1RTT
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEY] Found QUIC_ClientHandshake key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_ClientHandshake
+[23:44:13] [KEY] Found QUIC_ServerHandshake key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_ServerHandshake
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEY] Found QUIC_Server1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Server1RTT
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEY] Found QUIC_ClientHandshake key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_ClientHandshake
+[23:44:13] [KEY] Found QUIC_ServerHandshake key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_ServerHandshake
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEY] Found QUIC_Server1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Server1RTT
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEY] Found QUIC_ClientHandshake key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_ClientHandshake
+[23:44:13] [KEY] Found QUIC_ServerHandshake key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_ServerHandshake
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEY] Found QUIC_Server1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Server1RTT
+[23:44:13] [KEY] Found QUIC_Client1RTT key from C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs\sslkeys.log
+[23:44:13] [Encryption] Key discovered: QUIC_Client1RTT
+[23:44:13] [KEYS] Processed 8486 TLS secrets from sslkeys.log
+[23:44:13] [KEYS] QUIC keys auto-derived using RFC 9001 HKDF-Expand-Label
+[23:46:21] Diagnostics report generated
+
+-------------------------------------------------------------------------------
+                           END OF DIAGNOSTICS REPORT                           
+-------------------------------------------------------------------------------

@@ -260,27 +260,35 @@ public class AppState : IDisposable
     }
 
     // FIX 2: Modified Start() to start both TCP and UDP proxies
+    // FIX 2: Modified Start() to start both TCP and UDP proxies with proper ordering
     public void Start()
     {
         if (IsRunning) return;
 
-        // Start UDP proxy for gameplay
+        // CRITICAL FIX: Start TCP FIRST (Hytale does registry sync over TCP first)
+        int tcpListenPort = ListenPort + 1; // 5522 for TCP
+        TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, TargetPort);
+
+        // Small delay to ensure TCP is ready before UDP
+        Thread.Sleep(50);
+
+        // Then start UDP proxy for gameplay
         UdpProxy.Start("0.0.0.0", ListenPort, TargetHost, TargetPort);
 
-        // FIX 2: Start TCP proxy for registry sync (on different port)
-        int tcpListenPort = ListenPort + 1; // 5522 for TCP
-        int tcpTargetPort = TargetPort;     // 5520 (Hytale uses same port for TCP/UDP)
-        TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, tcpTargetPort);
-
         StartTime = DateTime.Now;
+
+        // CRITICAL FIX: Start the auto-decrypt timer AND the worker
         _autoDecryptTimer?.Start();
 
-        Log.Info($"[HyForce] Started - UDP Proxy on 0.0.0.0:{ListenPort}", "System");
-        Log.Info($"[HyForce] Started - TCP Proxy on 0.0.0.0:{tcpListenPort}", "System");
+        // ADD THIS LINE:
+        PacketDecryptor.StartAutoDecrypt();
+
+        Log.Info($"[HyForce] TCP Proxy started on 0.0.0.0:{tcpListenPort}", "System");
+        Log.Info($"[HyForce] UDP Proxy started on 0.0.0.0:{ListenPort}", "System");
         Log.Info($"[HyForce] Forwarding to {TargetHost}:{TargetPort}", "System");
 
-        AddInGameLog($"UDP Proxy started on 127.0.0.1:{ListenPort}");
         AddInGameLog($"TCP Proxy started on 127.0.0.1:{tcpListenPort}");
+        AddInGameLog($"UDP Proxy started on 127.0.0.1:{ListenPort}");
         AddInGameLog($"Connect Hytale to 127.0.0.1:{ListenPort}");
 
         // AUTO-COPY IP TO CLIPBOARD
@@ -298,27 +306,52 @@ public class AppState : IDisposable
 
         TryEnableSSLKeyLogFile();
         ScanAndLoadExistingKeys();
+        PacketDecryptor.StartAutoDecrypt();
     }
 
     private PacketDecryptor.EncryptionKey? ParseSSLKeyLogLine(string line, string source)
     {
+        DebugSSLKeyLogParsing(line);
         try
         {
-            // SSLKEYLOGFILE format: CLIENT_TRAFFIC_SECRET_0 <hex> <hex>
+            // SSLKEYLOGFILE format: LABEL <client_random_hex> <secret_hex>
             var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 3) return null;
+            if (parts.Length < 3)
+            {
+                Log.Debug($"Skipping malformed line (only {parts.Length} parts): {line[..Math.Min(50, line.Length)]}", "Keys");
+                return null;
+            }
 
             string label = parts[0];
+
+            // Skip non-QUIC labels early
+            if (!label.Contains("TRAFFIC_SECRET") && !label.Contains("EXPORTER"))
+            {
+                return null;
+            }
+
             byte[] clientRandom = Convert.FromHexString(parts[1]);
             byte[] secret = Convert.FromHexString(parts[2]);
 
-            // Determine key type based on label
+            // Validate lengths
+            if (clientRandom.Length != 32)
+            {
+                Log.Warn($"Unexpected client_random length: {clientRandom.Length} bytes", "Keys");
+            }
+            if (secret.Length != 48)
+            {
+                Log.Warn($"Unexpected secret length: {secret.Length} bytes (expected 48 for TLS 1.3)", "Keys");
+            }
+
+            // Determine key type based on label - ENHANCED with more cases
             var keyType = label switch
             {
                 "CLIENT_TRAFFIC_SECRET_0" => PacketDecryptor.EncryptionType.QUIC_Client1RTT,
                 "SERVER_TRAFFIC_SECRET_0" => PacketDecryptor.EncryptionType.QUIC_Server1RTT,
                 "CLIENT_HANDSHAKE_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_ClientHandshake,
                 "SERVER_HANDSHAKE_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_ServerHandshake,
+                "CLIENT_EARLY_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_Client0RTT,
+                "EXPORTER_SECRET" => PacketDecryptor.EncryptionType.QUIC_Client1RTT, // Fallback
                 _ => PacketDecryptor.EncryptionType.QUIC_Client1RTT
             };
 
@@ -333,7 +366,15 @@ public class AppState : IDisposable
             // Derive actual QUIC keys from TLS secret
             PacketDecryptor.DeriveQUICKeys(key);
 
+            // Log success with key info
+            Log.Success($"Parsed {label} ({secret.Length * 8} bits) → {keyType}, derived {key.Key.Length * 8}-bit key", "Keys");
+
             return key;
+        }
+        catch (FormatException ex)
+        {
+            Log.Warn($"Hex decode failed: {ex.Message} for line: {line[..Math.Min(40, line.Length)]}...", "Keys");
+            return null;
         }
         catch (Exception ex)
         {
@@ -342,14 +383,62 @@ public class AppState : IDisposable
         }
     }
 
+    private void DebugSSLKeyLogParsing(string line)
+    {
+        Console.WriteLine($"[KEY-PARSE] Raw line: {line.Substring(0, Math.Min(60, line.Length))}...");
+
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3)
+        {
+            Console.WriteLine($"[KEY-PARSE] ✗ Invalid format: only {parts.Length} parts");
+            return;
+        }
+
+        string label = parts[0];
+        Console.WriteLine($"[KEY-PARSE] Label: '{label}'");
+
+        // Only debug QUIC-relevant labels
+        if (!label.Contains("TRAFFIC_SECRET") && !label.Contains("EXPORTER") && !label.Contains("HANDSHAKE"))
+        {
+            return;
+        }
+
+        try
+        {
+            byte[] clientRandom = Convert.FromHexString(parts[1]);
+            byte[] secret = Convert.FromHexString(parts[2]);
+
+            Console.WriteLine($"[KEY-PARSE] Client random: {clientRandom.Length} bytes ({BitConverter.ToString(clientRandom.Take(8).ToArray())}...)");
+            Console.WriteLine($"[KEY-PARSE] Secret: {secret.Length} bytes ({secret.Length * 8} bits) - {BitConverter.ToString(secret.Take(8).ToArray())}...");
+
+            if (secret.Length != 48)
+            {
+                Console.WriteLine($"[KEY-PARSE] ⚠ WARNING: Expected 48 bytes for TLS 1.3, got {secret.Length}");
+            }
+            else
+            {
+                Console.WriteLine($"[KEY-PARSE] ✓ Secret length looks correct for TLS 1.3");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[KEY-PARSE] ✗ Parse error: {ex.Message}");
+        }
+    }
+
     private void TryEnableSSLKeyLogFile()
     {
         try
         {
             string keyLogPath = Path.Combine(ExportDirectory, "sslkeys.log");
-            Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath);
-            AddInGameLog($"[AUTO-DECRYPT] SSLKEYLOGFILE set to: {keyLogPath}");
 
+            // Set for current process
+            Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.Process);
+
+            AddInGameLog($"[AUTO-DECRYPT] SSLKEYLOGFILE set to: {keyLogPath}");
+            AddInGameLog($"[AUTO-DECRYPT] IMPORTANT: Restart Hytale if running!");
+
+            // Check for existing keys
             var existingLogs = Directory.GetFiles(ExportDirectory, "*.log")
                 .Where(f => f.Contains("key", StringComparison.OrdinalIgnoreCase) ||
                            f.Contains("ssl", StringComparison.OrdinalIgnoreCase));
@@ -479,6 +568,7 @@ public class AppState : IDisposable
         TcpProxy.Stop();
         StartTime = null;
         _autoDecryptTimer?.Stop();
+        PacketDecryptor.StopAutoDecrypt();
         Log.Info("[HyForce] Proxy stopped", "System");
         AddInGameLog("Proxy stopped");
     }
