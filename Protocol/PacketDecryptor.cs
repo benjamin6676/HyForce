@@ -499,9 +499,29 @@ public static class PacketDecryptor
         _keysLock.EnterReadLock();
         try
         {
+            // CRITICAL FIX: Prioritize keys based on header type
+            bool isLongHeader = (encryptedData[0] & 0x80) != 0;
+
             keysCopy = _discoveredKeys
                 .Where(k => k.Key.Length >= 16 && k.IV.Length == 12)
-                .OrderByDescending(k => k.UseCount)
+                .OrderBy(k =>
+                {
+                    // Prioritize correct key types for header type
+                    if (!isLongHeader) // Short header = 1-RTT
+                    {
+                        if (k.Type == EncryptionType.QUIC_Client1RTT || k.Type == EncryptionType.QUIC_Server1RTT)
+                            return 0; // Highest priority
+                        if (k.Type == EncryptionType.QUIC_Client0RTT || k.Type == EncryptionType.QUIC_Server0RTT)
+                            return 1;
+                    }
+                    else // Long header = Handshake
+                    {
+                        if (k.Type == EncryptionType.QUIC_ClientHandshake || k.Type == EncryptionType.QUIC_ServerHandshake)
+                            return 0; // Highest priority
+                    }
+                    return 2; // Lowest priority (wrong key type)
+                })
+                .ThenByDescending(k => k.UseCount)
                 .Take(5)
                 .ToList();
         }
@@ -522,10 +542,13 @@ public static class PacketDecryptor
         }
 
         // Log packet info
+        bool packetIsLongHeader = (encryptedData[0] & 0x80) != 0;
+        Console.WriteLine($"[DECRYPT-DEBUG] ========== NEW DECRYPT ATTEMPT ==========");
         Console.WriteLine($"[DECRYPT-DEBUG] Packet size: {encryptedData.Length} bytes");
         Console.WriteLine($"[DECRYPT-DEBUG] First 16 bytes: {BitConverter.ToString(encryptedData.Take(16).ToArray())}");
-        Console.WriteLine($"[DECRYPT-DEBUG] IsLongHeader: {(encryptedData[0] & 0x80) != 0}");
+        Console.WriteLine($"[DECRYPT-DEBUG] IsLongHeader: {packetIsLongHeader}");
         Console.WriteLine($"[DECRYPT-DEBUG] Available keys: {keysCopy.Count}");
+        Console.WriteLine($"[DECRYPT-DEBUG] Key types available: {string.Join(", ", keysCopy.Select(k => k.Type).Distinct())}");
 
         foreach (var key in keysCopy)
         {
@@ -540,12 +563,13 @@ public static class PacketDecryptor
                 };
             }
 
-            Console.WriteLine($"[DECRYPT-DEBUG] Trying key: {key.Type}");
-            Console.WriteLine($"[DECRYPT-DEBUG] Key bytes: {BitConverter.ToString(key.Key)}");
+            Console.WriteLine($"[DECRYPT-DEBUG] ----------------------------------------");
+            Console.WriteLine($"[DECRYPT-DEBUG] Trying key: {key.Type} (priority based on header type)");
+            Console.WriteLine($"[DECRYPT-DEBUG] Key bytes: {BitConverter.ToString(key.Key.Take(8).ToArray())}... ({key.Key.Length} bytes)");
             Console.WriteLine($"[DECRYPT-DEBUG] IV bytes: {BitConverter.ToString(key.IV)}");
             Console.WriteLine($"[DECRYPT-DEBUG] Has HP key: {key.HeaderProtectionKey != null}");
             if (key.HeaderProtectionKey != null)
-                Console.WriteLine($"[DECRYPT-DEBUG] HP key: {BitConverter.ToString(key.HeaderProtectionKey)}");
+                Console.WriteLine($"[DECRYPT-DEBUG] HP key: {BitConverter.ToString(key.HeaderProtectionKey.Take(8).ToArray())}...");
 
             try
             {
@@ -610,28 +634,30 @@ public static class PacketDecryptor
             }
 
             Console.WriteLine($"[DECRYPT-DEBUG] Header protection removed. pnOffset={pnOffset}, pnLength={pnLength}");
+            Console.WriteLine($"[DECRYPT-DEBUG] Unprotected header: {BitConverter.ToString(unprotectedHeader.Take(pnOffset + pnLength + 4).ToArray())}");
 
-            // Extract packet number from unprotected header
-            ulong packetNumber = 0;  // <-- DECLARE IT HERE FIRST
+            // CRITICAL FIX: Extract packet number from unprotected header
+            ulong packetNumber = 0;
             for (int i = 0; i < pnLength && i < 8; i++)
             {
                 packetNumber = (packetNumber << 8) | unprotectedHeader[pnOffset + i];
             }
 
-            // NOW do the sanity check after extraction
-            if (packetNumber > 1000000)  // Sanity check
+            // CRITICAL FIX: Sanity check packet number
+            if (packetNumber > 10000000)  // Sanity check - too large indicates corruption
             {
                 return new DecryptionResult { Success = false, ErrorMessage = "Invalid packet number from header protection" };
             }
 
             Console.WriteLine($"[DECRYPT-DEBUG] Extracted packet number: {packetNumber}");
 
-            // Build header for AEAD (everything up to and including packet number)
-            byte[] header = new byte[pnOffset + pnLength];
-            Buffer.BlockCopy(unprotectedHeader, 0, header, 0, header.Length);
-            Console.WriteLine($"[DECRYPT-DEBUG] Header for AEAD: {BitConverter.ToString(header)}");
+            // CRITICAL FIX: Build header for AEAD - MUST include first byte through packet number
+            int headerLength = pnOffset + pnLength;
+            byte[] header = new byte[headerLength];
+            Buffer.BlockCopy(unprotectedHeader, 0, header, 0, headerLength);
+            Console.WriteLine($"[DECRYPT-DEBUG] Header for AEAD ({headerLength} bytes): {BitConverter.ToString(header)}");
 
-            // Extract payload (everything after packet number)
+            // Extract payload (everything after packet number, excluding auth tag)
             int payloadOffset = pnOffset + pnLength;
             int payloadLen = packetData.Length - payloadOffset - 16; // -16 for auth tag
 
@@ -640,10 +666,11 @@ public static class PacketDecryptor
 
             byte[] payload = new byte[payloadLen];
             Buffer.BlockCopy(packetData, payloadOffset, payload, 0, payloadLen);
-            Console.WriteLine($"[DECRYPT-DEBUG] Payload length: {payloadLen}");
+            Console.WriteLine($"[DECRYPT-DEBUG] Payload offset: {payloadOffset}, length: {payloadLen}");
 
             byte[] tag = new byte[16];
             Buffer.BlockCopy(packetData, packetData.Length - 16, tag, 0, 16);
+            Console.WriteLine($"[DECRYPT-DEBUG] Auth tag: {BitConverter.ToString(tag)}");
 
             // Construct nonce
             byte[] nonce = ConstructQUICNonce(key.IV, packetNumber);
@@ -659,6 +686,8 @@ public static class PacketDecryptor
                 if (IsValidDecryptedData(plaintext))
                 {
                     Console.WriteLine($"[DECRYPT-DEBUG] Decryption successful! Plaintext length: {plaintext.Length}");
+                    Console.WriteLine($"[DECRYPT-DEBUG] First 32 bytes plaintext: {BitConverter.ToString(plaintext.Take(32).ToArray())}");
+
                     return new DecryptionResult
                     {
                         Success = true,
@@ -670,7 +699,9 @@ public static class PacketDecryptor
                             ["algorithm"] = key.Key.Length == 16 ? "AES-128-GCM" : "AES-256-GCM",
                             ["packet_number"] = packetNumber,
                             ["header_type"] = (packetData[0] & 0x80) != 0 ? "long" : "short",
-                            ["header_protection_removed"] = true
+                            ["header_protection_removed"] = true,
+                            ["header_length"] = headerLength,
+                            ["payload_length"] = payloadLen
                         }
                     };
                 }
@@ -692,7 +723,6 @@ public static class PacketDecryptor
             return new DecryptionResult { Success = false, ErrorMessage = ex.Message };
         }
     }
-
     // NEW: Detailed brute force with logging
     private static DecryptionResult TryDecryptWithBruteForceDetailed(byte[] packetData, EncryptionKey key, CancellationToken ct)
     {
@@ -701,16 +731,18 @@ public static class PacketDecryptor
         bool isLongHeader = (packetData[0] & 0x80) != 0;
         Console.WriteLine($"[DECRYPT-DEBUG] IsLongHeader: {isLongHeader}");
 
-        // For short headers, try different DCID lengths
-        int[] dcidLengths = isLongHeader ? new[] { 0 } : new[] { 0, 4, 8, 12, 16 };
+        // CRITICAL FIX: Expanded DCID lengths including odd sizes Netty might use
+        int[] dcidLengths = isLongHeader ? new[] { 0 } : new[] { 0, 4, 8, 12, 16, 20, 1, 2, 3, 5, 6, 7 };
 
         int attempts = 0;
+        int maxAttempts = 1000; // Limit to prevent infinite loops
 
         foreach (int dcidLen in dcidLengths)
         {
             if (ct.IsCancellationRequested)
                 return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
 
+            // For short header: headerLen = 1 (flags) + dcidLen
             int headerLen = isLongHeader ? 0 : 1 + dcidLen;
 
             // Try different PN lengths (1-4 bytes)
@@ -721,33 +753,38 @@ public static class PacketDecryptor
 
                 if (payloadOffset + 16 > packetData.Length) continue;
 
-                // Extract base packet number
+                // Extract base packet number from packet bytes
                 ulong basePN = 0;
                 for (int i = 0; i < pnLen && i < 8; i++)
                 {
                     basePN = (basePN << 8) | packetData[pnOffset + i];
                 }
 
-                // Try nearby packet numbers
-                for (ulong pnDelta = 0; pnDelta < 30; pnDelta++)
+                // Try nearby packet numbers with expanded range
+                for (ulong pnDelta = 0; pnDelta < 50; pnDelta++) // Increased from 30
                 {
                     attempts++;
+                    if (attempts > maxAttempts)
+                    {
+                        Console.WriteLine($"[DECRYPT-DEBUG] Brute force hit max attempts ({maxAttempts})");
+                        return new DecryptionResult { Success = false, ErrorMessage = $"Max attempts reached ({maxAttempts})" };
+                    }
 
                     // Try incrementing
                     var result = TryDecryptAtPN(packetData, key, headerLen, pnLen, basePN + pnDelta, pnOffset, ct);
                     if (result.Success)
                     {
-                        Console.WriteLine($"[DECRYPT-DEBUG] Brute force success after {attempts} attempts! PN={basePN + pnDelta}");
+                        Console.WriteLine($"[DECRYPT-DEBUG] Brute force success after {attempts} attempts! PN={basePN + pnDelta}, dcidLen={dcidLen}, pnLen={pnLen}");
                         return result;
                     }
 
                     // Try decrementing
                     if (basePN >= pnDelta && pnDelta > 0)
                     {
-                        result = TryDecryptAtPN(packetData, key, headerLen, pnLen, basePN - pnDelta, pnOffset,ct);
+                        result = TryDecryptAtPN(packetData, key, headerLen, pnLen, basePN - pnDelta, pnOffset, ct);
                         if (result.Success)
                         {
-                            Console.WriteLine($"[DECRYPT-DEBUG] Brute force success after {attempts} attempts! PN={basePN - pnDelta}");
+                            Console.WriteLine($"[DECRYPT-DEBUG] Brute force success after {attempts} attempts! PN={basePN - pnDelta}, dcidLen={dcidLen}, pnLen={pnLen}");
                             return result;
                         }
                     }
@@ -758,6 +795,7 @@ public static class PacketDecryptor
         Console.WriteLine($"[DECRYPT-DEBUG] Brute force failed after {attempts} attempts");
         return new DecryptionResult { Success = false, ErrorMessage = $"Brute force failed. Tried {attempts} combinations." };
     }
+
 
     // FIXED: Async manual decrypt for UI
     public static async Task<DecryptionResult> TryDecryptManualAsync(byte[] encryptedData, int timeoutMs = 2000, CancellationToken ct = default)
@@ -914,12 +952,24 @@ public static class PacketDecryptor
             if (ct.IsCancellationRequested)
                 return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
 
-            // Build header for AEAD (everything up to and including packet number)
+            // CRITICAL FIX: Build header for AEAD correctly
+            // Header = flags byte (if short header) + DCID (if any) + packet number
             byte[] header = new byte[headerLen + pnLen];
-            Buffer.BlockCopy(packetData, 0, header, 0, header.Length);
+
+            // Copy flags and DCID if present
+            if (headerLen > 0)
+            {
+                Buffer.BlockCopy(packetData, 0, header, 0, headerLen);
+            }
+
+            // Copy packet number bytes into header
+            for (int i = 0; i < pnLen; i++)
+            {
+                header[headerLen + i] = packetData[pnOffset + i];
+            }
 
             // Extract payload (everything after packet number, excluding auth tag)
-            int payloadOffset = headerLen + pnLen;
+            int payloadOffset = pnOffset + pnLen;
             int payloadLen = packetData.Length - payloadOffset - 16; // 16 bytes for AES-GCM tag
 
             if (payloadLen <= 0)
@@ -954,17 +1004,19 @@ public static class PacketDecryptor
                             ["algorithm"] = key.Key.Length == 16 ? "AES-128-GCM" : "AES-256-GCM",
                             ["packet_number"] = packetNumber,
                             ["header_type"] = (packetData[0] & 0x80) != 0 ? "long" : "short",
-                            ["brute_force"] = true
+                            ["brute_force"] = true,
+                            ["dcid_length"] = headerLen > 0 ? headerLen - 1 : 0,
+                            ["pn_length"] = pnLen
                         }
                     };
                 }
             }
             catch (CryptographicException)
             {
-                // Expected for wrong PN - ignore and return failure below
+                // Expected for wrong PN - ignore
             }
 
-            // Return failure if we get here
+            // Return failure
             return new DecryptionResult { Success = false, ErrorMessage = "Decryption failed" };
         }
         catch (Exception ex)
@@ -1045,9 +1097,10 @@ public static class PacketDecryptor
                 packetNumber = (packetNumber << 8) | unprotectedHeader[pnOffset + i];
             }
 
-            // Build header for AEAD (everything up to and including packet number)
-            byte[] header = new byte[pnOffset + pnLength];
-            Buffer.BlockCopy(unprotectedHeader, 0, header, 0, header.Length);
+            // CORRECT - for short headers:
+            int headerLen = pnOffset + pnLength; // This should be 1 + pnLength for short header
+            byte[] header = new byte[headerLen];
+            Buffer.BlockCopy(unprotectedHeader, 0, header, 0, headerLen);
 
             // Extract payload (everything after packet number)
             int payloadOffset = pnOffset + pnLength;
@@ -1259,108 +1312,53 @@ public static class PacketDecryptor
         {
             Console.WriteLine($"[KEY-DERIVE] ========== {key.Type} ==========");
             Console.WriteLine($"[KEY-DERIVE] Secret length: {key.Secret.Length} bytes");
-            Console.WriteLine($"[KEY-DERIVE] Secret (first 16 bytes): {BitConverter.ToString(key.Secret.Take(16).ToArray())}");
 
             int secretLength = key.Secret.Length;
 
-            // Handle different secret lengths
-            if (secretLength == 32)
+            // RFC 9001 uses different key lengths based on cipher
+            // For TLS_AES_128_GCM_SHA256: key=16, iv=12, hp=16
+            // For TLS_AES_256_GCM_SHA384: key=32, iv=12, hp=32
+
+            int keyLen = 16;  // Default to AES-128
+            int hpLen = 16;
+
+            // If secret is 48 bytes, we might be using AES-256
+            if (secretLength >= 48)
             {
-                // 32-byte secret (likely TLS 1.2 or custom) - use direct derivation
-                Console.WriteLine($"[KEY-DERIVE] Detected 32-byte secret (TLS 1.2 style)");
-                Console.WriteLine($"[KEY-DERIVE] Using DIRECT derivation (no HKDF)");
-
-                key.Key = key.Secret.Take(16).ToArray();
-                key.IV = key.Secret.Skip(16).Take(12).ToArray();
-                key.HeaderProtectionKey = key.Key.ToArray(); // Copy of key
-
-                Console.WriteLine($"[KEY-DERIVE] Key (first 16 bytes of secret): {Convert.ToHexString(key.Key)}");
-                Console.WriteLine($"[KEY-DERIVE] IV (bytes 16-27 of secret): {Convert.ToHexString(key.IV)}");
-                Console.WriteLine($"[KEY-DERIVE] HP (same as key): {Convert.ToHexString(key.HeaderProtectionKey)}");
-            }
-            else if (secretLength == 48)
-            {
-                // 48-byte secret (standard TLS 1.3) - use RFC 9001 HKDF
-                Console.WriteLine($"[KEY-DERIVE] Detected 48-byte secret (TLS 1.3 style)");
-                Console.WriteLine($"[KEY-DERIVE] Using RFC 9001 HKDF derivation");
-
-                int keyLength = 32; // AES-256 for 48-byte secrets
-
-                Console.WriteLine($"[KEY-DERIVE] --- RFC 9001 (no 'tls13 ' prefix) ---");
-                var rfcKey = HkdfExpandLabelQUIC(key.Secret, QUIC_KEY_LABEL, Array.Empty<byte>(), keyLength);
-                var rfcIV = HkdfExpandLabelQUIC(key.Secret, QUIC_IV_LABEL, Array.Empty<byte>(), 12);
-                var rfcHP = HkdfExpandLabelQUIC(key.Secret, QUIC_HP_LABEL, Array.Empty<byte>(), keyLength);
-
-                Console.WriteLine($"[KEY-DERIVE] Key: {Convert.ToHexString(rfcKey)}");
-                Console.WriteLine($"[KEY-DERIVE] IV:  {Convert.ToHexString(rfcIV)}");
-                Console.WriteLine($"[KEY-DERIVE] HP:  {Convert.ToHexString(rfcHP)}");
-
-                Console.WriteLine($"[KEY-DERIVE] --- TLS 1.3 style (with 'tls13 ' prefix) ---");
-                var tlsKey = HkdfExpandLabel(key.Secret, QUIC_KEY_LABEL, Array.Empty<byte>(), keyLength);
-                var tlsIV = HkdfExpandLabel(key.Secret, QUIC_IV_LABEL, Array.Empty<byte>(), 12);
-                var tlsHP = HkdfExpandLabel(key.Secret, QUIC_HP_LABEL, Array.Empty<byte>(), keyLength);
-
-                Console.WriteLine($"[KEY-DERIVE] Key: {Convert.ToHexString(tlsKey)}");
-                Console.WriteLine($"[KEY-DERIVE] IV:  {Convert.ToHexString(tlsIV)}");
-                Console.WriteLine($"[KEY-DERIVE] HP:  {Convert.ToHexString(tlsHP)}");
-
-                // Use RFC 9001 version
-                key.Key = rfcKey;
-                key.IV = rfcIV;
-                key.HeaderProtectionKey = rfcHP;
-            }
-            else
-            {
-                // Unknown secret length - try HKDF anyway
-                Console.WriteLine($"[KEY-DERIVE] Unknown secret length {secretLength}, trying standard HKDF");
-
-                key.Key = HkdfExpandLabelQUIC(key.Secret, QUIC_KEY_LABEL, Array.Empty<byte>(), 16);
-                key.IV = HkdfExpandLabelQUIC(key.Secret, QUIC_IV_LABEL, Array.Empty<byte>(), 12);
-                key.HeaderProtectionKey = HkdfExpandLabelQUIC(key.Secret, QUIC_HP_LABEL, Array.Empty<byte>(), 16);
+                keyLen = 32;
+                hpLen = 32;
             }
 
-            // Validate derived keys
-            if (key.Key.Length == 0 || key.IV.Length == 0)
-            {
-                throw new InvalidOperationException("Derived keys are empty");
-            }
+            Console.WriteLine($"[KEY-DERIVE] Using AES-{keyLen * 8} (keyLen={keyLen})");
 
-            Console.WriteLine($"[KEY-DERIVE] ✓ Successfully derived {key.Key.Length * 8}-bit keys");
-            Console.WriteLine($"[KEY-DERIVE] ====================================");
+            // CRITICAL FIX: Use correct RFC 9001 labels WITHOUT "tls13 " prefix
+            key.Key = HkdfExpandLabelRFC9001(key.Secret, "quic key", keyLen);
+            key.IV = HkdfExpandLabelRFC9001(key.Secret, "quic iv", 12);
+            key.HeaderProtectionKey = HkdfExpandLabelRFC9001(key.Secret, "quic hp", hpLen);
+
+            Console.WriteLine($"[KEY-DERIVE] Derived key: {Convert.ToHexString(key.Key)}");
+            Console.WriteLine($"[KEY-DERIVE] Derived IV:  {Convert.ToHexString(key.IV)}");
+            Console.WriteLine($"[KEY-DERIVE] Derived HP:  {Convert.ToHexString(key.HeaderProtectionKey)}");
+            Console.WriteLine($"[KEY-DERIVE] ? Successfully derived {key.Key.Length * 8}-bit keys");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[KEY-DERIVE] ✗ FAILED: {ex.Message}");
-            Console.WriteLine($"[KEY-DERIVE] Stack trace: {ex.StackTrace}");
+            Console.WriteLine($"[KEY-DERIVE] ? FAILED: {ex.Message}");
             key.Key = Array.Empty<byte>();
             key.IV = Array.Empty<byte>();
             key.HeaderProtectionKey = null;
         }
     }
 
-
-
-    private static byte[] HkdfExpandLabel(byte[] secret, byte[] label, byte[] context, int length)
+    // CRITICAL FIX: Correct RFC 9001 HKDF-Expand-Label (NO "tls13 " prefix!)
+    private static byte[] HkdfExpandLabelRFC9001(byte[] secret, string label, int length)
     {
-        var fullLabel = new List<byte>();
-        fullLabel.AddRange(TLS13_LABEL_PREFIX);
-        fullLabel.AddRange(label);
+        // RFC 9001 Section 5.1: labels are "quic key", "quic iv", "quic hp" (NOT "tls13 quic key")
 
-        var hkdfLabel = new List<byte>();
-        hkdfLabel.Add((byte)(length >> 8));
-        hkdfLabel.Add((byte)(length & 0xFF));
-        hkdfLabel.Add((byte)fullLabel.Count);
-        hkdfLabel.AddRange(fullLabel);
-        hkdfLabel.Add((byte)context.Length);
-        hkdfLabel.AddRange(context);
+        var labelBytes = Encoding.ASCII.GetBytes(label);
 
-        return HkdfExpand(secret, hkdfLabel.ToArray(), length);
-    }
-
-    // RFC 9001 QUIC-TLS key derivation (NO "tls13 " prefix!)
-    private static byte[] HkdfExpandLabelQUIC(byte[] secret, byte[] label, byte[] context, int length)
-    {
-        // Build label: length(2) + label_len(1) + label + context_len(1) + context
+        // Build HkdfLabel: length(2) + label_len(1) + label + context_len(1) + context
+        // Context is always empty for QUIC key derivation
         var hkdfLabel = new List<byte>(128);
 
         // Length of derived key (16 bits, big-endian)
@@ -1368,16 +1366,16 @@ public static class PacketDecryptor
         hkdfLabel.Add((byte)(length & 0xFF));
 
         // Label length and label
-        hkdfLabel.Add((byte)label.Length);
-        hkdfLabel.AddRange(label);
+        hkdfLabel.Add((byte)labelBytes.Length);
+        hkdfLabel.AddRange(labelBytes);
 
-        // Context length and context
-        hkdfLabel.Add((byte)context.Length);
-        hkdfLabel.AddRange(context);
+        // Context length (0) and empty context
+        hkdfLabel.Add(0);
 
         return HkdfExpand(secret, hkdfLabel.ToArray(), length);
     }
 
+    // Standard HKDF-Expand (RFC 5869)
     private static byte[] HkdfExpand(byte[] prk, byte[] info, int length)
     {
         var result = new List<byte>();
