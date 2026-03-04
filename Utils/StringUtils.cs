@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;  // ADDED
 using System.IO;                   // ADDED
 using System.Text;

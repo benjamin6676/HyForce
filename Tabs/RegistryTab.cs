@@ -1,4 +1,4 @@
-﻿using HyForce.Core;
+using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
@@ -26,7 +26,7 @@ public class RegistryTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  REGISTRY ANALYSIS  �  Item IDs & Player Names");
+        ImGui.Text("  REGISTRY ANALYSIS  ?  Item IDs & Player Names");
         ImGui.Separator();
         ImGui.Spacing();
 
@@ -86,7 +86,7 @@ public class RegistryTab : ITab
 
             bool selected = _selectedOpcode == opcode;
 
-            string label = $"0x{opcode:X2}  �{count}";
+            string label = $"0x{opcode:X2}  ?{count}";
             if (hasEntries && entries > 0)
                 label += $"  [{entries} items]";
 

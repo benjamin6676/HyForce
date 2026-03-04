@@ -1,4 +1,4 @@
-﻿using HyForce.Data;
+using HyForce.Data;
 using HyForce.Networking;
 
 namespace HyForce.Core;

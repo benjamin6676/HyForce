@@ -1,9 +1,9 @@
 // FILE: Data/PacketLogEntry.cs  (EXTENDED)
 // ADDITIONS:
-//   DecryptedBytes   — persists plaintext after QUIC decrypt
-//   ParsedPacketId   — LE uint32 at offset 4 in DecryptedBytes
-//   Fields           — structured fields parsed by WireFormatParser
-//   WasDecrypted     — convenience bool
+//   DecryptedBytes   -- persists plaintext after QUIC decrypt
+//   ParsedPacketId   -- LE uint32 at offset 4 in DecryptedBytes
+//   Fields           -- structured fields parsed by WireFormatParser
+//   WasDecrypted     -- convenience bool
 
 using HyForce.Protocol;
 
@@ -28,7 +28,7 @@ public class PacketLogEntry
     public List<ParsedField>? Fields   { get; set; }
 
     // UI properties
-    public string DirStr    => Direction == Networking.PacketDirection.ServerToClient ? "S→C" : "C→S";
+    public string DirStr    => Direction == Networking.PacketDirection.ServerToClient ? "S->C" : "C->S";
     public string ProtoStr  => IsTcp ? "TCP" : "UDP";
     public string StatusStr => WasDecrypted ? (Fields != null ? "[PARSE]" : "[DEC]") : "[RAW]";
 
@@ -44,7 +44,7 @@ public class PacketLogEntry
     public Networking.QuicHeaderInfo? QuicInfo { get; set; }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 // Represents one auto-detected field inside a decrypted packet
 public class ParsedField
 {
@@ -54,7 +54,7 @@ public class ParsedField
     public FieldType Type       { get; set; }
     public object?  Value       { get; set; }   // int, float, string, byte[], etc.
     public string   HexPreview  { get; set; } = "";
-    public double   Confidence  { get; set; }   // 0.0–1.0
+    public double   Confidence  { get; set; }   // 0.0-1.0
 
     public string DisplayValue => Value switch
     {

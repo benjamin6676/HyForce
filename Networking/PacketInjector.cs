@@ -1,5 +1,5 @@
 // FILE: Networking/PacketInjector.cs
-// Inject packets back into the proxy — towards the server (C2S) or the client (S2C).
+// Inject packets back into the proxy -- towards the server (C2S) or the client (S2C).
 //
 // Flow:
 //   1. Take a plaintext payload (already modified by the user in InjectTab).
@@ -35,7 +35,7 @@ public class PacketInjector
         _state = state;
     }
 
-    // ── Inject to server (C2S) ────────────────────────────────────────────
+    // -- Inject to server (C2S) --------------------------------------------
 
     /// <summary>
     /// Re-encrypt <paramref name="plaintextPayload"/> with the current 1-RTT client key
@@ -70,7 +70,7 @@ public class PacketInjector
         }
     }
 
-    // ── Inject to client (S2C) ────────────────────────────────────────────
+    // -- Inject to client (S2C) --------------------------------------------
 
     /// <summary>Re-encrypt and send to the local game client.</summary>
     public async Task<InjectionResult> InjectToClientAsync(
@@ -81,7 +81,7 @@ public class PacketInjector
         return await InjectCoreAsync(plaintextPayload, PacketDirection.ServerToClient, overridePacketId, ct);
     }
 
-    // ── Batch injection ───────────────────────────────────────────────────
+    // -- Batch injection ---------------------------------------------------
 
     public async Task<List<InjectionResult>> InjectBatchAsync(
         IEnumerable<InjectionRequest> requests,
@@ -106,7 +106,7 @@ public class PacketInjector
         return results;
     }
 
-    // ── Replay ────────────────────────────────────────────────────────────
+    // -- Replay ------------------------------------------------------------
 
     /// <summary>Replay a list of captured packets at original or scaled timing.</summary>
     public async Task ReplayAsync(
@@ -137,7 +137,7 @@ public class PacketInjector
         _state.AddInGameLog("[INJ] Replay complete");
     }
 
-    // ── Internal ──────────────────────────────────────────────────────────
+    // -- Internal ----------------------------------------------------------
 
     private async Task<InjectionResult> InjectCoreAsync(
         byte[] payload, PacketDirection dir, uint overridePacketId, CancellationToken ct)
@@ -149,7 +149,7 @@ public class PacketInjector
             return InjectionResult.Fail("UDP proxy not running");
 
         if (PacketDecryptor.DiscoveredKeys.Count == 0)
-            return InjectionResult.Fail("No encryption keys — cannot re-encrypt");
+            return InjectionResult.Fail("No encryption keys -- cannot re-encrypt");
 
         try
         {
@@ -216,7 +216,7 @@ public class PacketInjector
     }
 }
 
-// ── Data types ────────────────────────────────────────────────────────────────
+// -- Data types ----------------------------------------------------------------
 
 public class InjectionResult
 {

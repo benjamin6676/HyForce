@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/OpcodeManager.cs - NEW: Centralized opcode filtering and management
+// FILE: Tabs/OpcodeManager.cs - NEW: Centralized opcode filtering and management
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
@@ -71,7 +71,7 @@ public class OpcodeManager : ITab
     {
         // Search
         ImGui.SetNextItemWidth(200);
-        ImGui.InputText("🔍 Search", ref _searchFilter, 256);
+        ImGui.InputText("? Search", ref _searchFilter, 256);
 
         ImGui.SameLine();
         ImGui.Checkbox("Hidden Only", ref _showOnlyHidden);
@@ -134,8 +134,8 @@ public class OpcodeManager : ITab
 
         if (ImGui.BeginTable("##opcodes", 4, ImGuiTableFlags.RowBg | ImGuiTableFlags.Borders | ImGuiTableFlags.ScrollY))
         {
-            ImGui.TableSetupColumn("★", ImGuiTableColumnFlags.WidthFixed, 25);
-            ImGui.TableSetupColumn("👁", ImGuiTableColumnFlags.WidthFixed, 25);
+            ImGui.TableSetupColumn("*", ImGuiTableColumnFlags.WidthFixed, 25);
+            ImGui.TableSetupColumn("?", ImGuiTableColumnFlags.WidthFixed, 25);
             ImGui.TableSetupColumn("Opcode", ImGuiTableColumnFlags.WidthFixed, 60);
             ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch);
             ImGui.TableHeadersRow();
@@ -148,7 +148,7 @@ public class OpcodeManager : ITab
                 // Favorite star
                 ImGui.TableSetColumnIndex(0);
                 bool isFav = _favoriteOpcodes.Contains(op.Opcode);
-                if (ImGui.Button(isFav ? "★" : "☆"))
+                if (ImGui.Button(isFav ? "*" : "o"))
                 {
                     if (isFav) _favoriteOpcodes.Remove(op.Opcode);
                     else _favoriteOpcodes.Add(op.Opcode);
@@ -157,7 +157,7 @@ public class OpcodeManager : ITab
                 // Visibility toggle
                 ImGui.TableSetColumnIndex(1);
                 bool isHidden = _hiddenOpcodes.Contains(op.Opcode);
-                if (ImGui.Button(isHidden ? "🚫" : "👁"))
+                if (ImGui.Button(isHidden ? "?" : "?"))
                 {
                     if (isHidden) _hiddenOpcodes.Remove(op.Opcode);
                     else _hiddenOpcodes.Add(op.Opcode);
@@ -216,7 +216,7 @@ public class OpcodeManager : ITab
         if (c2sInfo != null)
         {
             ImGui.Spacing();
-            ImGui.TextColored(new Vector4(0.3f, 0.8f, 0.3f, 1), "Client → Server");
+            ImGui.TextColored(new Vector4(0.3f, 0.8f, 0.3f, 1), "Client -> Server");
             ImGui.Text($"Name: {c2sInfo.Name}");
             ImGui.Text($"Category: {c2sInfo.Category}");
             ImGui.TextWrapped($"Description: {c2sInfo.Description}");
@@ -226,7 +226,7 @@ public class OpcodeManager : ITab
         if (s2cInfo != null)
         {
             ImGui.Spacing();
-            ImGui.TextColored(new Vector4(0.8f, 0.5f, 0.2f, 1), "Server → Client");
+            ImGui.TextColored(new Vector4(0.8f, 0.5f, 0.2f, 1), "Server -> Client");
             ImGui.Text($"Name: {s2cInfo.Name}");
             ImGui.Text($"Category: {s2cInfo.Category}");
             ImGui.TextWrapped($"Description: {s2cInfo.Description}");

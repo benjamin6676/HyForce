@@ -1,13 +1,13 @@
 // FILE: Utils/GlobalHotkeys.cs
-// Win32 global hotkeys — fire callbacks even when Hytale is the foreground window.
+// Win32 global hotkeys -- fire callbacks even when Hytale is the foreground window.
 // Uses RegisterHotKey / PeekMessage polling (no hidden window required for Veldrid apps
 // because Veldrid's SDL2 backend pumps a Win32 message queue internally).
 //
 // Default bindings (all configurable):
-//   F8  — Trigger Action Correlator capture
-//   F9  — Start session recording
-//   F10 — Stop recording + save
-//   F11 — Inject last packet (repeat last injection)
+//   F8  -- Trigger Action Correlator capture
+//   F9  -- Start session recording
+//   F10 -- Stop recording + save
+//   F11 -- Inject last packet (repeat last injection)
 
 using System.Runtime.InteropServices;
 
@@ -15,7 +15,7 @@ namespace HyForce.Utils;
 
 public class GlobalHotkeys : IDisposable
 {
-    // ── Win32 ──────────────────────────────────────────────────────────────
+    // -- Win32 --------------------------------------------------------------
     [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] private static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
@@ -36,33 +36,33 @@ public class GlobalHotkeys : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int x; public int y; }
 
-    // ── Binding registry ──────────────────────────────────────────────────
+    // -- Binding registry --------------------------------------------------
     private readonly Dictionary<int, HotkeyBinding> _bindings = new();
     private int _nextId = 100;
     private bool _disposed;
 
-    // ── Public events ─────────────────────────────────────────────────────
+    // -- Public events -----------------------------------------------------
     public event Action? OnCorrelatorCapture;
     public event Action? OnRecordStart;
     public event Action? OnRecordStop;
     public event Action? OnInjectRepeat;
 
-    // ── Overlay notification ──────────────────────────────────────────────
+    // -- Overlay notification ----------------------------------------------
     public string? OverlayMessage       { get; private set; }
     public float   OverlayMessageExpiry { get; private set; }
 
-    // ── Current binding display ───────────────────────────────────────────
+    // -- Current binding display -------------------------------------------
     public IReadOnlyDictionary<int, HotkeyBinding> Bindings => _bindings;
 
     public GlobalHotkeys()
     {
-        RegisterDefault(VK_F8,  MOD_NONE, "Correlator Capture",  () => { ShowOverlay("● CAPTURING"); OnCorrelatorCapture?.Invoke(); });
-        RegisterDefault(VK_F9,  MOD_NONE, "Start Recording",     () => { ShowOverlay("● RECORDING");  OnRecordStart?.Invoke(); });
-        RegisterDefault(VK_F10, MOD_NONE, "Stop Recording",      () => { ShowOverlay("■ SAVED");      OnRecordStop?.Invoke(); });
-        RegisterDefault(VK_F11, MOD_NONE, "Inject Repeat",       () => { ShowOverlay("⚡ INJECTING"); OnInjectRepeat?.Invoke(); });
+        RegisterDefault(VK_F8,  MOD_NONE, "Correlator Capture",  () => { ShowOverlay("[*] CAPTURING"); OnCorrelatorCapture?.Invoke(); });
+        RegisterDefault(VK_F9,  MOD_NONE, "Start Recording",     () => { ShowOverlay("[*] RECORDING");  OnRecordStart?.Invoke(); });
+        RegisterDefault(VK_F10, MOD_NONE, "Stop Recording",      () => { ShowOverlay("[#] SAVED");      OnRecordStop?.Invoke(); });
+        RegisterDefault(VK_F11, MOD_NONE, "Inject Repeat",       () => { ShowOverlay("! INJECTING"); OnInjectRepeat?.Invoke(); });
     }
 
-    // ── Polling (call once per render frame) ──────────────────────────────
+    // -- Polling (call once per render frame) ------------------------------
     public void Poll()
     {
         // Drain WM_HOTKEY messages from the queue
@@ -81,7 +81,7 @@ public class GlobalHotkeys : IDisposable
             OverlayMessage = null;
     }
 
-    // ── Rebind support ─────────────────────────────────────────────────────
+    // -- Rebind support -----------------------------------------------------
     public bool Rebind(int id, uint newVk, uint newMod = MOD_NONE)
     {
         if (!_bindings.TryGetValue(id, out var binding)) return false;
@@ -98,7 +98,7 @@ public class GlobalHotkeys : IDisposable
         return false;
     }
 
-    // ── Overlay rendering (call from main render loop) ────────────────────
+    // -- Overlay rendering (call from main render loop) --------------------
     public void RenderOverlay()
     {
         if (OverlayMessage == null) return;
@@ -116,7 +116,7 @@ public class GlobalHotkeys : IDisposable
         ImGuiNET.ImGui.End();
     }
 
-    // ── Internals ─────────────────────────────────────────────────────────
+    // -- Internals ---------------------------------------------------------
     private void RegisterDefault(uint vk, uint mod, string name, Action cb)
     {
         int id = _nextId++;

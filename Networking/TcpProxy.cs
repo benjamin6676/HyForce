@@ -1,4 +1,4 @@
-﻿// FILE: Networking/TcpProxy.cs - Enhanced version with better logging
+// FILE: Networking/TcpProxy.cs - Enhanced version with better logging
 using HyForce.Core;
 using System.Collections.Concurrent;
 using System.Net;

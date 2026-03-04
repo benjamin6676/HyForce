@@ -1,4 +1,4 @@
-﻿// FILE: Protocol/PacketInspector.cs (ENHANCED)
+// FILE: Protocol/PacketInspector.cs (ENHANCED)
 using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Utils;

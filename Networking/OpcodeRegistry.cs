@@ -1,4 +1,4 @@
-﻿// FILE: Protocol/OpcodeRegistry.cs (ENHANCED VERSION)
+// FILE: Protocol/OpcodeRegistry.cs (ENHANCED VERSION)
 using HyForce.Networking;
 using HyForce.Data;
 using System.Collections.Generic;

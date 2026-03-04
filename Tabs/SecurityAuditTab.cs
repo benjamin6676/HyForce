@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/SecurityAuditTab.cs - FIXED: REMOVED TcpPackets
+// FILE: Tabs/SecurityAuditTab.cs - FIXED: REMOVED TcpPackets
 using HyForce.Core;
 using HyForce.Data;
 using HyForce.UI;

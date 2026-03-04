@@ -1,4 +1,4 @@
-﻿using HyForce.Core;
+using HyForce.Core;
 using HyForce.UI;
 using ImGuiNET;
 using System.Numerics;
@@ -27,7 +27,7 @@ public class LogTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  IN-GAME LOG  —  Debug Output");
+        ImGui.Text("  IN-GAME LOG  --  Debug Output");
         ImGui.Separator();
         ImGui.Spacing();
 

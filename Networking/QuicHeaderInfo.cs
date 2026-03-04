@@ -1,4 +1,4 @@
-﻿// FILE: Networking/QuicHeaderInfo.cs - FIXED: Added short header support fields
+// FILE: Networking/QuicHeaderInfo.cs - FIXED: Added short header support fields
 namespace HyForce.Networking;
 
 public class QuicHeaderInfo

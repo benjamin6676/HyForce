@@ -1,4 +1,4 @@
-﻿// FILE: Core/AppState.cs - FIXED: Removed duplicate TryAutoDecryptPackets
+// FILE: Core/AppState.cs - FIXED: Removed duplicate TryAutoDecryptPackets
 using HyForce.Data;
 using HyForce.Networking;
 using HyForce.Protocol;
@@ -56,6 +56,7 @@ public class AppState : IDisposable
     private readonly PacketReceivedHandler _packetHandlerDelegate;
     // FIX 2: Add TCP packet handler delegate
     private readonly PacketReceivedHandler _tcpPacketHandlerDelegate;
+    private string? _activeKeyLogFile = null;
 
     public AppState()
     {
@@ -75,9 +76,13 @@ public class AppState : IDisposable
 
         Directory.CreateDirectory(ExportDirectory);
 
+
+
         SetupAutoDecryption();
-        SetupSSLKeyWatcher();
-        ScanAndLoadExistingKeys();
+        // SetupSSLKeyWatcher();        // REMOVED - now done in Start()
+        // ScanAndLoadExistingKeys();   // REMOVED - now done in Start() with session-specific file
+        // Only scan existing if not starting fresh session
+        // ScanForExistingSessionFiles(); // Optional - implement if needed
 
         _retryTimer = new System.Timers.Timer(2000);
         _retryTimer.Elapsed += (s, e) => ProcessPendingKeyFiles();
@@ -85,78 +90,35 @@ public class AppState : IDisposable
         _retryTimer.Start();
     }
 
-    private void SetupSSLKeyWatcher()
+    public string? GetActiveKeyLogFile()
     {
-        try
-        {
-            if (!Directory.Exists(ExportDirectory))
-                Directory.CreateDirectory(ExportDirectory);
-
-            _sslKeyWatcher = new FileSystemWatcher(ExportDirectory)
-            {
-                Filter = "*ssl*.log",
-                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
-                EnableRaisingEvents = true
-            };
-
-            _sslKeyWatcher.Created += (s, e) =>
-            {
-                AddInGameLog($"[KEYS] New key file detected: {Path.GetFileName(e.FullPath)}");
-                QueueKeyFileLoad(e.FullPath);
-            };
-
-            _sslKeyWatcher.Changed += (s, e) =>
-            {
-                lock (_keyLoadLock)
-                {
-                    if ((DateTime.Now - _lastKeyLoadTime).TotalSeconds > 2)
-                    {
-                        AddInGameLog($"[KEYS] Key file updated: {Path.GetFileName(e.FullPath)}");
-                        QueueKeyFileLoad(e.FullPath);
-                        _lastKeyLoadTime = DateTime.Now;
-                    }
-                }
-            };
-
-            AddInGameLog("[KEYS] File watcher active for SSL key logs");
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"[KEYS] Failed to setup file watcher: {ex.Message}", "System");
-        }
+        return _activeKeyLogFile;
     }
 
-    private void ScanAndLoadExistingKeys()
+    // Add manual prepare method for UI
+    public void PrepareFreshKeyLogManual()
     {
+        ClearKeyLogFile();
+
+        string sessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        string keyLogPath = Path.Combine(ExportDirectory, $"sslkeys_session_{sessionId}.log");
+
+        _activeKeyLogFile = keyLogPath;
+        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.Process);
+
         try
         {
-            if (!Directory.Exists(ExportDirectory)) return;
-
-            var keyFiles = Directory.GetFiles(ExportDirectory, "*.log")
-                .Where(f =>
-                    Path.GetFileName(f).Contains("ssl", StringComparison.OrdinalIgnoreCase) ||
-                    Path.GetFileName(f).Contains("key", StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(f => new FileInfo(f).LastWriteTime)
-                .ToList();
-
-            if (keyFiles.Any())
-            {
-                AddInGameLog($"[KEYS] Found {keyFiles.Count} potential key files");
-                foreach (var file in keyFiles.Take(3))
-                {
-                    QueueKeyFileLoad(file);
-                }
-            }
-            else
-            {
-                AddInGameLog("[KEYS] No existing key files found in export directory");
-            }
+            Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.User);
         }
-        catch (Exception ex)
-        {
-            Log.Warn($"[KEYS] Scan failed: {ex.Message}", "System");
-        }
+        catch { }
+
+        File.WriteAllText(keyLogPath, $"# HyForce Session {sessionId} - Prepared manually\r\n");
+
+        AddInGameLog($"[KEYLOG] Fresh key log ready: {Path.GetFileName(keyLogPath)}");
+        AddInGameLog("[KEYLOG] >>> START HYTALE NOW <<<");
     }
+
+
 
     private void QueueKeyFileLoad(string path)
     {
@@ -205,7 +167,7 @@ public class AppState : IDisposable
     // FIXED: Single SetupAutoDecryption method with 30 second interval
     private void SetupAutoDecryption()
     {
-        _autoDecryptTimer = new System.Timers.Timer(30000); // 30 seconds - much less aggressive
+        _autoDecryptTimer = new System.Timers.Timer(60000); // 60 seconds - very conservative
         _autoDecryptTimer.Elapsed += (s, e) =>
         {
             // CRITICAL FIX: Only auto-decrypt if we have keys AND proxy is running
@@ -259,76 +221,313 @@ public class AppState : IDisposable
         }
     }
 
-    // FIX 2: Modified Start() to start both TCP and UDP proxies
-    // FIX 2: Modified Start() to start both TCP and UDP proxies with proper ordering
+
     public void Start()
     {
         if (IsRunning) return;
 
-        // CRITICAL FIX: Start TCP FIRST (Hytale does registry sync over TCP first)
-        int tcpListenPort = ListenPort + 1; // 5522 for TCP
+        AddInGameLog("[SESSION] === Starting Fresh Session ===");
+
+        // Clear old files
+        ClearKeyLogFile();
+
+        // Create fresh session file
+        string sessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        string sessionKeyLog = Path.Combine(ExportDirectory, $"sslkeys_session_{sessionId}.log");
+
+        // TRACK THIS FILE
+        _activeKeyLogFile = sessionKeyLog;
+
+        // Set environment variables
+        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", sessionKeyLog, EnvironmentVariableTarget.Process);
+        try { Environment.SetEnvironmentVariable("SSLKEYLOGFILE", sessionKeyLog, EnvironmentVariableTarget.User); } catch { }
+
+        // Create file
+        File.WriteAllText(sessionKeyLog, $"# HyForce Session {sessionId}\r\n");
+
+        AddInGameLog($"[SESSION] Fresh key log: {Path.GetFileName(sessionKeyLog)}");
+
+        // Clear old keys
+        PacketDecryptor.ClearKeys();
+
+        // Setup watcher for ONLY this file
+        SetupSessionKeyWatcher(sessionKeyLog);
+
+        AddInGameLog("[SESSION] >>> START HYTALE NOW <<<");
+        AddInGameLog("[SESSION] Keys will be filtered for QUIC/Hytale only");
+
+        // Start proxies
+        int tcpListenPort = ListenPort + 1;
         TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, TargetPort);
-
-        // Small delay to ensure TCP is ready before UDP
         Thread.Sleep(50);
-
-        // Then start UDP proxy for gameplay
         UdpProxy.Start("0.0.0.0", ListenPort, TargetHost, TargetPort);
 
         StartTime = DateTime.Now;
-
-        // CRITICAL FIX: Start the auto-decrypt timer AND the worker
         _autoDecryptTimer?.Start();
-
-        // ADD THIS LINE:
         PacketDecryptor.StartAutoDecrypt();
 
-        Log.Info($"[HyForce] TCP Proxy started on 0.0.0.0:{tcpListenPort}", "System");
-        Log.Info($"[HyForce] UDP Proxy started on 0.0.0.0:{ListenPort}", "System");
-        Log.Info($"[HyForce] Forwarding to {TargetHost}:{TargetPort}", "System");
-
-        AddInGameLog($"TCP Proxy started on 127.0.0.1:{tcpListenPort}");
-        AddInGameLog($"UDP Proxy started on 127.0.0.1:{ListenPort}");
-        AddInGameLog($"Connect Hytale to 127.0.0.1:{ListenPort}");
-
-        // AUTO-COPY IP TO CLIPBOARD
+        // Auto-copy
         try
         {
             string connectString = $"127.0.0.1:{ListenPort}";
             TextCopy.ClipboardService.SetText(connectString);
             AddInGameLog($"[AUTO-COPY] {connectString} copied to clipboard!");
-            Log.Success($"Connect address copied to clipboard: {connectString}", "System");
         }
         catch (Exception ex)
         {
-            Log.Warn($"Failed to copy to clipboard: {ex.Message}", "System");
+            Log.Warn($"Failed to copy: {ex.Message}", "System");
         }
 
-        TryEnableSSLKeyLogFile();
-        ScanAndLoadExistingKeys();
-        PacketDecryptor.StartAutoDecrypt();
+        // Delayed key scan - only our session file
+        Task.Run(async () =>
+        {
+            await Task.Delay(5000);
+            ScanSessionKeyFile(sessionKeyLog);
+        });
+    }
+
+    private void SetupSessionKeyWatcher(string specificFilePath)
+    {
+        try
+        {
+            // Stop old watcher if exists
+            _sslKeyWatcher?.Dispose();
+
+            string? directory = Path.GetDirectoryName(specificFilePath);
+            string? fileName = Path.GetFileName(specificFilePath);
+
+            if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(fileName))
+                return;
+
+            _sslKeyWatcher = new FileSystemWatcher(directory)
+            {
+                Filter = fileName, // Watch ONLY our specific session file
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
+                EnableRaisingEvents = true
+            };
+
+            _sslKeyWatcher.Changed += (s, e) =>
+            {
+                if ((DateTime.Now - _lastKeyLoadTime).TotalSeconds > 1)
+                {
+                    AddInGameLog($"[KEYS] Session file updated");
+                    QueueKeyFileLoad(e.FullPath);
+                    _lastKeyLoadTime = DateTime.Now;
+                }
+            };
+
+            AddInGameLog("[KEYS] Watching session file for new keys");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[KEYS] Watcher setup failed: {ex.Message}", "System");
+        }
+    }
+
+    private void ScanSessionKeyFile(string sessionFilePath)
+    {
+        try
+        {
+            if (!File.Exists(sessionFilePath))
+            {
+                AddInGameLog($"[KEYS] Session file not found: {Path.GetFileName(sessionFilePath)}");
+                return;
+            }
+
+            var fileInfo = new FileInfo(sessionFilePath);
+            AddInGameLog($"[KEYS] Scanning {Path.GetFileName(sessionFilePath)} ({fileInfo.Length} bytes)");
+
+            int keysAdded = 0;
+            int linesChecked = 0;
+            int quicLinesFound = 0;
+
+            using (var fs = new FileStream(sessionFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(fs))
+            {
+                string? line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    linesChecked++;
+
+                    if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#"))
+                        continue;
+
+                    // Debug: show first few lines
+                    if (linesChecked <= 5)
+                    {
+                        AddInGameLog($"[KEYS-DEBUG] Line {linesChecked}: {line.Substring(0, Math.Min(50, line.Length))}...");
+                    }
+
+                    if (IsHytaleQuicKey(line))
+                    {
+                        quicLinesFound++;
+                        var key = ParseSSLKeyLogLine(line, sessionFilePath);
+                        if (key != null)
+                        {
+                            PacketDecryptor.AddKey(key);
+                            keysAdded++;
+                            AddInGameLog($"[KEYS] Added {key.Type} key");
+                        }
+                    }
+                }
+            }
+
+            AddInGameLog($"[KEYS] Scanned {linesChecked} lines, found {quicLinesFound} QUIC entries, added {keysAdded} keys");
+
+            if (keysAdded > 0)
+            {
+                OnKeysUpdated?.Invoke();
+            }
+        }
+        catch (Exception ex)
+        {
+            AddInGameLog($"[KEYS] Scan error: {ex.Message}");
+        }
+    }
+
+    private bool IsHytaleQuicKey(string line)
+    {
+        // Hytale uses QUIC which produces these specific labels
+        // Browsers produce CLIENT_RANDOM, CLIENT_TRAFFIC_SECRET, etc. for TLS
+        string[] quicLabels =
+        {
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        "CLIENT_TRAFFIC_SECRET_0",
+        "SERVER_TRAFFIC_SECRET_0",
+        "CLIENT_EARLY_TRAFFIC_SECRET",
+        "EXPORTER_SECRET"
+    };
+
+        // Must start with a QUIC label and have 3 parts (label + client_random + secret)
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3) return false;
+
+        return quicLabels.Any(label => parts[0].Equals(label, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public void ClearKeyLogFile()
+    {
+        try
+        {
+            // Get the system-wide key log file path
+            string? systemKeyLog = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Machine)
+                ?? Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.User)
+                ?? Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Process);
+
+            // Also check common locations
+            string[] possiblePaths =
+            {
+            systemKeyLog,
+            Path.Combine(ExportDirectory, "sslkeys.log"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "sslkeys.log"),
+            @"C:\Users\benja\source\repos\HyForce\Exported logs\sslkeys.log"
+        };
+
+            foreach (var path in possiblePaths.Where(p => !string.IsNullOrEmpty(p)).Distinct())
+            {
+                if (string.IsNullOrEmpty(path)) continue;
+
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        // Try to clear it using multiple strategies
+                        bool cleared = TryClearFile(path);
+
+                        if (cleared)
+                        {
+                            AddInGameLog($"[KEYLOG] Cleared: {Path.GetFileName(path)}");
+                        }
+                        else
+                        {
+                            // If can't clear, rename it
+                            string backupPath = path + ".backup." + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                            File.Move(path, backupPath);
+                            AddInGameLog($"[KEYLOG] Renamed locked file to {Path.GetFileName(backupPath)}");
+                        }
+                    }
+
+                    // Create fresh empty file with header
+                    File.WriteAllText(path, "# SSL Key Log - Fresh session started by HyForce\r\n");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn($"[KEYS] Could not clear {path}: {ex.Message}", "System");
+                }
+            }
+
+            Log.Info("[KEYS] All key log files cleared/reset", "System");
+        }
+        catch (Exception ex)
+        {
+            AddInGameLog($"[KEYLOG] Clear operation warning: {ex.Message}");
+        }
+    }
+
+    private bool TryClearFile(string path)
+    {
+        try
+        {
+            // Strategy 1: FileShare.ReadWrite
+            using (var fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
+            {
+                fs.SetLength(0);
+                using (var writer = new StreamWriter(fs))
+                {
+                    writer.WriteLine("# SSL Key Log - Cleared by HyForce");
+                }
+            }
+            return true;
+        }
+        catch
+        {
+            try
+            {
+                // Strategy 2: Delete and recreate
+                File.Delete(path);
+                File.WriteAllText(path, "# SSL Key Log - Fresh start\r\n");
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    private void ScanSpecificKeyFile(string specificPath)
+    {
+        try
+        {
+            if (File.Exists(specificPath))
+            {
+                var age = DateTime.Now - new FileInfo(specificPath).LastWriteTime;
+                AddInGameLog($"[KEYS] Loading from current session ({age.TotalSeconds:F0}s old)");
+                QueueKeyFileLoad(specificPath);
+            }
+            else
+            {
+                AddInGameLog("[KEYS] Session key file not found yet - will retry");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[KEYS] Scan failed: {ex.Message}", "System");
+        }
     }
 
     private PacketDecryptor.EncryptionKey? ParseSSLKeyLogLine(string line, string source)
     {
-        DebugSSLKeyLogParsing(line);
         try
         {
-            // SSLKEYLOGFILE format: LABEL <client_random_hex> <secret_hex>
             var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 3)
-            {
-                Log.Debug($"Skipping malformed line (only {parts.Length} parts): {line[..Math.Min(50, line.Length)]}", "Keys");
-                return null;
-            }
+            if (parts.Length < 3) return null;
 
             string label = parts[0];
 
-            // Skip non-QUIC labels early
-            if (!label.Contains("TRAFFIC_SECRET") && !label.Contains("EXPORTER"))
-            {
-                return null;
-            }
+            // Double-check it's a QUIC label we want
+            if (!IsHytaleQuicKey(line)) return null;
 
             byte[] clientRandom = Convert.FromHexString(parts[1]);
             byte[] secret = Convert.FromHexString(parts[2]);
@@ -338,12 +537,13 @@ public class AppState : IDisposable
             {
                 Log.Warn($"Unexpected client_random length: {clientRandom.Length} bytes", "Keys");
             }
-            if (secret.Length != 48)
+
+            if (secret.Length != 32 && secret.Length != 48)
             {
-                Log.Warn($"Unexpected secret length: {secret.Length} bytes (expected 48 for TLS 1.3)", "Keys");
+                Log.Warn($"Unusual secret length: {secret.Length}B (expected 32 or 48)", "Keys");
             }
 
-            // Determine key type based on label - ENHANCED with more cases
+            // Determine key type based on label
             var keyType = label switch
             {
                 "CLIENT_TRAFFIC_SECRET_0" => PacketDecryptor.EncryptionType.QUIC_Client1RTT,
@@ -351,7 +551,7 @@ public class AppState : IDisposable
                 "CLIENT_HANDSHAKE_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_ClientHandshake,
                 "SERVER_HANDSHAKE_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_ServerHandshake,
                 "CLIENT_EARLY_TRAFFIC_SECRET" => PacketDecryptor.EncryptionType.QUIC_Client0RTT,
-                "EXPORTER_SECRET" => PacketDecryptor.EncryptionType.QUIC_Client1RTT, // Fallback
+                "EXPORTER_SECRET" => PacketDecryptor.EncryptionType.QUIC_Client1RTT,
                 _ => PacketDecryptor.EncryptionType.QUIC_Client1RTT
             };
 
@@ -366,19 +566,17 @@ public class AppState : IDisposable
             // Derive actual QUIC keys from TLS secret
             PacketDecryptor.DeriveQUICKeys(key);
 
-            // Log success with key info
-            Log.Success($"Parsed {label} ({secret.Length * 8} bits) → {keyType}, derived {key.Key.Length * 8}-bit key", "Keys");
-
+            Log.Success($"Parsed {label} ({secret.Length * 8} bits) -> {keyType}", "Keys");
             return key;
         }
         catch (FormatException ex)
         {
-            Log.Warn($"Hex decode failed: {ex.Message} for line: {line[..Math.Min(40, line.Length)]}...", "Keys");
+            Log.Warn($"Hex decode failed: {ex.Message}", "Keys");
             return null;
         }
         catch (Exception ex)
         {
-            Log.Warn($"Failed to parse SSL key log line: {ex.Message}", "Keys");
+            Log.Warn($"Parse error: {ex.Message}", "Keys");
             return null;
         }
     }
@@ -390,7 +588,7 @@ public class AppState : IDisposable
         var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length < 3)
         {
-            Console.WriteLine($"[KEY-PARSE] ✗ Invalid format: only {parts.Length} parts");
+            Console.WriteLine($"[KEY-PARSE] XX Invalid format: only {parts.Length} parts");
             return;
         }
 
@@ -411,18 +609,13 @@ public class AppState : IDisposable
             Console.WriteLine($"[KEY-PARSE] Client random: {clientRandom.Length} bytes ({BitConverter.ToString(clientRandom.Take(8).ToArray())}...)");
             Console.WriteLine($"[KEY-PARSE] Secret: {secret.Length} bytes ({secret.Length * 8} bits) - {BitConverter.ToString(secret.Take(8).ToArray())}...");
 
-            if (secret.Length != 48)
-            {
-                Console.WriteLine($"[KEY-PARSE] ⚠ WARNING: Expected 48 bytes for TLS 1.3, got {secret.Length}");
-            }
-            else
-            {
-                Console.WriteLine($"[KEY-PARSE] ✓ Secret length looks correct for TLS 1.3");
-            }
+            // 32B = AES-128/SHA-256 (Hytale standard), 48B = AES-256/SHA-384
+            string sn = secret.Length == 32 ? "OK AES-128 (Hytale)" : secret.Length == 48 ? "OK AES-256" : $"(!) unusual ({secret.Length}B)";
+            Console.WriteLine($"[KEY-PARSE] {sn}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[KEY-PARSE] ✗ Parse error: {ex.Message}");
+            Console.WriteLine($"[KEY-PARSE] XX Parse error: {ex.Message}");
         }
     }
 
@@ -474,6 +667,7 @@ public class AppState : IDisposable
 
                 int keysAdded = 0;
                 int linesProcessed = 0;
+                int keysFiltered = 0;
 
                 using (var fs = new FileStream(actualPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 using (var reader = new StreamReader(fs))
@@ -482,34 +676,37 @@ public class AppState : IDisposable
                     while ((line = reader.ReadLine()) != null)
                     {
                         linesProcessed++;
-                        if (line.StartsWith("CLIENT_TRAFFIC_SECRET_0") ||
-                            line.StartsWith("SERVER_TRAFFIC_SECRET_0") ||
-                            line.StartsWith("CLIENT_HANDSHAKE_TRAFFIC_SECRET") ||
-                            line.StartsWith("SERVER_HANDSHAKE_TRAFFIC_SECRET") ||
-                            line.StartsWith("EXPORTER_SECRET"))
+
+                        // FILTER: Only process Hytale QUIC keys
+                        if (!IsHytaleQuicKey(line))
                         {
-                            // Parse SSL key log line and add key
-                            var key = ParseSSLKeyLogLine(line, actualPath);
-                            if (key != null)
-                            {
-                                PacketDecryptor.AddKey(key);
-                                keysAdded++;
-                            }
+                            if (!string.IsNullOrWhiteSpace(line) && !line.StartsWith("#"))
+                                keysFiltered++;
+                            continue;
+                        }
+
+                        var key = ParseSSLKeyLogLine(line, actualPath);
+                        if (key != null)
+                        {
+                            PacketDecryptor.AddKey(key);
+                            keysAdded++;
                         }
                     }
                 }
 
                 if (keysAdded > 0)
                 {
-                    AddInGameLog($"[KEYS] Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}");
-                    AddInGameLog($"[KEYS] QUIC keys auto-derived using RFC 9001 HKDF-Expand-Label");
-                    Log.Success($"Processed {keysAdded} TLS secrets from {Path.GetFileName(actualPath)}", "Keys");
+                    AddInGameLog($"[KEYS] {keysAdded} Hytale keys from {Path.GetFileName(actualPath)}");
+                    if (keysFiltered > 0)
+                    {
+                        AddInGameLog($"[KEYS] Filtered {keysFiltered} non-QUIC keys (browsers/other apps)");
+                    }
                     OnKeysUpdated?.Invoke();
                     return true;
                 }
-                else if (linesProcessed > 0)
+                else if (keysFiltered > 0)
                 {
-                    AddInGameLog($"[KEYS] No valid TLS secrets found in {Path.GetFileName(actualPath)} ({linesProcessed} lines)");
+                    AddInGameLog($"[KEYS] No Hytale keys yet (filtered {keysFiltered} browser keys)");
                     return true;
                 }
                 return true;
@@ -517,16 +714,12 @@ public class AppState : IDisposable
             catch (IOException ex) when (IsFileLocked(ex))
             {
                 retryCount++;
-                if (retryCount >= MAX_RETRIES)
-                {
-                    AddInGameLog($"[KEYS] File locked after {MAX_RETRIES} attempts: {Path.GetFileName(actualPath)}");
-                    return false;
-                }
+                if (retryCount >= MAX_RETRIES) return false;
                 Thread.Sleep(100 * retryCount);
             }
             catch (Exception ex)
             {
-                AddInGameLog($"[KEYS] Failed to load keys: {ex.Message}");
+                AddInGameLog($"[KEYS] Load error: {ex.Message}");
                 return true;
             }
         }
@@ -541,8 +734,28 @@ public class AppState : IDisposable
 
     public void RefreshAllKeys()
     {
-        AddInGameLog("[KEYS] Refreshing all key files...");
-        ScanAndLoadExistingKeys();
+        AddInGameLog("[KEYS] Refreshing keys...");
+
+        // Get current session file
+        string? currentLog = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Process);
+
+        if (!string.IsNullOrEmpty(currentLog) && File.Exists(currentLog))
+        {
+            ScanSessionKeyFile(currentLog); // Use new method
+        }
+        else
+        {
+            // Fallback: look for any session file
+            var sessionFiles = Directory.GetFiles(ExportDirectory, "sslkeys_session_*.log")
+                .OrderByDescending(f => new FileInfo(f).LastWriteTime)
+                .FirstOrDefault();
+
+            if (sessionFiles != null)
+            {
+                ScanSessionKeyFile(sessionFiles);
+            }
+        }
+
         OnKeysUpdated?.Invoke();
     }
 
@@ -560,6 +773,8 @@ public class AppState : IDisposable
                 : (DateTime?)null
         };
     }
+
+
 
     public void Stop()
     {
@@ -941,8 +1156,15 @@ public class AppState : IDisposable
 
     public void Dispose()
     {
+        // Clear keys but don't clear file (might be needed for debugging)
+        try
+        {
+            // Optional: Clear key log on close
+            // ClearKeyLogFile(); 
+        }
+        catch { }
+
         UdpProxy.OnPacket -= _packetHandlerDelegate;
-        // FIX 2: Unsubscribe TCP handler
         TcpProxy.OnPacket -= _tcpPacketHandlerDelegate;
 
         Stop();

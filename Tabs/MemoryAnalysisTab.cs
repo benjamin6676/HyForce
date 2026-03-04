@@ -1,13 +1,13 @@
 // FILE: Tabs/MemoryAnalysisTab.cs
 // ============================================================
 // Complete memory analysis UI tab integrating:
-//   • LocalPlayer discovery + live field inspector
-//   • Memory field list with value change highlighting
-//   • Entity structure scan results
-//   • Pointer graph visualizer
-//   • Snapshot capture + diff viewer
-//   • Structured memory log
-//   • Memory dumper
+//   * LocalPlayer discovery + live field inspector
+//   * Memory field list with value change highlighting
+//   * Entity structure scan results
+//   * Pointer graph visualizer
+//   * Snapshot capture + diff viewer
+//   * Structured memory log
+//   * Memory dumper
 //
 // Tab layout (sub-tabs):
 //   [Overview] [Fields] [Entities] [Pointer Graph] [Snapshots] [Log] [Dump]
@@ -26,19 +26,19 @@ public class MemoryAnalysisTab : ITab
 {
     public string Name => "Memory";
 
-    // ── Win32 ──────────────────────────────────────────────────────────────
+    // -- Win32 --------------------------------------------------------------
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
     [DllImport("kernel32.dll")] static extern bool   CloseHandle(IntPtr h);
     private const int PROCESS_VM_READ       = 0x0010;
     private const int PROCESS_QUERY_INFORMATION = 0x0400;
 
-    // ── State ─────────────────────────────────────────────────────────────
+    // -- State -------------------------------------------------------------
     private readonly AppState _state;
 
     // Process attach
     private IntPtr    _processHandle = IntPtr.Zero;
     private bool      _isAttached;
-    private string    _processName = "java";   // Hytale runs under JVM
+    private string    _processName = "HytaleClient";  // Hytale native client
 
     // Subsystems (created after attach)
     private SignatureScanner?   _scanner;
@@ -93,7 +93,7 @@ public class MemoryAnalysisTab : ITab
 
     public MemoryAnalysisTab(AppState state) { _state = state; }
 
-    // ── Render entry ──────────────────────────────────────────────────────
+    // -- Render entry ------------------------------------------------------
 
     public void Render()
     {
@@ -147,23 +147,108 @@ public class MemoryAnalysisTab : ITab
         }
     }
 
-    // ── Attach bar ────────────────────────────────────────────────────────
+    // -- Attach bar --------------------------------------------------------
+
+    // -- Running process cache ----------------------------------------------
+    private Process[] _procList       = Array.Empty<Process>();
+    private DateTime  _lastProcScan   = DateTime.MinValue;
+    private int       _selectedProcIdx = -1;
+
+    private void RefreshProcList()
+    {
+        if ((DateTime.Now - _lastProcScan).TotalSeconds < 2) return;
+        _lastProcScan = DateTime.Now;
+        try
+        {
+            _procList = Process.GetProcesses()
+                .Where(p => { try { return p.Id > 4; } catch { return false; } })
+                .OrderBy(p => p.ProcessName).ToArray();
+            for (int i = 0; i < _procList.Length; i++)
+            {
+                if (_procList[i].ProcessName.ToLower().Contains("hytale"))
+                { _selectedProcIdx = i; _processName = _procList[i].ProcessName; break; }
+            }
+        }
+        catch { }
+    }
 
     private void RenderAttachBar()
     {
-        ImGui.SetNextItemWidth(160);
-        ImGui.InputText("Process", ref _processName, 64);
-        ImGui.SameLine();
-
-        if (!_isAttached)
+        if (_isAttached)
         {
-            if (ImGui.Button("Attach", new Vector2(80, 24))) TryAttach();
+            ImGui.TextColored(Theme.ColSuccess, "[*] ATTACHED");
+            ImGui.SameLine(0,8);
+            ImGui.TextColored(Theme.ColTextMuted, _processName);
+            ImGui.SameLine(0,8);
+            if (ImGui.Button("Detach", new Vector2(70,22))) Detach();
+            ImGui.SameLine();
+            ImGui.Checkbox("Auto-refresh", ref _autoRefresh);
+            return;
+        }
+
+        RefreshProcList();
+
+        // Highlight Hytale processes with a quick-attach button
+        var hytaleProcs = _procList.Where(p => p.ProcessName.ToLower().Contains("hytale")).ToArray();
+        if (hytaleProcs.Length > 0)
+        {
+            foreach (var hp in hytaleProcs)
+            {
+                ImGui.PushStyleColor(ImGuiCol.Button, Theme.ColAccentDim);
+                if (ImGui.Button($"* Attach {hp.ProcessName} (PID {hp.Id})", new Vector2(0,22)))
+                { _processName = hp.ProcessName; TryAttach(); }
+                ImGui.PopStyleColor();
+                ImGui.SameLine();
+            }
+            ImGui.NewLine();
         }
         else
         {
-            ImGui.TextColored(Theme.ColSuccess, $"✓ Attached");
-            ImGui.SameLine();
-            if (ImGui.Button("Detach", new Vector2(80, 24))) Detach();
+            ImGui.TextColored(Theme.ColDanger, "[ ] NOT ATTACHED");
+            ImGui.SameLine(0,8);
+            ImGui.TextColored(Theme.ColTextMuted, "HytaleClient.exe not found");
+            ImGui.NewLine();
+        }
+
+        // Manual input
+        ImGui.SetNextItemWidth(160);
+        ImGui.InputText("##proc", ref _processName, 64);
+        ImGui.SameLine();
+        ImGui.PushStyleColor(ImGuiCol.Button, Theme.ColSuccess);
+        if (ImGui.Button("Attach", new Vector2(60,22))) TryAttach();
+        ImGui.PopStyleColor();
+        ImGui.SameLine();
+        if (ImGui.Button("Refresh", new Vector2(60,22))) _lastProcScan = DateTime.MinValue;
+
+        // Process dropdown
+        if (_procList.Length > 0)
+        {
+            ImGui.SameLine(0,10);
+            ImGui.SetNextItemWidth(220);
+            string preview = _selectedProcIdx >= 0 && _selectedProcIdx < _procList.Length
+                ? $"{_procList[_selectedProcIdx].ProcessName} ({_procList[_selectedProcIdx].Id})"
+                : "-- pick --";
+            if (ImGui.BeginCombo("##pc", preview))
+            {
+                for (int i = 0; i < _procList.Length; i++)
+                {
+                    var p = _procList[i];
+                    bool ht = p.ProcessName.ToLower().Contains("hytale");
+                    if (ht) ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColAccent);
+                    string lbl; try { lbl = $"{p.ProcessName}  ({p.Id})"; } catch { lbl = $"? ({p.Id})"; }
+                    if (ImGui.Selectable(lbl, i == _selectedProcIdx))
+                    { _selectedProcIdx = i; _processName = p.ProcessName; }
+                    if (ht) ImGui.PopStyleColor();
+                }
+                ImGui.EndCombo();
+            }
+            if (_selectedProcIdx >= 0 && _selectedProcIdx < _procList.Length)
+            {
+                ImGui.SameLine();
+                ImGui.PushStyleColor(ImGuiCol.Button, Theme.ColAccentMid);
+                if (ImGui.Button("Attach##sel", new Vector2(90,22))) TryAttach();
+                ImGui.PopStyleColor();
+            }
         }
 
         ImGui.SameLine();
@@ -173,7 +258,7 @@ public class MemoryAnalysisTab : ITab
         ImGui.SliderFloat("Hz", ref _refreshHz, 1f, 60f);
     }
 
-    // ── Overview panel ────────────────────────────────────────────────────
+    // -- Overview panel ----------------------------------------------------
 
     private void RenderOverview()
     {
@@ -187,7 +272,7 @@ public class MemoryAnalysisTab : ITab
 
         if (_discovering)
         {
-            ImGui.TextColored(Theme.ColWarn, "● Scanning…");
+            ImGui.TextColored(Theme.ColWarn, "[*] Scanning...");
         }
         else if (ImGui.Button("Discover Player", new Vector2(160, 26)))
         {
@@ -229,7 +314,7 @@ public class MemoryAnalysisTab : ITab
 
         // Quick stats row
         ImGui.BeginChild("##stats_row", new Vector2(0, 80), ImGuiChildFlags.None);
-        StatCard("Regions",  _scanner == null ? "—" : "ready", new Vector4(0.3f, 0.5f, 0.9f, 1f));
+        StatCard("Regions",  _scanner == null ? "--" : "ready", new Vector4(0.3f, 0.5f, 0.9f, 1f));
         ImGui.SameLine();
         StatCard("Snapshots", (_snapshots?.Snapshots.Count ?? 0).ToString(), Theme.ColAccent);
         ImGui.SameLine();
@@ -239,14 +324,14 @@ public class MemoryAnalysisTab : ITab
         ImGui.EndChild();
     }
 
-    // ── Fields panel ─────────────────────────────────────────────────────
+    // -- Fields panel -----------------------------------------------------
 
     private void RenderFields()
     {
         var avail = ImGui.GetContentRegionAvail();
 
         // Toolbar
-        if (ImGui.Button("Add Field…", new Vector2(100, 24)))
+        if (ImGui.Button("Add Field...", new Vector2(100, 24)))
             ImGui.OpenPopup("##add_field");
         ImGui.SameLine();
         if (ImGui.Button("Clear All", new Vector2(80, 24)))  { _fieldBatch.Clear(); _selectedField = null; }
@@ -315,7 +400,7 @@ public class MemoryAnalysisTab : ITab
 
             ImGui.TableSetColumnIndex(2);
             if (field.Changed)
-                ImGui.TextColored(Theme.ColWarn, "●");
+                ImGui.TextColored(Theme.ColWarn, "[*]");
 
             ImGui.TableSetColumnIndex(3);
             ImGui.TextColored(Theme.ColTextMuted, $"0x{(ulong)field.Address:X}");
@@ -398,7 +483,7 @@ public class MemoryAnalysisTab : ITab
         }
     }
 
-    // ── Entities panel ────────────────────────────────────────────────────
+    // -- Entities panel ----------------------------------------------------
 
     private void RenderEntities()
     {
@@ -406,7 +491,7 @@ public class MemoryAnalysisTab : ITab
             StartEntityScan();
         ImGui.SameLine();
         if (_entityScanning)
-            ImGui.TextColored(Theme.ColWarn, "● Scanning…");
+            ImGui.TextColored(Theme.ColWarn, "[*] Scanning...");
         else
             ImGui.Text($"{_entityCandidates.Count} candidates");
 
@@ -487,7 +572,7 @@ public class MemoryAnalysisTab : ITab
         ImGui.EndChild();
     }
 
-    // ── Pointer graph panel ───────────────────────────────────────────────
+    // -- Pointer graph panel -----------------------------------------------
 
     private void RenderPointerGraph()
     {
@@ -550,7 +635,7 @@ public class MemoryAnalysisTab : ITab
         }
     }
 
-    // ── Snapshots panel ───────────────────────────────────────────────────
+    // -- Snapshots panel ---------------------------------------------------
 
     private void RenderSnapshots()
     {
@@ -605,13 +690,13 @@ public class MemoryAnalysisTab : ITab
         ImGui.EndChild();
 
         // Diff
-        if (_snapA != null && _snapB != null && ImGui.Button("Compare A→B", new Vector2(120, 26)))
+        if (_snapA != null && _snapB != null && ImGui.Button("Compare A->B", new Vector2(120, 26)))
         {
             var diff = _snapshots!.Diff(_snapA, _snapB);
             _snapDiffText = _snapshots.FormatDiff(diff);
         }
         ImGui.SameLine();
-        ImGui.Text($"A: {_snapA?.Name ?? "—"}  |  B: {_snapB?.Name ?? "—"}");
+        ImGui.Text($"A: {_snapA?.Name ?? "--"}  |  B: {_snapB?.Name ?? "--"}");
 
         ImGui.BeginChild("##diff_view", new Vector2(0, avail.Y - topH - 60), ImGuiChildFlags.Borders);
         if (!string.IsNullOrEmpty(_snapDiffText))
@@ -621,7 +706,7 @@ public class MemoryAnalysisTab : ITab
         ImGui.EndChild();
     }
 
-    // ── Log panel ─────────────────────────────────────────────────────────
+    // -- Log panel ---------------------------------------------------------
 
     private void RenderLog()
     {
@@ -659,7 +744,7 @@ public class MemoryAnalysisTab : ITab
         ImGui.EndChild();
     }
 
-    // ── Dump panel ────────────────────────────────────────────────────────
+    // -- Dump panel --------------------------------------------------------
 
     private void RenderDump()
     {
@@ -701,19 +786,25 @@ public class MemoryAnalysisTab : ITab
         ImGui.EndChild();
     }
 
-    // ── Attach / Detach ───────────────────────────────────────────────────
+    // -- Attach / Detach ---------------------------------------------------
 
     private void TryAttach()
     {
-        var procs = Process.GetProcessesByName(_processName);
+        // Strip .exe if user typed it
+        string clean = _processName.Replace(".exe","").Replace(".EXE","").Trim();
+        var procs = Process.GetProcessesByName(clean);
         if (procs.Length == 0)
         {
-            // Also try "java" (Hytale launcher variant)
-            procs = Process.GetProcessesByName("java");
+            // Fuzzy fallback: match any process containing "hytale" or the typed name
+            procs = Process.GetProcesses()
+                .Where(p => { try { return p.ProcessName.ToLower().Contains("hytale") ||
+                                         p.ProcessName.ToLower().Contains(clean.ToLower()); }
+                              catch { return false; } })
+                .ToArray();
         }
         if (procs.Length == 0)
         {
-            _log.Warn($"[ATTACH] Process '{_processName}' not found");
+            _log.Warn($"[ATTACH] Process '{_processName}' not found. Is HytaleClient.exe running?");
             return;
         }
 
@@ -749,13 +840,13 @@ public class MemoryAnalysisTab : ITab
         _log.Info("[ATTACH] Detached");
     }
 
-    // ── Discovery flow ─────────────────────────────────────────────────────
+    // -- Discovery flow -----------------------------------------------------
 
     private void StartPlayerDiscovery()
     {
         if (_discovery == null || _discovering) return;
         _discovering = true;
-        _discoverStatus = "Scanning…";
+        _discoverStatus = "Scanning...";
 
         Task.Run(() =>
         {
@@ -771,7 +862,7 @@ public class MemoryAnalysisTab : ITab
                 }
                 else
                 {
-                    _discoverStatus = "Not found — try after joining a world";
+                    _discoverStatus = "Not found -- try after joining a world";
                 }
             }
             catch (Exception ex)
@@ -797,7 +888,7 @@ public class MemoryAnalysisTab : ITab
         });
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────
+    // -- Helpers -----------------------------------------------------------
 
     private void AddFieldFromInput(FieldKind kind, int size)
     {
@@ -821,7 +912,7 @@ public class MemoryAnalysisTab : ITab
     }
 
     private static string TruncateStr(string s, int max) =>
-        s.Length <= max ? s : s[..max] + "…";
+        s.Length <= max ? s : s[..max] + "...";
 
     private static void Row(string label, string value)
     {

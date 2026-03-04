@@ -1,4 +1,4 @@
-﻿// FILE: Data/PacketPatternDetector.cs
+// FILE: Data/PacketPatternDetector.cs
 using HyForce.Networking;
 using HyForce.Protocol;
 using System;

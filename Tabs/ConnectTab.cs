@@ -1,4 +1,4 @@
-﻿using HyForce.Core;
+using HyForce.Core;
 using HyForce.UI;
 using ImGuiNET;
 using System.Numerics;
@@ -34,20 +34,20 @@ public class ConnectTab : ITab
         if (!_state.IsRunning)
         {
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.95f, 0.28f, 0.22f, 1));
-            ImGui.TextWrapped("⚠  START PROXY FIRST: Then connect Hytale to 127.0.0.1:5521 (auto-copied to clipboard)");
+            ImGui.TextWrapped("(!)  START PROXY FIRST: Then connect Hytale to 127.0.0.1:5521 (auto-copied to clipboard)");
             ImGui.PopStyleColor();
         }
         else
         {
             ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.2f, 0.8f, 0.3f, 1));
-            ImGui.TextWrapped("✓ Proxy is RUNNING - Connect Hytale to 127.0.0.1:5521 (copied to clipboard!)");
+            ImGui.TextWrapped("OK Proxy is RUNNING - Connect Hytale to 127.0.0.1:5521 (copied to clipboard!)");
             ImGui.PopStyleColor();
 
             // Show copy feedback
             if (ImGui.GetTime() - _copyFeedbackTime < 3.0)
             {
                 ImGui.TextColored(new Vector4(0.2f, 0.9f, 0.2f, 1),
-                    "✓ 127.0.0.1:5521 copied to clipboard!");
+                    "OK 127.0.0.1:5521 copied to clipboard!");
             }
         }
 
@@ -363,7 +363,7 @@ public class ConnectTab : ITab
         if (isRunning)
         {
             ImGui.SameLine();
-            ImGui.TextColored(Theme.ColTextMuted, $"● {sessions} sessions");
+            ImGui.TextColored(Theme.ColTextMuted, $"[*] {sessions} sessions");
         }
         ImGui.EndGroup();
     }

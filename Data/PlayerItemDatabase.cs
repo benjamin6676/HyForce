@@ -1,4 +1,4 @@
-﻿using HyForce.Networking;
+using HyForce.Networking;
 using System.Collections.Concurrent;
 
 namespace HyForce.Data;

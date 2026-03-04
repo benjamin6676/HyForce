@@ -117,7 +117,7 @@ public class PacketLog
         }
     }
 
-    // FIX: Copy only the needed tail — minimise time holding the lock
+    // FIX: Copy only the needed tail -- minimise time holding the lock
     public List<PacketLogEntry> GetLast(int n)
     {
         lock (_lock)
@@ -166,7 +166,7 @@ public class PacketLog
     public IReadOnlyDictionary<ushort, int> GetOpcodeCounts() => _opcodeCounts;
     public int CountForOpcode(ushort opcode) => _opcodeCounts.TryGetValue(opcode, out int c) ? c : 0;
 
-    // ── helpers ──────────────────────────────────────────────────────────────
+    // -- helpers --------------------------------------------------------------
 
     private static ushort ReadOpcode(byte[] raw)
     {
@@ -179,7 +179,7 @@ public class PacketLog
         method = "none";
         if (raw.Length < 4) return null;
 
-        // Zstd magic: 0xFD2FB528 little-endian → bytes 28 B5 2F FD
+        // Zstd magic: 0xFD2FB528 little-endian -> bytes 28 B5 2F FD
         if (raw[0] == 0x28 && raw[1] == 0xB5 && raw[2] == 0x2F && raw[3] == 0xFD)
         {
             try

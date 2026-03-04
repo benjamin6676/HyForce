@@ -2,9 +2,9 @@
 // Parses decrypted Hytale QUIC packet payloads.
 //
 // Hytale wire format (post-QUIC decrypt):
-//   [4B LE uint32 — payload length]
-//   [4B LE uint32 — packet ID / opcode]
-//   [...payload — may be Zstd-compressed]
+//   [4B LE uint32 -- payload length]
+//   [4B LE uint32 -- packet ID / opcode]
+//   [...payload -- may be Zstd-compressed]
 //
 // This parser:
 //   1. Strips the 8-byte header and (optionally) decompresses the payload.
@@ -19,7 +19,7 @@ namespace HyForce.Protocol;
 
 public static class WireFormatParser
 {
-    // ── Public entry point ────────────────────────────────────────────────
+    // -- Public entry point ------------------------------------------------
 
     /// <summary>Parse a raw decrypted byte array from QUIC into a structured packet.</summary>
     public static ParsedHytalePacket? Parse(byte[] decrypted)
@@ -69,10 +69,10 @@ public static class WireFormatParser
         }
     }
 
-    // ── Field auto-detection ──────────────────────────────────────────────
+    // -- Field auto-detection ----------------------------------------------
 
     /// <summary>
-    /// Heuristic scan of payload bytes — detect floats, ints, strings, pointers.
+    /// Heuristic scan of payload bytes -- detect floats, ints, strings, pointers.
     /// Returns up to 64 high-confidence fields.
     /// </summary>
     public static List<Data.ParsedField> DetectFields(byte[] data)
@@ -83,7 +83,7 @@ public static class WireFormatParser
         int i = 0;
         while (i < data.Length - 3 && results.Count < 64)
         {
-            // ── Vec3 detection: 3 plausible floats in a row ───────────────
+            // -- Vec3 detection: 3 plausible floats in a row ---------------
             if (i + 11 < data.Length)
             {
                 float fx = BitConverter.ToSingle(data, i);
@@ -93,7 +93,7 @@ public static class WireFormatParser
                 if (IsPlausibleFloat(fx) && IsPlausibleFloat(fy) && IsPlausibleFloat(fz) &&
                     !IsAllZero(data, i, 12))
                 {
-                    // Distinguish position (large range) from rotation (−π to π)
+                    // Distinguish position (large range) from rotation (-pi to pi)
                     bool isRot = Math.Abs(fx) <= 7f && Math.Abs(fy) <= 7f && Math.Abs(fz) <= 7f;
                     results.Add(new Data.ParsedField
                     {
@@ -110,7 +110,7 @@ public static class WireFormatParser
                 }
             }
 
-            // ── Float detection ───────────────────────────────────────────
+            // -- Float detection -------------------------------------------
             if (i + 3 < data.Length)
             {
                 float f = BitConverter.ToSingle(data, i);
@@ -132,7 +132,7 @@ public static class WireFormatParser
                 }
             }
 
-            // ── Length-prefixed UTF-8 string (2B prefix) ──────────────────
+            // -- Length-prefixed UTF-8 string (2B prefix) ------------------
             if (i + 3 < data.Length)
             {
                 ushort strLen = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(i));
@@ -158,7 +158,7 @@ public static class WireFormatParser
                 }
             }
 
-            // ── Int32 detection ────────────────────────────────────────────
+            // -- Int32 detection --------------------------------------------
             if (i + 3 < data.Length)
             {
                 int iv = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(i));
@@ -179,7 +179,7 @@ public static class WireFormatParser
                 }
             }
 
-            // ── 8-byte pointer (JVM compressed OOP range) ─────────────────
+            // -- 8-byte pointer (JVM compressed OOP range) -----------------
             if (i + 7 < data.Length)
             {
                 long ptr = BitConverter.ToInt64(data, i);
@@ -203,11 +203,11 @@ public static class WireFormatParser
             i++;
         }
 
-        // Deduplicate overlapping ranges — keep higher-confidence entry
+        // Deduplicate overlapping ranges -- keep higher-confidence entry
         return DeduplicateFields(results);
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────
+    // -- Helpers ------------------------------------------------------------
 
     private static bool IsPlausibleFloat(float f) =>
         !float.IsNaN(f) && !float.IsInfinity(f) &&
@@ -259,7 +259,7 @@ public static class WireFormatParser
     }
 }
 
-// ── Return type ──────────────────────────────────────────────────────────────
+// -- Return type --------------------------------------------------------------
 public class ParsedHytalePacket
 {
     public uint   PacketId      { get; init; }
@@ -271,6 +271,6 @@ public class ParsedHytalePacket
 
     public string PacketIdHex   => $"0x{PacketId:X8}";
     public string SizeStr       => WasCompressed
-        ? $"{RawPayload.Length}B → {Payload.Length}B (Zstd)"
+        ? $"{RawPayload.Length}B -> {Payload.Length}B (Zstd)"
         : $"{Payload.Length}B";
 }

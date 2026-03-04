@@ -3,25 +3,25 @@
 // Automated LocalPlayer structure discovery for Hytale (JVM process).
 //
 // HOW IT WORKS
-// ─────────────────────────────────────────────────────────
+// ---------------------------------------------------------
 // Hytale runs on HotSpot JVM. The LocalPlayer object lives on the Java heap.
 // We can't use a static offset from a module base (there is no native .exe
 // with a predictable data section). Instead we use three complementary strategies:
 //
-// Strategy A — String Anchor (most reliable across updates)
+// Strategy A -- String Anchor (most reliable across updates)
 //   Scan heap for UTF-16LE class strings like "PlayerChannelHandler",
 //   "HytaleProtocol", "LocalPlayer". A Java class object always has a
 //   reference back to its instances. We walk nearby pointers to find the
 //   live player object.
 //
-// Strategy B — Field Pattern Heuristics
+// Strategy B -- Field Pattern Heuristics
 //   Scan for regions that contain a Vec3 (3 consecutive plausible floats)
 //   followed closely by another float in [0, 40] (health) and at least one
 //   valid heap pointer (inventory). Score each candidate and keep the best.
 //
-// Strategy C — Netty Pipeline Walk
+// Strategy C -- Netty Pipeline Walk
 //   Hytale uses Netty QUIC. PlayerChannelHandler is always reachable from
-//   the pipeline. Walk: pipeline → context → handler → player field.
+//   the pipeline. Walk: pipeline -> context -> handler -> player field.
 //   This is the most stable chain because Netty's object layout changes
 //   independently from game updates.
 //
@@ -39,9 +39,9 @@ using HyForce.Memory;
 
 namespace HyForce.Memory;
 
-// ════════════════════════════════════════════════════════════════════════════
-// PUBLIC DATA MODEL — LocalPlayerState
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// PUBLIC DATA MODEL -- LocalPlayerState
+// ============================================================================
 
 public class LocalPlayerState
 {
@@ -72,9 +72,9 @@ public class LocalPlayerState
     public string  AddrHex   => $"0x{(ulong)BaseAddress:X16}";
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // DISCOVERY ENGINE
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 public sealed class LocalPlayerDiscovery
 {
@@ -83,7 +83,7 @@ public sealed class LocalPlayerDiscovery
     private readonly StructureValidator _validator;
     private readonly MemoryLogger      _log;
 
-    // ── Hytale-specific signatures ────────────────────────────────────────
+    // -- Hytale-specific signatures ----------------------------------------
     // These are designed to survive minor updates:
     //   - We anchor on STRING CONTENT, not code offsets.
     //   - Wildcards absorb pointer-size differences and padding bytes.
@@ -100,7 +100,7 @@ public sealed class LocalPlayerDiscovery
     };
 
     // Native-style byte patterns (used if JVM heap walk succeeds and Hytale
-    // ever exposes a native PlayerManager via JNI — unlikely but future-proof)
+    // ever exposes a native PlayerManager via JNI -- unlikely but future-proof)
     private static readonly Signature[] NativePatterns =
     {
         // Float 1.0 sentinel at start of many Hytale health structs
@@ -123,7 +123,7 @@ public sealed class LocalPlayerDiscovery
         _log       = log;
     }
 
-    // ── Main discovery entry point ─────────────────────────────────────────
+    // -- Main discovery entry point -----------------------------------------
 
     /// <summary>
     /// Run all discovery strategies and return the best candidate,
@@ -131,10 +131,10 @@ public sealed class LocalPlayerDiscovery
     /// </summary>
     public LocalPlayerState? Discover()
     {
-        _log.Info("[DISCOVERY] Starting LocalPlayer scan…");
+        _log.Info("[DISCOVERY] Starting LocalPlayer scan...");
         var candidates = new List<(IntPtr addr, double score, string strategy)>();
 
-        // Strategy A: string anchor → pointer walk
+        // Strategy A: string anchor -> pointer walk
         var stringCandidates = StrategyA_StringAnchor();
         candidates.AddRange(stringCandidates);
 
@@ -170,7 +170,7 @@ public sealed class LocalPlayerDiscovery
         return state;
     }
 
-    // ── Strategy A: String anchor + nearby pointer search ─────────────────
+    // -- Strategy A: String anchor + nearby pointer search -----------------
 
     private List<(IntPtr, double, string)> StrategyA_StringAnchor()
     {
@@ -185,7 +185,7 @@ public sealed class LocalPlayerDiscovery
 
             foreach (var hit in hits)
             {
-                // Scan ±512 bytes around the string for valid heap pointers
+                // Scan +/-512 bytes around the string for valid heap pointers
                 // that might be 'this' references pointing to a larger object
                 var candidates = FindNearbyObjectPointers(hit.MatchAddress, radius: 512);
                 foreach (var (ptr, score) in candidates)
@@ -199,7 +199,7 @@ public sealed class LocalPlayerDiscovery
         return results;
     }
 
-    // ── Strategy B: Field pattern heuristics ──────────────────────────────
+    // -- Strategy B: Field pattern heuristics ------------------------------
 
     private List<(IntPtr, double, string)> StrategyB_FieldPatterns()
     {
@@ -208,7 +208,7 @@ public sealed class LocalPlayerDiscovery
 
         foreach (var hit in regions)
         {
-            // Assume match is inside the player struct — back up to start
+            // Assume match is inside the player struct -- back up to start
             for (int backtrack = 0; backtrack <= 128; backtrack += 4)
             {
                 var candidate = hit.MatchAddress - backtrack;
@@ -222,7 +222,7 @@ public sealed class LocalPlayerDiscovery
         return results;
     }
 
-    // ── Strategy C: Native AOB patterns ───────────────────────────────────
+    // -- Strategy C: Native AOB patterns -----------------------------------
 
     private List<(IntPtr, double, string)> StrategyC_NativePatterns()
     {
@@ -242,7 +242,7 @@ public sealed class LocalPlayerDiscovery
         return results;
     }
 
-    // ── Pointer search within a radius ────────────────────────────────────
+    // -- Pointer search within a radius ------------------------------------
 
     private List<(IntPtr ptr, double score)> FindNearbyObjectPointers(IntPtr anchor, int radius)
     {
@@ -264,7 +264,7 @@ public sealed class LocalPlayerDiscovery
         return results;
     }
 
-    // ── Candidate validation ───────────────────────────────────────────────
+    // -- Candidate validation -----------------------------------------------
 
     public bool ValidatePlayerCandidate(IntPtr addr)
     {
@@ -308,7 +308,7 @@ public sealed class LocalPlayerDiscovery
             }
         }
 
-        // Pointer bonus (inventory, name…)
+        // Pointer bonus (inventory, name...)
         for (int i = 16; i < Math.Min(data.Length - 7, 200); i += 8)
         {
             long raw = BitConverter.ToInt64(data, i);
@@ -319,11 +319,11 @@ public sealed class LocalPlayerDiscovery
         return Math.Min(score, 1.0);
     }
 
-    // ── Field extraction ───────────────────────────────────────────────────
+    // -- Field extraction ---------------------------------------------------
 
     /// <summary>
     /// Read all known fields from a validated LocalPlayer address.
-    /// Field offsets are heuristically discovered — auto-scan the first 256 bytes.
+    /// Field offsets are heuristically discovered -- auto-scan the first 256 bytes.
     /// </summary>
     public LocalPlayerState ExtractFields(IntPtr addr)
     {
@@ -376,7 +376,7 @@ public sealed class LocalPlayerDiscovery
             }
         }
 
-        // Scan for valid heap pointers (inventory, name…)
+        // Scan for valid heap pointers (inventory, name...)
         int ptrCount = 0;
         for (int i = 16; i < data.Length - 7; i += 8)
         {
@@ -400,12 +400,12 @@ public sealed class LocalPlayerDiscovery
         return state;
     }
 
-    // ── Java String read ──────────────────────────────────────────────────
+    // -- Java String read --------------------------------------------------
     // Java String object layout (HotSpot 64-bit, compressed OOPs):
     //   +0  : mark word (8B)
     //   +8  : klass ptr (4B compressed)
     //   +12 : hash (4B int)
-    //   +16 : value (4B compressed oop → char[] or byte[])
+    //   +16 : value (4B compressed oop -> char[] or byte[])
     //   +20 : coder (1B: 0=LATIN1, 1=UTF16)
 
     private string TryReadJavaString(IntPtr strObjPtr)
@@ -440,9 +440,9 @@ public sealed class LocalPlayerDiscovery
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// LIVE MONITOR — updates LocalPlayerState every N ms
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// LIVE MONITOR -- updates LocalPlayerState every N ms
+// ============================================================================
 
 public sealed class LocalPlayerMonitor : IDisposable
 {
@@ -485,7 +485,7 @@ public sealed class LocalPlayerMonitor : IDisposable
     private async Task MonitorLoop(int refreshMs, CancellationToken ct)
     {
         // Initial discovery
-        StatusText = "Discovering…";
+        StatusText = "Discovering...";
         State = _discovery.Discover();
 
         if (State == null)
@@ -511,7 +511,7 @@ public sealed class LocalPlayerMonitor : IDisposable
                 continue;
             }
 
-            // Live field refresh (only position, rotation, health — not discovery)
+            // Live field refresh (only position, rotation, health -- not discovery)
             RefreshLiveFields(State);
             OnStateUpdated?.Invoke(State);
         }
@@ -522,7 +522,7 @@ public sealed class LocalPlayerMonitor : IDisposable
         var data = _scanner.ReadBytes(state.BaseAddress, 256);
         if (data == null) { state.IsValid = false; return; }
 
-        // Re-scan for position (quick — just try last known offsets first, then full scan)
+        // Re-scan for position (quick -- just try last known offsets first, then full scan)
         // We store the offset in the state on first discovery (not shown here for brevity;
         // in practice cache the offsets from ExtractFields).
         var updated = _discovery.ExtractFields(state.BaseAddress);

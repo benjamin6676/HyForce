@@ -1,4 +1,4 @@
-﻿namespace HyForce.Core;
+namespace HyForce.Core;
 
 public static class Constants
 {

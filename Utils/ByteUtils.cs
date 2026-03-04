@@ -1,4 +1,4 @@
-﻿namespace HyForce.Utils;
+namespace HyForce.Utils;
 
 public static class ByteUtils
 {

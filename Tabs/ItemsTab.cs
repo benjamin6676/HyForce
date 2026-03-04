@@ -1,4 +1,4 @@
-﻿// FILE: Tabs/ItemsTab.cs
+// FILE: Tabs/ItemsTab.cs
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
@@ -26,13 +26,13 @@ public class ItemsTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  ITEM DATABASE  —  Discovered Items & Registry");
+        ImGui.Text("  ITEM DATABASE  --  Discovered Items & Registry");
         ImGui.Separator();
         ImGui.Spacing();
 
         // Search bar
         ImGui.SetNextItemWidth(300);
-        ImGui.InputText("🔍 Search Items", ref _searchFilter, 256);
+        ImGui.InputText("? Search Items", ref _searchFilter, 256);
 
         ImGui.SameLine();
         if (ImGui.Button("Export Items", new Vector2(120, 0)))

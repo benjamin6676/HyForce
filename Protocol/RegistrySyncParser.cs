@@ -40,7 +40,7 @@ public static class RegistrySyncParser
             // FIX: Actually decompress instead of silently returning
             byte[] data = TryDecompress(raw, out bool wasCompressed);
             if (wasCompressed)
-                ParseLog[opcode] = $"Zstd decompressed: {raw.Length} → {data.Length} bytes";
+                ParseLog[opcode] = $"Zstd decompressed: {raw.Length} -> {data.Length} bytes";
 
             int entryCount = 0;
 

@@ -1,4 +1,4 @@
-﻿using HyForce.Protocol;
+using HyForce.Protocol;
 
 namespace HyForce.Networking;
 
@@ -16,6 +16,6 @@ public class CapturedPacket
 
     // Parsed data
     public bool IsRegistrySync => IsTcp && Opcode is >= 0x18 and <= 0x3F;
-    public string DirectionStr => Direction == PacketDirection.ServerToClient ? "S→C" : "C→S";
+    public string DirectionStr => Direction == PacketDirection.ServerToClient ? "S->C" : "C->S";
     public string ProtocolStr => IsTcp ? "TCP" : "UDP";
 }

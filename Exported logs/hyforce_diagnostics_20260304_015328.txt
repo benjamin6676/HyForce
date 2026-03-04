@@ -1,0 +1,95 @@
++------------------------------------------------------------------------------+
+                    HYFORCE V22-ENHANCED - TCP+UDP MODE                        
++------------------------------------------------------------------------------+
+
+Generated: 2026-03-04 01:53:28
+Session Duration: 2m 59s
+
+-------------------------------------------------------------------------------
+                              SYSTEM INFORMATION                               
+-------------------------------------------------------------------------------
+OS: Microsoft Windows NT 10.0.19045.0
+.NET Version: 10.0.3
+Machine: DESKTOP-640UJ9D
+Processor Count: 12
+
+-------------------------------------------------------------------------------
+                                CONFIGURATION                                  
+-------------------------------------------------------------------------------
+Mode: TCP+UDP (Hytale Registry + Gameplay)
+Target: 51.195.60.80:5520
+UDP Listen: 0.0.0.0:5521
+TCP Listen: 0.0.0.0:5522
+Export Path: C:\\Users\\benja\\source\\repos\\HyForce\\Exported logs
+
+-------------------------------------------------------------------------------
+                                PROXY STATUS                                   
+-------------------------------------------------------------------------------
+UDP Proxy: RUNNING 
+  - Status: Active: 1 sessions
+  - Active Sessions: 1
+  - Total Clients: 1
+
+TCP Proxy: RUNNING 
+  - Status: Listening 0.0.0.0:5522 ? 51.195.60.80:5520
+  - Active Connections: 0
+  - Total Connections: 0
+
+-------------------------------------------------------------------------------
+                              TRAFFIC STATISTICS                               
+-------------------------------------------------------------------------------
+Total Packets: 24 676
+  TCP: 0 (0,00 B bytes) - Registry/Login
+  UDP: 24 676 (13,11 MB bytes) - Gameplay
+
+Bytes Total: 13,11 MB
+  Server->Client: 12,60 MB
+  Client->Server: 522,77 KB
+
+Unique Opcodes: 1
+
+-------------------------------------------------------------------------------
+                             DECRYPTION STATUS                                 
+-------------------------------------------------------------------------------
+Keys Available: 0
+Successful Decryptions: 0
+Failed Decryptions: 12627
+
+-------------------------------------------------------------------------------
+                                TOP 20 OPCODES                                 
+-------------------------------------------------------------------------------
+  0xFFFF (S2C_0xFFFF          ):  24676 packets (100,0%)
+
+-------------------------------------------------------------------------------
+                               PLAYER DATABASE                                 
+-------------------------------------------------------------------------------
+Unique Items: 0
+Unique Players: 25 918
+
+-------------------------------------------------------------------------------
+                               SECURITY EVENTS                                 
+-------------------------------------------------------------------------------
+Total Events: 0
+By Category: 
+
+--- Recent Events (Last 20) ---
+
+-------------------------------------------------------------------------------
+                                IN-GAME LOG                                    
+-------------------------------------------------------------------------------
+[01:48:40] [CONFIG] Selected preset: HyTown (51.195.60.80:5520)
+[01:48:50] [KEYLOG] Cleared: sslkeys.log
+[01:48:50] [KEYLOG] Cleared: sslkeys.log
+[01:50:24] [SESSION] === Starting Fresh Session ===
+[01:50:24] [KEYLOG] Cleared: sslkeys.log
+[01:50:24] [KEYLOG] Cleared: sslkeys.log
+[01:50:24] [KEYLOG] Cleared: sslkeys.log
+[01:50:29] [SESSION] Fresh key log: sslkeys_session_20260304_015024.log
+[01:50:29] [KEYS] Watching session file for new keys
+[01:50:29] [SESSION] >>> START HYTALE NOW <<<
+[01:50:29] [SESSION] Keys will be filtered for QUIC/Hytale only
+[01:50:29] [AUTO-COPY] 127.0.0.1:5521 copied to clipboard!
+
+-------------------------------------------------------------------------------
+                           END OF DIAGNOSTICS REPORT                           
+-------------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using Veldrid;
 using ImGuiNET;
@@ -62,6 +62,12 @@ public class ImGuiController : IDisposable
         platformIO.Platform_GetClipboardTextFn = Marshal.GetFunctionPointerForDelegate(_getClipboardDelegate);
 
         CreateDeviceResources(gd, outputDescription);
+
+        // ── Font scale: makes all text significantly larger and more readable ──
+        // The default ImGui font is 13px bitmap; 1.5x scale gives ~20px effective size
+        var io2 = ImGui.GetIO();
+        io2.FontGlobalScale = 1.5f;
+
         SetPerFrameImGuiData(1f / 60f);
         ImGui.NewFrame();
         _frameBegun = true;

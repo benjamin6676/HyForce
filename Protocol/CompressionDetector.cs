@@ -1,4 +1,4 @@
-﻿namespace HyForce.Protocol;
+namespace HyForce.Protocol;
 
 public static class CompressionDetector
 {

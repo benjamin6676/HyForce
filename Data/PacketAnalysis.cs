@@ -1,4 +1,4 @@
-﻿// FILE: Data/PacketAnalysis.cs
+// FILE: Data/PacketAnalysis.cs
 using System.Collections.Generic;
 
 namespace HyForce.Data;

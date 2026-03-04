@@ -8,16 +8,16 @@ using System.Text;
 
 namespace HyForce.Memory;
 
-// ════════════════════════════════════════════════════════════════════════════
-// MEMORY FIELD — the core UI data-binding primitive
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// MEMORY FIELD -- the core UI data-binding primitive
+// ============================================================================
 //
 // Design:
-//   • Each MemoryField owns its address, type, and value history.
-//   • Refresh() reads memory once and records the diff.
-//   • The UI reads `DisplayValue`, `Changed`, and `RawBytes` — it never
+//   * Each MemoryField owns its address, type, and value history.
+//   * Refresh() reads memory once and records the diff.
+//   * The UI reads `DisplayValue`, `Changed`, and `RawBytes` -- it never
 //     touches Win32 directly.
-//   • Throttling: a shared MemoryFieldBatch calls Refresh() at most
+//   * Throttling: a shared MemoryFieldBatch calls Refresh() at most
 //     `RefreshHz` times per second for its entire field list.
 //
 // Why a class, not a struct?
@@ -26,7 +26,7 @@ namespace HyForce.Memory;
 
 public sealed class MemoryField
 {
-    // ── Identity ──────────────────────────────────────────────────────────
+    // -- Identity ----------------------------------------------------------
     public string   Name         { get; set; } = "";
     public IntPtr   Address      { get; set; }
     public int      Size         { get; set; }       // bytes to read
@@ -34,19 +34,19 @@ public sealed class MemoryField
     public string   Group        { get; set; } = ""; // for collapsing in UI
     public bool     IsBookmarked { get; set; }
 
-    // ── Current value ─────────────────────────────────────────────────────
+    // -- Current value -----------------------------------------------------
     public byte[]   RawBytes     { get; private set; } = Array.Empty<byte>();
     public byte[]   PrevBytes    { get; private set; } = Array.Empty<byte>();
     public bool     Changed      { get; private set; }
     public DateTime LastChanged  { get; private set; }
     public double   Confidence   { get; set; } = 1.0;
 
-    // ── Interpreted display ───────────────────────────────────────────────
+    // -- Interpreted display -----------------------------------------------
     public string DisplayValue
     {
         get
         {
-            if (RawBytes.Length == 0) return "—";
+            if (RawBytes.Length == 0) return "--";
             try
             {
                 return Kind switch
@@ -72,11 +72,11 @@ public sealed class MemoryField
         RawBytes.Length == 0 ? ""
         : BitConverter.ToString(RawBytes.Take(16).ToArray()).Replace("-", " ");
 
-    // ── Child fields (for pointer expansion in UI) ─────────────────────────
+    // -- Child fields (for pointer expansion in UI) -------------------------
     public List<MemoryField> Children { get; } = new();
     public bool IsExpanded { get; set; }
 
-    // ── Refresh ───────────────────────────────────────────────────────────
+    // -- Refresh -----------------------------------------------------------
 
     /// <summary>
     /// Read current bytes from <paramref name="scanner"/>.
@@ -100,7 +100,7 @@ public sealed class MemoryField
         return Changed;
     }
 
-    // ── Child pointer expansion ────────────────────────────────────────────
+    // -- Child pointer expansion --------------------------------------------
 
     /// <summary>
     /// If this field is a Pointer kind, expand it by reading <paramref name="childCount"/>
@@ -128,7 +128,7 @@ public sealed class MemoryField
         }
     }
 
-    // ── Factory helpers ───────────────────────────────────────────────────
+    // -- Factory helpers ---------------------------------------------------
 
     public static MemoryField Float(string name, IntPtr addr)     => new() { Name = name, Address = addr, Size = 4,  Kind = FieldKind.Float };
     public static MemoryField Vec3(string name, IntPtr addr)      => new() { Name = name, Address = addr, Size = 12, Kind = FieldKind.Vec3 };
@@ -137,7 +137,7 @@ public sealed class MemoryField
     public static MemoryField Bool8(string name, IntPtr addr)     => new() { Name = name, Address = addr, Size = 1,  Kind = FieldKind.Bool };
     public static MemoryField Bytes(string name, IntPtr addr, int size) => new() { Name = name, Address = addr, Size = size, Kind = FieldKind.Bytes };
 
-    // ── Private helpers ───────────────────────────────────────────────────
+    // -- Private helpers ---------------------------------------------------
 
     private string FormatVec3()
     {
@@ -162,16 +162,16 @@ public sealed class MemoryField
     }
 }
 
-// ── Field kinds ──────────────────────────────────────────────────────────────
+// -- Field kinds --------------------------------------------------------------
 public enum FieldKind
 {
     Unknown, Float, Vec3, Int32, UInt32, Int64, UInt64,
     Bool, Pointer, String8, String16, Bytes
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// MEMORY FIELD BATCH — throttled group refresh
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// MEMORY FIELD BATCH -- throttled group refresh
+// ============================================================================
 
 public sealed class MemoryFieldBatch
 {
@@ -226,20 +226,20 @@ public sealed class MemoryFieldBatch
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// ENTITY SCANNER — finds entity arrays / ECS tables / pointer lists
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// ENTITY SCANNER -- finds entity arrays / ECS tables / pointer lists
+// ============================================================================
 //
 // Entity structure heuristics:
 //   1. POINTER ARRAY:    N consecutive 8-byte values all passing IsValidHeapPointer.
-//                        N ≥ 8 is a strong signal. Each pointed-to object should
+//                        N >= 8 is a strong signal. Each pointed-to object should
 //                        pass JVM header validation.
 //   2. ECS COMPONENT TABLE: A region starting with a 4-byte int (count), followed
 //                        by count * stride bytes where every stride-th slot
 //                        has a valid pointer.
 //   3. REPEATED STRUCT: A run of identical-sized blocks where block[0] and block[1]
 //                        have the same non-zero bytes at the same sub-offsets.
-//   4. ID TABLE:         Dense int32 sequence [0, 1, 2, … N-1] followed by N pointers.
+//   4. ID TABLE:         Dense int32 sequence [0, 1, 2, ... N-1] followed by N pointers.
 
 public sealed class EntityScanner
 {
@@ -254,12 +254,12 @@ public sealed class EntityScanner
         _log       = log;
     }
 
-    // ── Main scan ─────────────────────────────────────────────────────────
+    // -- Main scan ---------------------------------------------------------
 
     public List<EntityRegionCandidate> Scan(int maxRegions = 200)
     {
         var results = new List<EntityRegionCandidate>();
-        _log.Info($"[ENTITY] Starting entity structure scan…");
+        _log.Info($"[ENTITY] Starting entity structure scan...");
 
         // We do the actual region enumeration via a raw scan of
         // "regions containing many valid pointers".
@@ -290,13 +290,13 @@ public sealed class EntityScanner
         return results;
     }
 
-    // ── Pointer array finder ──────────────────────────────────────────────
+    // -- Pointer array finder ----------------------------------------------
 
     private List<(IntPtr baseAddr, int length, byte[] data)> FindPointerArrays(int maxCandidates)
     {
         var results = new List<(IntPtr, int, byte[])>();
 
-        // We can't enumerate regions directly here without the handle — so we use
+        // We can't enumerate regions directly here without the handle -- so we use
         // the scanner's ReadBytes in 1MB blocks across the expected heap range.
         // In practice a JVM heap lives between ~0x0000_0001_0000_0000 and ~0x0000_0010_0000_0000.
         long start   = 0x100000000;
@@ -308,7 +308,7 @@ public sealed class EntityScanner
             var data = _scanner.ReadBytes((IntPtr)addr, chunkSz);
             if (data == null) continue;
 
-            // Find runs of ≥ 8 valid pointers
+            // Find runs of >= 8 valid pointers
             int runStart = -1, runLen = 0;
             for (int i = 0; i <= data.Length - 8; i += 8)
             {
@@ -335,7 +335,7 @@ public sealed class EntityScanner
         return results;
     }
 
-    // ── Candidate analysis ────────────────────────────────────────────────
+    // -- Candidate analysis ------------------------------------------------
 
     private EntityRegionCandidate AnalyzeCandidate((IntPtr addr, int ptrCount, byte[] data) ca)
     {
@@ -389,7 +389,7 @@ public sealed class EntityScanner
     }
 }
 
-// ── Entity candidate result ───────────────────────────────────────────────────
+// -- Entity candidate result ---------------------------------------------------
 public sealed class EntityRegionCandidate
 {
     public IntPtr          BaseAddress       { get; set; }

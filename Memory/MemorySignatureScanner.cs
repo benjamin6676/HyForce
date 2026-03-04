@@ -3,19 +3,19 @@
 // Core memory analysis engine for HyForce.
 //
 // Components in this file:
-//   • Signature          — byte pattern with wildcards
-//   • SignatureScanner   — multi-region parallel pattern scan
-//   • PointerWalker      — validated multi-level pointer chain traversal
-//   • StructureValidator — heuristic object layout checks
-//   • MemoryRegionCache  — cached readable-region enumeration
+//   * Signature          -- byte pattern with wildcards
+//   * SignatureScanner   -- multi-region parallel pattern scan
+//   * PointerWalker      -- validated multi-level pointer chain traversal
+//   * StructureValidator -- heuristic object layout checks
+//   * MemoryRegionCache  -- cached readable-region enumeration
 //
 // Design notes:
 //   Hytale is a 64-bit JVM process (HotSpot/OpenJDK).
-//   – Object header:  8 bytes (mark word) + 4 bytes (compressed klass ptr)
-//     padded to 16 bytes → first real field at offset 16.
-//   – References (OOPs): 4 bytes with UseCompressedOops (default), or 8 bytes.
-//   – Floats/ints:    4 bytes, doubles: 8 bytes.
-//   – Java String:    char[] (UTF-16LE), length as int32 at char[]-8.
+//   - Object header:  8 bytes (mark word) + 4 bytes (compressed klass ptr)
+//     padded to 16 bytes -> first real field at offset 16.
+//   - References (OOPs): 4 bytes with UseCompressedOops (default), or 8 bytes.
+//   - Floats/ints:    4 bytes, doubles: 8 bytes.
+//   - Java String:    char[] (UTF-16LE), length as int32 at char[]-8.
 //
 // Usage (from MemoryAnalysisTab or anywhere else):
 //   var scanner = new SignatureScanner(processHandle, log);
@@ -27,9 +27,9 @@ using System.Runtime.InteropServices;
 
 namespace HyForce.Memory;
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // 1.  SIGNATURE DEFINITION
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 /// <summary>
 /// A byte-pattern + wildcard definition.
@@ -45,7 +45,7 @@ public sealed class Signature
     public int       DerefSize      { get; init; } = 8;
     public string    Description    { get; init; } = "";
 
-    // ── Factories ────────────────────────────────────────────────────────
+    // -- Factories --------------------------------------------------------
 
     /// <summary>
     /// Parse an IDA-style AOB string:
@@ -77,9 +77,9 @@ public sealed class Signature
         FromBytes(System.Text.Encoding.UTF8.GetBytes(text), name);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // 2.  SCAN RESULT
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 public sealed class ScanResult
 {
@@ -92,12 +92,12 @@ public sealed class ScanResult
 
     public string AddressHex => $"0x{(ulong)ResultAddress:X16}";
     public override string ToString() =>
-        $"[{SignatureName}] match@0x{(ulong)MatchAddress:X} → result@0x{(ulong)ResultAddress:X} conf={Confidence:F2}";
+        $"[{SignatureName}] match@0x{(ulong)MatchAddress:X} -> result@0x{(ulong)ResultAddress:X} conf={Confidence:F2}";
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // 3.  SIGNATURE SCANNER
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 public sealed class SignatureScanner
 {
@@ -130,7 +130,7 @@ public sealed class SignatureScanner
         _log    = log;
     }
 
-    // ── Public API ────────────────────────────────────────────────────────
+    // -- Public API --------------------------------------------------------
 
     public List<ScanResult> Scan(Signature sig, int maxResults = MAX_RESULTS) =>
         Scan(new[] { sig }, maxResults);
@@ -180,7 +180,7 @@ public sealed class SignatureScanner
     public ScanResult? ScanFirst(string aob, string name, int offset = 0, bool deref = false) =>
         Scan(Signature.FromAob(aob, name, offset, deref), 1).FirstOrDefault();
 
-    // ── Read helpers ──────────────────────────────────────────────────────
+    // -- Read helpers ------------------------------------------------------
 
     public byte[]? ReadBytes(IntPtr address, int count)
     {
@@ -203,7 +203,7 @@ public sealed class SignatureScanner
         return v.HasValue ? (IntPtr)v.Value : IntPtr.Zero;
     }
 
-    // ── Internal scan ─────────────────────────────────────────────────────
+    // -- Internal scan -----------------------------------------------------
 
     private List<ScanResult> ScanBuffer(byte[] buf, int len, IntPtr baseAddr, Signature sig)
     {
@@ -250,7 +250,7 @@ public sealed class SignatureScanner
         return true;
     }
 
-    // ── Region enumeration ────────────────────────────────────────────────
+    // -- Region enumeration ------------------------------------------------
 
     private List<MemoryRegion> GetCachedRegions()
     {
@@ -289,13 +289,13 @@ public sealed class SignatureScanner
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // 4.  POINTER WALKER
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 /// <summary>
 /// Walk a multi-level pointer chain with bounds checking at each step.
-/// Example: playerBase → +0x10 → +0x3C  reads *(*(base+0x10)+0x3C)
+/// Example: playerBase -> +0x10 -> +0x3C  reads *(*(base+0x10)+0x3C)
 /// </summary>
 public sealed class PointerWalker
 {
@@ -355,13 +355,13 @@ public sealed class PointerWalker
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // 5.  STRUCTURE VALIDATOR
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 /// <summary>
 /// Validates that a candidate address looks like a specific JVM object or structure.
-/// Each check returns a confidence score 0.0–1.0.
+/// Each check returns a confidence score 0.0-1.0.
 /// </summary>
 public sealed class StructureValidator
 {
@@ -369,13 +369,13 @@ public sealed class StructureValidator
 
     public StructureValidator(SignatureScanner scanner) { _scanner = scanner; }
 
-    // ── JVM object header validation ──────────────────────────────────────
+    // -- JVM object header validation --------------------------------------
 
     /// <summary>
     /// A valid JVM object header (HotSpot 64-bit) looks like:
-    ///   bytes 0–7   : mark word (often 0x0000000000000001 for unlocked objects)
-    ///   bytes 8–11  : compressed klass pointer — nonzero, points to metaspace
-    ///   bytes 12–15 : padding (may be 0 or first field)
+    ///   bytes 0-7   : mark word (often 0x0000000000000001 for unlocked objects)
+    ///   bytes 8-11  : compressed klass pointer -- nonzero, points to metaspace
+    ///   bytes 12-15 : padding (may be 0 or first field)
     /// Score approaches 1.0 as more checks pass.
     /// </summary>
     public double ValidateJvmObjectHeader(IntPtr addr)
@@ -397,7 +397,7 @@ public sealed class StructureValidator
         return Math.Min(score, 1.0);
     }
 
-    // ── Float-triple (Vec3) validation ───────────────────────────────────
+    // -- Float-triple (Vec3) validation -----------------------------------
 
     /// <summary>Three consecutive plausible floats that form a world coordinate.</summary>
     public double ValidateVec3(byte[] data, int offset)
@@ -415,22 +415,22 @@ public sealed class StructureValidator
         if (Math.Abs(x) < 100_000 && Math.Abs(y) < 10_000 && Math.Abs(z) < 100_000) score += 0.5;
         // At least one component is non-zero
         if (Math.Abs(x) > 0.01f || Math.Abs(y) > 0.01f || Math.Abs(z) > 0.01f) score += 0.3;
-        // Y is vertical in Hytale — unlikely to be 0 unless on exact ground
+        // Y is vertical in Hytale -- unlikely to be 0 unless on exact ground
         if (y != 0) score += 0.2;
 
         return score;
     }
 
-    // ── Health-like float ─────────────────────────────────────────────────
+    // -- Health-like float -------------------------------------------------
 
     public double ValidateHealthFloat(float value)
     {
         if (float.IsNaN(value) || float.IsInfinity(value)) return 0;
-        if (value < 0 || value > 40) return 0;        // Hytale heart system: 0–20 hearts
+        if (value < 0 || value > 40) return 0;        // Hytale heart system: 0-20 hearts
         return value > 0 && value <= 40 ? 0.8 : 0.3;
     }
 
-    // ── Pointer array (entity list) ───────────────────────────────────────
+    // -- Pointer array (entity list) ---------------------------------------
 
     /// <summary>
     /// A contiguous array of N valid heap pointers = likely entity/object list.
@@ -450,9 +450,9 @@ public sealed class StructureValidator
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // 6.  MEMORY REGION CACHE
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 public sealed class MemoryRegionCache
 {

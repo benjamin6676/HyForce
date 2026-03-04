@@ -26,7 +26,7 @@ public class ActionCorrelatorTab : ITab
     private List<CapturedAction> _capturedPackets = new();
     private List<CorrelatedOpcode> _correlatedOpcodes = new();
 
-    // FIX: Pre-capture ring buffer — keeps last 50 packets before action trigger
+    // FIX: Pre-capture ring buffer -- keeps last 50 packets before action trigger
     private readonly Queue<CapturedAction> _preBuffer = new();
     private const int PRE_BUFFER_CAPACITY = 50;
 
@@ -104,7 +104,7 @@ public class ActionCorrelatorTab : ITab
         ImGui.BulletText("Click 'Start Action Capture' below");
         ImGui.BulletText("3-second countdown will begin");
         ImGui.BulletText("Perform your action in-game (jump, attack, etc.)");
-        ImGui.BulletText("Tool captures packets ±3 seconds around action");
+        ImGui.BulletText("Tool captures packets +/-3 seconds around action");
         ImGui.BulletText("Analyzes timing to identify your specific packets");
 
         ImGui.Spacing();
@@ -374,7 +374,7 @@ public class ActionCorrelatorTab : ITab
         _state.AddInGameLog($"[ACTION] CAPTURING! Pre-buffered {_capturedPackets.Count} context packets. Perform your action now!");
     }
 
-    /// <summary>Called by GlobalHotkeys (F8) — triggers a 3-second capture immediately.</summary>
+    /// <summary>Called by GlobalHotkeys (F8) -- triggers a 3-second capture immediately.</summary>
     public void TriggerCapture()
     {
         if (_currentState != ActionState.Idle) return;

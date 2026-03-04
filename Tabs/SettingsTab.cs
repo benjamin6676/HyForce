@@ -1,4 +1,4 @@
-﻿using HyForce.Core;
+using HyForce.Core;
 using HyForce.UI;
 using ImGuiNET;
 
@@ -72,7 +72,7 @@ public class SettingsTab : ITab
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  SETTINGS  —  Configuration");
+        ImGui.Text("  SETTINGS  --  Configuration");
         ImGui.Separator();
         ImGui.Spacing();
 

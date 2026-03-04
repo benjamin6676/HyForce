@@ -1,4 +1,4 @@
-﻿namespace HyForce.Data;
+namespace HyForce.Data;
 
 public enum PacketCategory
 {

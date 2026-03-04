@@ -7,9 +7,9 @@ using System.Text;
 
 namespace HyForce.Memory;
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // 1.  STRUCTURED MEMORY LOGGER
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 public enum LogLevel { Debug, Info, Warn, Error }
 
@@ -96,9 +96,9 @@ public sealed class MemoryLogger
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // 2.  MEMORY REGION DUMPER
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
 public sealed class MemoryDumper
 {
@@ -111,7 +111,7 @@ public sealed class MemoryDumper
         _log     = log;
     }
 
-    // ── Formatted hex dump ────────────────────────────────────────────────
+    // -- Formatted hex dump ------------------------------------------------
 
     /// <summary>
     /// Read <paramref name="length"/> bytes from <paramref name="address"/> and
@@ -127,7 +127,7 @@ public sealed class MemoryDumper
         }
 
         var sb = new StringBuilder();
-        sb.AppendLine($"── Memory Dump: 0x{(ulong)address:X16} (+{length} bytes) ──");
+        sb.AppendLine($"-- Memory Dump: 0x{(ulong)address:X16} (+{length} bytes) --");
 
         for (int row = 0; row < data.Length; row += bytesPerRow)
         {
@@ -157,7 +157,7 @@ public sealed class MemoryDumper
         return sb.ToString();
     }
 
-    // ── Struct dump (4-byte grid with type guesses) ───────────────────────
+    // -- Struct dump (4-byte grid with type guesses) -----------------------
 
     public string StructDump(IntPtr address, int length = 256)
     {
@@ -165,9 +165,9 @@ public sealed class MemoryDumper
         if (data == null) return "<read failed>";
 
         var sb = new StringBuilder();
-        sb.AppendLine($"── Struct Dump: 0x{(ulong)address:X16} ──");
+        sb.AppendLine($"-- Struct Dump: 0x{(ulong)address:X16} --");
         sb.AppendLine($"{"Offset",-8} {"Hex",-12} {"Int32",-12} {"Float",-14} {"Pointer?",-20} {"Guess"}");
-        sb.AppendLine(new string('─', 80));
+        sb.AppendLine(new string('-', 80));
 
         for (int i = 0; i < data.Length - 3; i += 4)
         {
@@ -190,7 +190,7 @@ public sealed class MemoryDumper
         return sb.ToString();
     }
 
-    // ── Save dump to disk ─────────────────────────────────────────────────
+    // -- Save dump to disk -------------------------------------------------
 
     public void DumpToFile(IntPtr address, int length, string outputDir)
     {
@@ -215,9 +215,9 @@ public sealed class MemoryDumper
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// 3.  SNAPSHOT SYSTEM — compare memory states over time
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// 3.  SNAPSHOT SYSTEM -- compare memory states over time
+// ============================================================================
 
 public sealed class MemorySnapshot
 {
@@ -318,7 +318,7 @@ public sealed class SnapshotSystem
     public string FormatDiff(SnapshotDiff diff)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"── DIFF: '{diff.A.Name}' @ {diff.A.Timestamp:HH:mm:ss} vs '{diff.B.Name}' @ {diff.B.Timestamp:HH:mm:ss} ──");
+        sb.AppendLine($"-- DIFF: '{diff.A.Name}' @ {diff.A.Timestamp:HH:mm:ss} vs '{diff.B.Name}' @ {diff.B.Timestamp:HH:mm:ss} --");
         sb.AppendLine(diff.Summary);
         sb.AppendLine();
 
@@ -334,7 +334,7 @@ public sealed class SnapshotSystem
                 float fNew = BitConverter.ToSingle(r.NewData, 0);
                 float fOld = BitConverter.ToSingle(r.OldData, 0);
                 if (!float.IsNaN(fNew) && !float.IsNaN(fOld))
-                    sb.AppendLine($"  As Float: {fOld:F4} → {fNew:F4}  (Δ {fNew - fOld:+F4;-F4})");
+                    sb.AppendLine($"  As Float: {fOld:F4} -> {fNew:F4}  (D {fNew - fOld:+F4;-F4})");
             }
         }
         return sb.ToString();
@@ -358,9 +358,9 @@ public sealed class SnapshotSystem
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// 4.  POINTER GRAPH — visualize pointer chains in ImGui
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// 4.  POINTER GRAPH -- visualize pointer chains in ImGui
+// ============================================================================
 
 public sealed class PointerGraphNode
 {
@@ -430,7 +430,7 @@ public sealed class PointerGraph
                 var child = BuildNode(ptr, depth + 1, maxDepth, maxChildren, visited);
                 if (child != null)
                 {
-                    child.Label = $"+0x{i:X2} → 0x{(ulong)ptr:X}";
+                    child.Label = $"+0x{i:X2} -> 0x{(ulong)ptr:X}";
                     node.Children.Add(child);
                     childCount++;
                 }

@@ -1,4 +1,4 @@
-﻿using HyForce.Core;
+using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
 using System.Buffers.Binary;

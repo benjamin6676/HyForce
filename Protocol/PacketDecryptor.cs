@@ -1,4 +1,4 @@
-﻿// FILE: Protocol/PacketDecryptor.cs - FIXED: Proper async decryption without blocking UI
+// FILE: Protocol/PacketDecryptor.cs - FIXED: Proper async decryption without blocking UI
 using HyForce.Networking;
 using System.Collections.Concurrent;
 using System.Runtime.ExceptionServices;
@@ -156,6 +156,8 @@ public static class PacketDecryptor
 
     // This removes header protection according to RFC 9001 Section 5.4
     // This removes header protection according to RFC 9001 Section 5.4
+    // REPLACE the entire TryRemoveHeaderProtection method with this:
+
     private static bool TryRemoveHeaderProtection(byte[] packet, EncryptionKey key, out byte[] unprotectedHeader, out int pnOffset, out int pnLength)
     {
         unprotectedHeader = (byte[])packet.Clone();
@@ -167,132 +169,120 @@ public static class PacketDecryptor
 
         bool isLongHeader = (packet[0] & 0x80) != 0;
 
-        // Find the packet number offset
-        int sampleOffset;
+        // For Hytale/Netty: Try multiple approaches
+        int[] pnOffsetsToTry;
+
         if (isLongHeader)
         {
-            // Long header: pn_offset = 6 + dcid_len + scid_len + token_len_field + length_field + 4
-            // Simplified: estimate based on typical structure
-            int offset = 6; // flags(1) + version(4) + dcid_len(1)
-            if (offset >= packet.Length) return false;
-            byte dcidLen = packet[5];
-            offset += dcidLen + 1; // +1 for scid_len
-            if (offset >= packet.Length) return false;
-            byte scidLen = packet[offset - 1];
-            offset += scidLen;
-
-            // Skip token length (varint) and token if present
-            if (offset < packet.Length && (packet[0] & 0x30) == 0x00) // Initial packet type
-            {
-                // Token length varint
-                int tokenLen = packet[offset];
-                if ((tokenLen & 0x80) != 0)
-                {
-                    tokenLen = ((tokenLen & 0x7F) << 8) | packet[offset + 1];
-                    offset += 2;
-                }
-                else
-                {
-                    offset += 1;
-                }
-                offset += tokenLen;
-            }
-
-            // Skip length field (varint)
-            if (offset >= packet.Length) return false;
-            int lengthField = packet[offset];
-            if ((lengthField & 0x80) != 0)
-            {
-                offset += 2;
-            }
-            else
-            {
-                offset += 1;
-            }
-
-            pnOffset = offset;
-            sampleOffset = pnOffset + 4; // Sample starts 4 bytes after assumed PN start
+            // Long header: PN starts after version(4) + DCID len(1) + DCID + SCID len(1) + SCID
+            // But this varies by packet type - try common offsets
+            pnOffsetsToTry = new[] { 6, 7, 8, 10, 12, 14, 16, 18, 20, 22 };
         }
         else
         {
-            // Short header: pn_offset = 1 + dcid_len
-            // For 1-RTT packets, DCID length is typically 0 after handshake completes
-            // However, it could be up to 20 bytes. We need to try different lengths.
-            int dcidLen = 0; // Default assumption for 1-RTT
+            // Short header: PN starts after flags(1) + DCID
+            // Hytale often uses 0-length DCID in 1-RTT, so PN is at offset 1
+            // But try various DCID lengths
+            pnOffsetsToTry = new[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 21 };
+        }
 
-            // Try to infer DCID length from packet structure
-            // If packet is very short, DCID is likely 0
-            if (packet.Length < 10)
+        // Try each potential PN offset
+        foreach (int testPnOffset in pnOffsetsToTry)
+        {
+            if (testPnOffset >= packet.Length - 4) continue;
+
+            // Calculate sample offset (16 bytes after PN start, per RFC 9001)
+            int sampleOffset = testPnOffset + 4;
+            if (sampleOffset + 16 > packet.Length) continue;
+
+            // Extract sample
+            byte[] sample = new byte[16];
+            Buffer.BlockCopy(packet, sampleOffset, sample, 0, 16);
+
+            // Generate mask
+            byte[] mask;
+            try
             {
-                dcidLen = 0;
+                using (var aes = Aes.Create())
+                {
+                    aes.Key = key.HeaderProtectionKey;
+                    aes.Mode = CipherMode.ECB;
+                    aes.Padding = PaddingMode.None;
+
+                    using (var encryptor = aes.CreateEncryptor())
+                    {
+                        mask = encryptor.TransformFinalBlock(sample, 0, 16);
+                    }
+                }
+            }
+            catch { continue; }
+
+            // Apply mask to first byte
+            byte unprotectedFirstByte;
+            if (isLongHeader)
+                unprotectedFirstByte = (byte)(packet[0] ^ (mask[0] & 0x0F));
+            else
+                unprotectedFirstByte = (byte)(packet[0] ^ (mask[0] & 0x1F));
+
+            // Validate: reserved bits must be 0, version must be valid for long header
+            bool valid = true;
+            if (isLongHeader)
+            {
+                // Long header: bits 4-5 must be 0 for some versions, or check version field
+                if ((unprotectedFirstByte & 0x30) != 0 && (unprotectedFirstByte & 0x30) != 0x10)
+                    valid = false; // Allow some flexibility for different packet types
+
+                // Check version field if we have enough bytes
+                if (packet.Length >= 5)
+                {
+                    uint version = (uint)((packet[1] << 24) | (packet[2] << 16) | (packet[3] << 8) | packet[4]);
+                    // Version 0 or 0x00000001 are valid, or negotiation versions
+                    if (version != 0 && version != 1 && version != 0x51303530) // Q050 for gQUIC
+                        valid = false;
+                }
             }
             else
             {
-                // Check if this looks like a valid 1-RTT packet with 0-length DCID
-                // The spin bit and reserved bits should be 0 in most implementations
-                if ((packet[0] & 0x04) == 0) // Spin bit check
-                {
-                    dcidLen = 0;
-                }
+                // Short header: spin bit (bit 2) can be 0 or 1, reserved bits (3-4) must be 0
+                if ((unprotectedFirstByte & 0x18) != 0)
+                    valid = false;
             }
 
-            pnOffset = 1 + dcidLen;
-            sampleOffset = pnOffset + 4; // Sample starts 4 bytes after PN start
-        }
+            if (!valid) continue;
 
-        if (sampleOffset + 16 > packet.Length)
-            return false; // Not enough data for sample
+            // Get PN length from unprotected first byte
+            int testPnLength = (unprotectedFirstByte & 0x03) + 1;
+            if (testPnOffset + testPnLength > packet.Length) continue;
 
-        // Extract 16-byte sample from ciphertext
-        byte[] sample = new byte[16];
-        Buffer.BlockCopy(packet, sampleOffset, sample, 0, 16);
+            // Apply mask to PN bytes
+            Buffer.BlockCopy(packet, 0, unprotectedHeader, 0, packet.Length);
 
-        // Generate mask using AES-ECB
-        byte[] mask;
-        try
-        {
-            using (var aes = Aes.Create())
+            if (isLongHeader)
+                unprotectedHeader[0] = (byte)(packet[0] ^ (mask[0] & 0x0F));
+            else
+                unprotectedHeader[0] = (byte)(packet[0] ^ (mask[0] & 0x1F));
+
+            for (int i = 0; i < testPnLength && i < 4; i++)
             {
-                aes.Key = key.HeaderProtectionKey;
-                aes.Mode = CipherMode.ECB;
-                aes.Padding = PaddingMode.None;
-
-                using (var encryptor = aes.CreateEncryptor())
-                {
-                    mask = encryptor.TransformFinalBlock(sample, 0, 16);
-                }
+                unprotectedHeader[testPnOffset + i] = (byte)(packet[testPnOffset + i] ^ mask[1 + i]);
             }
-        }
-        catch
-        {
-            return false;
-        }
 
-        // Apply mask to header
-        if (isLongHeader)
-        {
-            // Long header: mask 4 bits of first byte
-            unprotectedHeader[0] ^= (byte)(mask[0] & 0x0F);
-        }
-        else
-        {
-            // Short header: mask 5 bits of first byte
-            unprotectedHeader[0] ^= (byte)(mask[0] & 0x1F);
+            // Validate PN is reasonable (not all 0xFF, not huge)
+            ulong pn = 0;
+            for (int i = 0; i < testPnLength; i++)
+            {
+                pn = (pn << 8) | unprotectedHeader[testPnOffset + i];
+            }
+
+            // Sanity check: PN should be reasonable
+            if (pn > 0xFFFFFF) continue; // Too large, probably wrong
+
+            pnOffset = testPnOffset;
+            pnLength = testPnLength;
+            return true;
         }
 
-        // Get actual packet number length from unmasked header
-        pnLength = (unprotectedHeader[0] & 0x03) + 1;
-
-        if (pnOffset + pnLength > packet.Length)
-            return false;
-
-        // Unmask packet number
-        for (int i = 0; i < pnLength; i++)
-        {
-            unprotectedHeader[pnOffset + i] ^= mask[1 + i];
-        }
-
-        return true;
+        return false;
     }
 
     // FIXED: Background worker that processes decrypt jobs without throwing
@@ -385,6 +375,16 @@ public static class PacketDecryptor
     /// CRITICAL FIX: TryDecrypt must actually wait for and return the result
     public static DecryptionResult TryDecrypt(byte[] encryptedData, int timeoutMs = 10000)
     {
+        // CRITICAL: Don't even try if we have no keys
+        if (DiscoveredKeys.Count == 0)
+        {
+            return new DecryptionResult
+            {
+                Success = false,
+                ErrorMessage = "No keys available"
+            };
+        }
+
         if (!AutoDecryptEnabled)
             return TryDecryptManual(encryptedData, timeoutMs);
 
@@ -725,6 +725,8 @@ public static class PacketDecryptor
         }
     }
     // NEW: Detailed brute force with logging
+    // REPLACE TryDecryptWithBruteForceDetailed with this:
+
     private static DecryptionResult TryDecryptWithBruteForceDetailed(byte[] packetData, EncryptionKey key, CancellationToken ct)
     {
         Console.WriteLine($"[DECRYPT-DEBUG] Brute force starting for key {key.Type}");
@@ -732,11 +734,13 @@ public static class PacketDecryptor
         bool isLongHeader = (packetData[0] & 0x80) != 0;
         Console.WriteLine($"[DECRYPT-DEBUG] IsLongHeader: {isLongHeader}");
 
-        // CRITICAL FIX: Expanded DCID lengths including odd sizes Netty might use
-        int[] dcidLengths = isLongHeader ? new[] { 0 } : new[] { 0, 4, 8, 12, 16, 20, 1, 2, 3, 5, 6, 7 };
+        // EXPANDED: More DCID lengths to try including common Netty values
+        int[] dcidLengths = isLongHeader
+            ? new[] { 0 }
+            : new[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20 };
 
         int attempts = 0;
-        int maxAttempts = 1000; // Limit to prevent infinite loops
+        int maxAttempts = 5000; // Increased from 1000
 
         foreach (int dcidLen in dcidLengths)
         {
@@ -761,8 +765,15 @@ public static class PacketDecryptor
                     basePN = (basePN << 8) | packetData[pnOffset + i];
                 }
 
-                // Try nearby packet numbers with expanded range
-                for (ulong pnDelta = 0; pnDelta < 50; pnDelta++) // Increased from 30
+                // EXPANDED: Try much larger range of packet numbers
+                // Hytale may have high packet numbers due to long sessions
+                ulong[] pnDeltas = new ulong[100];
+                for (int i = 0; i < 50; i++) pnDeltas[i] = (ulong)i; // 0-49
+                for (int i = 50; i < 70; i++) pnDeltas[i] = (ulong)(50 + (i - 50) * 5); // 50, 55, 60... 145
+                for (int i = 70; i < 85; i++) pnDeltas[i] = (ulong)(100 + (i - 70) * 10); // 100, 110... 240
+                for (int i = 85; i < 100; i++) pnDeltas[i] = (ulong)(250 + (i - 85) * 50); // 250, 300... 1000
+
+                foreach (ulong pnDelta in pnDeltas)
                 {
                     attempts++;
                     if (attempts > maxAttempts)
@@ -771,7 +782,7 @@ public static class PacketDecryptor
                         return new DecryptionResult { Success = false, ErrorMessage = $"Max attempts reached ({maxAttempts})" };
                     }
 
-                    // Try incrementing
+                    // Try incrementing from base
                     var result = TryDecryptAtPN(packetData, key, headerLen, pnLen, basePN + pnDelta, pnOffset, ct);
                     if (result.Success)
                     {
@@ -779,7 +790,7 @@ public static class PacketDecryptor
                         return result;
                     }
 
-                    // Try decrementing
+                    // Try decrementing (if not zero)
                     if (basePN >= pnDelta && pnDelta > 0)
                     {
                         result = TryDecryptAtPN(packetData, key, headerLen, pnLen, basePN - pnDelta, pnOffset, ct);
@@ -787,6 +798,21 @@ public static class PacketDecryptor
                         {
                             Console.WriteLine($"[DECRYPT-DEBUG] Brute force success after {attempts} attempts! PN={basePN - pnDelta}, dcidLen={dcidLen}, pnLen={pnLen}");
                             return result;
+                        }
+                    }
+
+                    // Also try common fixed values regardless of base
+                    ulong[] commonPNs = { 0, 1, 2, 3, 4, 5, 10, 20, 50, 100, 200, 500, 1000 };
+                    foreach (ulong commonPn in commonPNs)
+                    {
+                        if (commonPn != basePN + pnDelta && commonPn != basePN - pnDelta)
+                        {
+                            result = TryDecryptAtPN(packetData, key, headerLen, pnLen, commonPn, pnOffset, ct);
+                            if (result.Success)
+                            {
+                                Console.WriteLine($"[DECRYPT-DEBUG] Brute force success with common PN {commonPn}!");
+                                return result;
+                            }
                         }
                     }
                 }
@@ -946,6 +972,8 @@ public static class PacketDecryptor
         return new DecryptionResult { Success = false, ErrorMessage = "Brute force failed - tried all PN combinations" };
     }
 
+    // REPLACE TryDecryptAtPN with this corrected version:
+
     private static DecryptionResult TryDecryptAtPN(byte[] packetData, EncryptionKey key, int headerLen, int pnLen, ulong packetNumber, int pnOffset, CancellationToken ct)
     {
         try
@@ -953,23 +981,22 @@ public static class PacketDecryptor
             if (ct.IsCancellationRequested)
                 return new DecryptionResult { Success = false, ErrorMessage = "Cancelled" };
 
-            // CRITICAL FIX: Build header for AEAD correctly
-            // Header = flags byte (if short header) + DCID (if any) + packet number
-            byte[] header = new byte[headerLen + pnLen];
+            // Build header: everything from start through PN
+            int fullHeaderLen = pnOffset + pnLen;
+            byte[] header = new byte[fullHeaderLen];
+            Buffer.BlockCopy(packetData, 0, header, 0, fullHeaderLen);
 
-            // Copy flags and DCID if present
-            if (headerLen > 0)
-            {
-                Buffer.BlockCopy(packetData, 0, header, 0, headerLen);
-            }
+            // CRITICAL: For short headers, we need to reconstruct what the header SHOULD look like
+            // The original packet has encrypted PN bytes, but for AEAD we need the "true" header
+            // with the actual PN values (not the encrypted ones)
 
-            // Copy packet number bytes into header
+            // Replace PN bytes in header with actual packet number (big-endian for QUIC)
             for (int i = 0; i < pnLen; i++)
             {
-                header[headerLen + i] = packetData[pnOffset + i];
+                header[pnOffset + (pnLen - 1 - i)] = (byte)(packetNumber >> (i * 8));
             }
 
-            // Extract payload (everything after packet number, excluding auth tag)
+            // Extract ciphertext (everything after PN, excluding auth tag)
             int payloadOffset = pnOffset + pnLen;
             int payloadLen = packetData.Length - payloadOffset - 16; // 16 bytes for AES-GCM tag
 
@@ -982,10 +1009,10 @@ public static class PacketDecryptor
             byte[] tag = new byte[16];
             Buffer.BlockCopy(packetData, packetData.Length - 16, tag, 0, 16);
 
-            // Construct nonce
+            // Construct nonce using packet number
             byte[] nonce = ConstructQUICNonce(key.IV, packetNumber);
 
-            // Decrypt
+            // Attempt decryption
             try
             {
                 using var aes = new AesGcm(key.Key, 16);
@@ -1007,17 +1034,17 @@ public static class PacketDecryptor
                             ["header_type"] = (packetData[0] & 0x80) != 0 ? "long" : "short",
                             ["brute_force"] = true,
                             ["dcid_length"] = headerLen > 0 ? headerLen - 1 : 0,
-                            ["pn_length"] = pnLen
+                            ["pn_length"] = pnLen,
+                            ["header_bytes"] = BitConverter.ToString(header)
                         }
                     };
                 }
             }
             catch (CryptographicException)
             {
-                // Expected for wrong PN - ignore
+                // Expected for wrong PN - continue trying
             }
 
-            // Return failure
             return new DecryptionResult { Success = false, ErrorMessage = "Decryption failed" };
         }
         catch (Exception ex)
@@ -1263,24 +1290,20 @@ public static class PacketDecryptor
         return offset + 1;
     }
 
+    // REPLACE ConstructQUICNonce with this verified version:
+
     private static byte[] ConstructQUICNonce(byte[] iv, ulong packetNumber)
     {
-        byte[] nonce = new byte[12];
+        // RFC 9001: XOR the packet number (left-padded to IV length) with the IV
+        byte[] nonce = new byte[12]; // 96-bit nonce for AES-GCM
         Buffer.BlockCopy(iv, 0, nonce, 0, Math.Min(iv.Length, 12));
 
-        byte[] pnBytes = new byte[8];
-        pnBytes[0] = (byte)(packetNumber >> 56);
-        pnBytes[1] = (byte)(packetNumber >> 48);
-        pnBytes[2] = (byte)(packetNumber >> 40);
-        pnBytes[3] = (byte)(packetNumber >> 32);
-        pnBytes[4] = (byte)(packetNumber >> 24);
-        pnBytes[5] = (byte)(packetNumber >> 16);
-        pnBytes[6] = (byte)(packetNumber >> 8);
-        pnBytes[7] = (byte)(packetNumber);
-
+        // XOR packet number into last 8 bytes of nonce (big-endian)
+        // This matches how TLS 1.3 / QUIC construct the nonce
         for (int i = 0; i < 8; i++)
         {
-            nonce[4 + i] ^= pnBytes[i];
+            byte pnByte = (byte)(packetNumber >> (i * 8));
+            nonce[11 - i] ^= pnByte; // XOR from the end (little-endian PN to big-endian position)
         }
 
         return nonce;
@@ -1320,17 +1343,11 @@ public static class PacketDecryptor
             // For TLS_AES_128_GCM_SHA256: key=16, iv=12, hp=16
             // For TLS_AES_256_GCM_SHA384: key=32, iv=12, hp=32
 
-            int keyLen = 16;  // Default to AES-128
-            int hpLen = 16;
-
-            // If secret is 48 bytes, we might be using AES-256
-            if (secretLength >= 48)
-            {
-                keyLen = 32;
-                hpLen = 32;
-            }
-
-            Console.WriteLine($"[KEY-DERIVE] Using AES-{keyLen * 8} (keyLen={keyLen})");
+            // 32B secret = AES-128/SHA-256 (Hytale standard); 48B = AES-256
+            int keyLen = secretLength >= 48 ? 32 : 16;
+            int hpLen  = keyLen;
+            string cipher = keyLen == 16 ? "AES-128-GCM (Hytale)" : "AES-256-GCM";
+            Console.WriteLine($"[KEY-DERIVE] Using {cipher}");
 
             // CRITICAL FIX: Use correct RFC 9001 labels WITHOUT "tls13 " prefix
             key.Key = HkdfExpandLabelRFC9001(key.Secret, "quic key", keyLen);
@@ -1430,6 +1447,8 @@ public static class PacketDecryptor
         return entropy;
     }
 
+    // In PacketDecryptor.cs, REPLACE the AddKey method with this:
+
     public static void AddKey(EncryptionKey key)
     {
         if (key?.Key == null || key.Key.Length == 0) return;
@@ -1437,23 +1456,42 @@ public static class PacketDecryptor
         _keysLock.EnterWriteLock();
         try
         {
+            // Check for exact duplicate (same key bytes)
             foreach (var existing in _discoveredKeys)
             {
                 if (existing.Key.SequenceEqual(key.Key))
                 {
+                    // Just update source if different, don't add duplicate
                     if (!existing.Source.Contains(key.Source))
                         existing.Source += $", {key.Source}";
                     return;
                 }
             }
 
+            // Also check if we have a key with same secret (different derivation)
+            if (key.Secret != null)
+            {
+                foreach (var existing in _discoveredKeys)
+                {
+                    if (existing.Secret != null && existing.Secret.SequenceEqual(key.Secret))
+                    {
+                        // Same TLS secret, already derived
+                        return;
+                    }
+                }
+            }
+
+            // Limit total keys to prevent memory bloat
             if (_discoveredKeys.Count >= 20)
             {
+                // Remove least recently used (lowest UseCount)
                 var leastUsed = _discoveredKeys.OrderBy(k => k.UseCount).First();
                 _discoveredKeys.Remove(leastUsed);
+                Console.WriteLine($"[KEYS] Removed least used key to make room");
             }
 
             _discoveredKeys.Add(key);
+            Console.WriteLine($"[KEYS] Added new {key.Type} key ({key.Key.Length} bytes)");
         }
         finally
         {

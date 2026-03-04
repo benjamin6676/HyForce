@@ -1,4 +1,4 @@
-﻿// FILE: Protocol/EncryptionBypass.cs
+// FILE: Protocol/EncryptionBypass.cs
 using System.Security.Cryptography;
 
 namespace HyForce.Protocol;

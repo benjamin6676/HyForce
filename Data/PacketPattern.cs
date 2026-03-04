@@ -1,4 +1,4 @@
-﻿// FILE: Data/PacketPattern.cs
+// FILE: Data/PacketPattern.cs
 using HyForce.Networking;
 
 namespace HyForce.Data;

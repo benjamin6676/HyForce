@@ -1,4 +1,4 @@
-﻿using HyForce.Core;
+using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
@@ -205,9 +205,9 @@ public class DecryptionStatsWindow : ITab
         ImGui.Dummy(new Vector2(0, 110));
 
         // Legend
-        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1f), "■ Success");
+        ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1f), "[#] Success");
         ImGui.SameLine();
-        ImGui.TextColored(new Vector4(0.9f, 0.2f, 0.2f, 1f), "■ Failed");
+        ImGui.TextColored(new Vector4(0.9f, 0.2f, 0.2f, 1f), "[#] Failed");
     }
 
     private void RenderActivityLog(float width)

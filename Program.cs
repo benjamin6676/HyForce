@@ -1,4 +1,4 @@
-﻿using HyForce.App;
+using HyForce.App;
 using Veldrid;
 using Veldrid.Sdl2;
 using Veldrid.StartupUtilities;
@@ -9,10 +9,10 @@ class Program
 {
     static void Main(string[] args)
     {
-        Console.WriteLine("╔══════════════════════════════════════════════╗");
-        Console.WriteLine("║           HYFORCE V22-ENHANCED               ║");
-        Console.WriteLine("║      Hytale Security Analyzer Tool           ║");
-        Console.WriteLine("╚══════════════════════════════════════════════╝");
+        Console.WriteLine("+==============================================+");
+        Console.WriteLine("|           HYFORCE V22-ENHANCED               |");
+        Console.WriteLine("|      Hytale Security Analyzer Tool           |");
+        Console.WriteLine("+==============================================+");
         Console.WriteLine();
 
         WindowCreateInfo windowCI = new WindowCreateInfo

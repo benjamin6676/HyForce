@@ -1,4 +1,4 @@
-﻿namespace HyForce.Networking;
+namespace HyForce.Networking;
 
 public enum PacketDirection
 {

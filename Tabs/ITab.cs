@@ -1,4 +1,4 @@
-﻿namespace HyForce.Tabs;
+namespace HyForce.Tabs;
 
 public interface ITab
 {
