@@ -205,19 +205,26 @@ public sealed class MemoryFieldBatch
         if (!player.IsValid) return;
 
         IntPtr b = player.BaseAddress;
-        // We scan the first 256 bytes and create a field per 4-byte slot,
-        // then later Refresh() will fill in interpreted values.
-        Fields.Add(MemoryField.Vec3 ("Position",  b + 16));
-        Fields.Add(MemoryField.Float("RotYaw",    b + 28));
-        Fields.Add(MemoryField.Float("RotPitch",  b + 32));
-        Fields.Add(MemoryField.Float("Health",    b + 36));
-        Fields.Add(MemoryField.Float("MaxHealth", b + 40));
-        Fields.Add(MemoryField.Float("MoveSpeed", b + 44));
-        Fields.Add(MemoryField.Bool8("OnGround",  b + 48));
-        Fields.Add(MemoryField.Ptr64("InventoryPtr", b + 56));
-        Fields.Add(MemoryField.Ptr64("NamePtr",   b + 64));
 
-        // Raw dump of first 256 bytes for manual inspection
+        // Use scan-discovered addresses when available; fall back to hardcoded offsets.
+        // Hardcoded offsets (+16, +28, etc.) are ONLY a last resort — the scanner
+        // found more accurate addresses dynamically.
+        IntPtr posAddr       = player.PosAddr       != IntPtr.Zero ? player.PosAddr       : b + 16;
+        IntPtr rotAddr       = player.RotAddr        != IntPtr.Zero ? player.RotAddr       : b + 28;
+        IntPtr healthAddr    = player.HealthAddr     != IntPtr.Zero ? player.HealthAddr    : b + 36;
+        IntPtr maxHealthAddr = player.MaxHealthAddr  != IntPtr.Zero ? player.MaxHealthAddr : healthAddr + 4;
+
+        Fields.Add(MemoryField.Vec3 ("Position",     posAddr));
+        Fields.Add(MemoryField.Float("RotYaw",        rotAddr));
+        Fields.Add(MemoryField.Float("RotPitch",      rotAddr + 4));
+        Fields.Add(MemoryField.Float("Health",        healthAddr));
+        Fields.Add(MemoryField.Float("MaxHealth",     maxHealthAddr));
+        Fields.Add(MemoryField.Float("MoveSpeed",     b + 44));
+        Fields.Add(MemoryField.Bool8("OnGround",      b + 48));
+        Fields.Add(MemoryField.Ptr64("InventoryPtr",  b + 56));
+        Fields.Add(MemoryField.Ptr64("NamePtr",       b + 64));
+
+        // Raw dump for manual inspection
         Fields.Add(MemoryField.Bytes("RawDump[0..63]",   b,      64));
         Fields.Add(MemoryField.Bytes("RawDump[64..127]", b + 64, 64));
 

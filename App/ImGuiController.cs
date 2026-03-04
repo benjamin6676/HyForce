@@ -66,7 +66,9 @@ public class ImGuiController : IDisposable
         // ── Font scale: makes all text significantly larger and more readable ──
         // The default ImGui font is 13px bitmap; 1.5x scale gives ~20px effective size
         var io2 = ImGui.GetIO();
-        io2.FontGlobalScale = 1.5f;
+        // Scale: 1.0 = default ImGui font (~13px). Keeps all tabs visible on screen.
+        // If user has a 4K screen they can bump this via Settings later.
+        io2.FontGlobalScale = 1.0f;
 
         SetPerFrameImGuiData(1f / 60f);
         ImGui.NewFrame();

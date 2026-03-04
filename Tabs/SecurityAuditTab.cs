@@ -9,7 +9,7 @@ namespace HyForce.Tabs;
 
 public class SecurityAuditTab : ITab
 {
-    public string Name => "Security Audit";
+    public string Name => "Security";
 
     private readonly AppState _state;
     private bool _autoScroll = true;

@@ -30,7 +30,7 @@ public class PacketHandler
     public PacketHandler(AppState state)
     {
         _state = state;
-        PacketDecryptor.OnKeyDiscovered += OnEncryptionKeyFound;
+        // PacketDecryptor.OnKeyDiscovered += OnEncryptionKeyFound;
     }
 
     public void ProcessPacket(CapturedPacket packet)
@@ -317,7 +317,7 @@ public class PacketHandler
 
     private void OnEncryptionKeyFound(PacketDecryptor.EncryptionKey key)
     {
-        _state.AddInGameLog($"[KEY] Found {key.Type} key from {key.Source}");
+        //_state.AddInGameLog($"[KEY] Found {key.Type} key from {key.Source}");
 
         if (key.MemoryAddress.HasValue)
         {

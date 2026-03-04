@@ -100,12 +100,19 @@ public class UdpProxy : IDisposable
 
     public void Stop()
     {
-        if (!IsRunning) return;
+        // FIX: Signal loops to stop FIRST before closing sockets
+        IsRunning = false;
 
         _logBatchTimer?.Dispose();
         _cts?.Cancel();
+
+        // Give loops time to see IsRunning = false
+        Thread.Sleep(100);
+
+        // Now close sockets
         _listener?.Close();
         _sharedServerSocket?.Close();
+
         _listener = null;
         _sharedServerSocket = null;
 
@@ -172,7 +179,7 @@ public class UdpProxy : IDisposable
     {
         _log.Info("[UDP] Client->Server loop started", "UDP");
 
-        while (!ct.IsCancellationRequested)
+        while (!ct.IsCancellationRequested && IsRunning)  // FIX: Check IsRunning
         {
             UdpReceiveResult result;
             try
@@ -193,10 +200,13 @@ public class UdpProxy : IDisposable
             }
             catch (Exception ex)
             {
-                if (!ct.IsCancellationRequested)
+                if (!ct.IsCancellationRequested && IsRunning)
                     _log.Error($"[UDP] Receive error: {ex.Message}", "UDP");
                 break;
             }
+
+            // FIX: Check if still running after receive
+            if (!IsRunning) break;
 
             var clientEp = result.RemoteEndPoint;
             var key = clientEp.ToString();
@@ -205,7 +215,7 @@ public class UdpProxy : IDisposable
 
             if (data.Length == 0) continue;
 
-            // FIXED: Get or create session (lightweight, no socket creation)
+            // Get or create session
             if (!_sessions.TryGetValue(key, out var session))
             {
                 TotalClients++;
@@ -217,17 +227,24 @@ public class UdpProxy : IDisposable
 
             session.LastActivity = DateTimeOffset.UtcNow;
 
-            // CRITICAL FIX: Forward IMMEDIATELY - no Task.Run, no blocking
+            // FIX: Null check before sending
+            if (_sharedServerSocket == null || !IsRunning)
+            {
+                _log.Warn("[UDP] Cannot forward: socket null or not running", "UDP");
+                continue;
+            }
+
             try
             {
-                await _sharedServerSocket!.SendAsync(data, data.Length);
+                await _sharedServerSocket.SendAsync(data, data.Length);
             }
             catch (Exception ex)
             {
-                _log.Error($"[UDP] Forward C->S error: {ex.Message}", "UDP");
+                if (IsRunning)
+                    _log.Error($"[UDP] Forward C->S error: {ex.Message}", "UDP");
             }
 
-            // CRITICAL FIX: Batch log instead of Task.Run
+            // Batch log
             LogPacket(new CapturedPacket
             {
                 SequenceId = Interlocked.Increment(ref _sequenceCounter),
@@ -240,27 +257,34 @@ public class UdpProxy : IDisposable
                 QuicInfo = TryParseQuicInfo(data)
             });
         }
+
+        _log.Info("[UDP] Client->Server loop ended", "UDP");
     }
 
-    // FIXED: Dedicated server->client loop with immediate forwarding
     private async Task ServerToClientLoop(CancellationToken ct)
     {
         _log.Info("[UDP] Server->Client loop started", "UDP");
         var buffer = new byte[65536];
 
-        while (!ct.IsCancellationRequested)
+        while (!ct.IsCancellationRequested && IsRunning)  // FIX: Check IsRunning
         {
             try
             {
-                // FIXED: Use Socket.ReceiveFromAsync and get result properly
+                // FIX: Null check before receive
+                if (_sharedServerSocket == null)
+                {
+                    await Task.Delay(100, ct);
+                    continue;
+                }
+
                 var remoteEp = new IPEndPoint(IPAddress.Any, 0) as EndPoint;
 
-                var result = await _sharedServerSocket!.Client.ReceiveFromAsync(
+                var socketResult = await _sharedServerSocket.Client.ReceiveFromAsync(
                     new ArraySegment<byte>(buffer),
                     SocketFlags.None,
                     remoteEp);
 
-                int received = result.ReceivedBytes;
+                int received = socketResult.ReceivedBytes;
 
                 if (received == 0) continue;
 
@@ -268,19 +292,20 @@ public class UdpProxy : IDisposable
                 var serverData = new byte[received];
                 Buffer.BlockCopy(buffer, 0, serverData, 0, received);
 
-                // CRITICAL FIX: Forward to ALL active clients (QUIC handles demux via CIDs)
+                // Forward to ALL active clients
                 var clients = _sessions.Values.ToList();
 
                 foreach (var session in clients)
                 {
                     try
                     {
-                        await _listener!.SendAsync(serverData, serverData.Length, session.ClientEndpoint);
+                        if (_listener != null && IsRunning)  // FIX: Check null and running
+                            await _listener.SendAsync(serverData, serverData.Length, session.ClientEndpoint);
                     }
                     catch { /* Ignore send errors to disconnected clients */ }
                 }
 
-                // CRITICAL FIX: Batch log instead of Task.Run
+                // Batch log
                 LogPacket(new CapturedPacket
                 {
                     SequenceId = Interlocked.Increment(ref _sequenceCounter),
@@ -303,10 +328,12 @@ public class UdpProxy : IDisposable
             }
             catch (Exception ex)
             {
-                if (!ct.IsCancellationRequested)
+                if (!ct.IsCancellationRequested && IsRunning)
                     _log.Error($"[UDP] S->C error: {ex.Message}", "UDP");
             }
         }
+
+        _log.Info("[UDP] Server->Client loop ended", "UDP");
     }
 
     private QuicHeaderInfo? TryParseQuicInfo(byte[] data)

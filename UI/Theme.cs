@@ -74,7 +74,7 @@ public class Theme
     public static Vector4 ColCatHandshake { get; private set; }
     public static Vector4 ColCatUnknown   { get; private set; }
 
-    public static string          CurrentThemeName { get; private set; } = "Carbon Red";
+    public static string          CurrentThemeName { get; private set; } = "HyForce Neon";
     public static ThemeDefinition Current          { get; private set; } = null!;
 
     // -- 8 built-in themes ----------------------------------------------------
@@ -92,6 +92,18 @@ public class Theme
             CatRegistry=V(1f,.533f,.400f), CatMovement=V(.267f,.600f,1f), CatCombat=V(1f,.267f,.200f),
             CatEntity=V(.267f,.800f,.533f), CatInventory=V(1f,.867f,.200f), CatChat=V(.533f,1f,.800f),
             CatHandshake=V(.533f,.400f,1f), CatUnknown=V(.353f,.290f,.267f) },
+        ["HyForce Neon"] = new() {
+            Name="HyForce Neon", Group="Dark",
+            WindowBg=V(.030f,.033f,.043f), ChildBg=V(.038f,.043f,.058f), PopupBg=V(.050f,.055f,.075f),
+            TableBg=V(.025f,.028f,.038f), TableRowBg=V(.042f,.048f,.065f), TableAltBg=V(.034f,.038f,.052f),
+            TabBg=V(.040f,.046f,.065f), InputBg=V(.048f,.055f,.078f),
+            Accent=V(.200f,.900f,1f),     AccentDim=V(.020f,.180f,.250f),  AccentMid=V(.040f,.350f,.480f),
+            Success=V(.120f,1f,.480f),    Warn=V(1f,.780f,.100f),          Danger=V(1f,.220f,.380f), Info=V(.200f,.600f,1f),
+            Text=V(.870f,.940f,.960f),    TextMuted=V(.300f,.480f,.540f),  TextDim=V(.160f,.260f,.300f),
+            Border=V(.080f,.200f,.280f),  Scrollbar=V(.080f,.200f,.280f),  Rounding=3f,
+            CatRegistry=V(.200f,.900f,1f), CatMovement=V(.120f,1f,.480f), CatCombat=V(1f,.220f,.380f),
+            CatEntity=V(1f,.780f,.100f),   CatInventory=V(.800f,.400f,1f), CatChat=V(.400f,1f,.700f),
+            CatHandshake=V(.400f,.700f,1f), CatUnknown=V(.200f,.300f,.380f) },
 
         ["Obsidian Ops"] = new() {
             Name="Obsidian Ops", Group="Dark",
@@ -315,12 +327,12 @@ public class Theme
         style.GrabRounding      = d.Rounding;
         style.TabRounding       = d.Rounding;
 
-        style.WindowPadding     = new Vector2(10, 8);
-        style.FramePadding      = new Vector2(8, 4);
-        style.ItemSpacing       = new Vector2(8, 5);
-        style.CellPadding       = new Vector2(5, 3);
-        style.ScrollbarSize     = 10f;
-        style.GrabMinSize       = 8f;
+        style.WindowPadding     = new Vector2(8, 6);
+        style.FramePadding      = new Vector2(6, 3);
+        style.ItemSpacing       = new Vector2(6, 4);
+        style.CellPadding       = new Vector2(4, 2);
+        style.ScrollbarSize     = 9f;
+        style.GrabMinSize       = 7f;
         style.WindowBorderSize  = 1f;
         style.ChildBorderSize   = 1f;
         // FrameBorderSize=1 makes all buttons/inputs show a border — critical for visibility
@@ -329,5 +341,5 @@ public class Theme
         SyncStatics(d);
     }
 
-    static Theme() { SwitchTo("Carbon Red"); }
+    static Theme() { SwitchTo("HyForce Neon"); }
 }

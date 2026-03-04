@@ -11,7 +11,7 @@ namespace HyForce.Tabs;
 
 public class ActionCorrelatorTab : ITab
 {
-    public string Name => "Action Correlator";
+    public string Name => "Correlator";
 
     private readonly AppState _state;
 

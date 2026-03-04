@@ -61,6 +61,13 @@ public class LocalPlayerState
     public float   MoveSpeed    { get; set; }
     public bool    IsOnGround   { get; set; }
 
+    // Scan-discovered addresses -- set by ExtractFields, used by Fields panel display
+    // IntPtr.Zero = not yet found by scanner (fallback to hardcoded offset)
+    public IntPtr  PosAddr       { get; set; }   // address of PosX (Vec3 start)
+    public IntPtr  RotAddr       { get; set; }   // address of RotYaw
+    public IntPtr  HealthAddr    { get; set; }   // address of Health float
+    public IntPtr  MaxHealthAddr { get; set; }   // address of MaxHealth float
+
     // Discovery metadata
     public string  DiscoveryStrategy { get; set; } = "";
     public double  Confidence        { get; set; }
@@ -138,14 +145,14 @@ public sealed class LocalPlayerDiscovery
         var stringCandidates = StrategyA_StringAnchor();
         candidates.AddRange(stringCandidates);
 
-        // Strategy B: field pattern heuristics
+        // Strategy B: field pattern heuristics — only if A found nothing
         if (candidates.Count == 0)
         {
             var heuristicCandidates = StrategyB_FieldPatterns();
             candidates.AddRange(heuristicCandidates);
         }
 
-        // Strategy C: native float-sentinel patterns
+        // Strategy C: native float-sentinel patterns — last resort only
         if (candidates.Count == 0)
         {
             var nativeCandidates = StrategyC_NativePatterns();
@@ -215,7 +222,7 @@ public sealed class LocalPlayerDiscovery
                 if (!ValidatePlayerCandidate(candidate)) continue;
 
                 var score = ScorePlayerCandidate(candidate);
-                if (score > 0.3)
+                if (score > 0.65)
                     results.Add((candidate, score, "FieldPattern:Vec3+Health"));
             }
         }
@@ -235,7 +242,7 @@ public sealed class LocalPlayerDiscovery
                 var candidate = hit.ResultAddress;
                 if (!ValidatePlayerCandidate(candidate)) continue;
                 var score = ScorePlayerCandidate(candidate);
-                if (score > 0.25)
+                if (score > 0.55)
                     results.Add((candidate, score, $"NativePattern:{sig.Name}"));
             }
         }
@@ -279,7 +286,7 @@ public sealed class LocalPlayerDiscovery
         bool hasVec3 = false;
         for (int i = 0; i < data.Length - 11; i += 4)
         {
-            if (_validator.ValidateVec3(data, i) > 0.4) { hasVec3 = true; break; }
+            if (_validator.ValidateVec3(data, i) > 0.7) { hasVec3 = true; break; }
         }
         return hasVec3;
     }
@@ -298,7 +305,7 @@ public sealed class LocalPlayerDiscovery
         {
             // Vec3 bonus
             double vec3 = _validator.ValidateVec3(data, i);
-            if (vec3 > 0.4) score += vec3 * 0.35;
+            if (vec3 > 0.7) score += vec3 * 0.40;  // only full-confidence Vec3s contribute
 
             // Health float bonus
             if (i + 3 < data.Length)
@@ -336,11 +343,12 @@ public sealed class LocalPlayerDiscovery
         // Find the first high-confidence Vec3 starting after the 16-byte JVM header
         for (int i = 16; i < data.Length - 11; i += 4)
         {
-            if (_validator.ValidateVec3(data, i) < 0.5) continue;
+            if (_validator.ValidateVec3(data, i) < 0.7) continue;
 
             state.PosX = BitConverter.ToSingle(data, i);
             state.PosY = BitConverter.ToSingle(data, i + 4);
             state.PosZ = BitConverter.ToSingle(data, i + 8);
+            state.PosAddr = addr + i;   // record actual memory address
 
             // Rotation likely follows position
             int rotOff = i + 12;
@@ -353,25 +361,44 @@ public sealed class LocalPlayerDiscovery
                 {
                     state.RotYaw   = yaw;
                     state.RotPitch = pitch;
+                    state.RotAddr  = addr + rotOff;  // record actual rotation address
                 }
             }
             break;
         }
 
         // Scan for health float: value in (0, 40], not NaN
-        for (int i = 16; i < data.Length - 7; i += 4)
+        // Start AFTER position+rotation block to avoid mistaking rotation values for health
+        int healthScanStart = state.PosAddr != IntPtr.Zero
+            ? (int)(state.PosAddr - addr) + 20  // skip past Vec3(12) + Yaw(4) + Pitch(4)
+            : 16;
+        for (int i = healthScanStart; i < data.Length - 7; i += 4)
         {
             float f = BitConverter.ToSingle(data, i);
             double hScore = _validator.ValidateHealthFloat(f);
             if (hScore > 0.6)
             {
-                state.Health    = f;
-                // Max health likely immediately before or after
+                state.Health     = f;
+                state.HealthAddr = addr + i;   // record actual health address
+
+                // Max health: look at adjacent floats
                 float prev = i >= 4 ? BitConverter.ToSingle(data, i - 4) : 0;
                 float next = i + 7 < data.Length ? BitConverter.ToSingle(data, i + 4) : 0;
-                if (prev > 0 && prev >= f && prev <= 40f)      state.MaxHealth = prev;
-                else if (next > 0 && next >= f && next <= 40f) state.MaxHealth = next;
-                else                                            state.MaxHealth = 20f;
+                if (prev > 0 && prev >= f && prev <= 40f)
+                {
+                    state.MaxHealth     = prev;
+                    state.MaxHealthAddr = addr + i - 4;
+                }
+                else if (next > 0 && next >= f && next <= 40f)
+                {
+                    state.MaxHealth     = next;
+                    state.MaxHealthAddr = addr + i + 4;
+                }
+                else
+                {
+                    state.MaxHealth     = 20f;
+                    state.MaxHealthAddr = IntPtr.Zero;
+                }
                 break;
             }
         }
@@ -517,23 +544,77 @@ public sealed class LocalPlayerMonitor : IDisposable
         }
     }
 
+    // Sanity limits — if values jump beyond these, reject the frame as noise
+    private const float MAX_POS_DELTA_PER_FRAME  = 50f;    // max units per refresh — tighter than before
+    private const float MAX_HEALTH_JUMP          = 20f;    // HP jump per frame considered suspicious
+    private const float MIN_HEALTH               = 0f;
+    private const float MAX_HEALTH               = 40f;
+    private const float MIN_WORLD_COORD          = -32000f;
+    private const float MAX_WORLD_COORD          =  32000f;
+
+    private int _badFrameCount = 0;  // consecutive bad frames before marking invalid
+
     private void RefreshLiveFields(LocalPlayerState state)
     {
         var data = _scanner.ReadBytes(state.BaseAddress, 256);
-        if (data == null) { state.IsValid = false; return; }
+        if (data == null)
+        {
+            _badFrameCount++;
+            if (_badFrameCount > 10) state.IsValid = false;
+            return;
+        }
 
-        // Re-scan for position (quick -- just try last known offsets first, then full scan)
-        // We store the offset in the state on first discovery (not shown here for brevity;
-        // in practice cache the offsets from ExtractFields).
         var updated = _discovery.ExtractFields(state.BaseAddress);
-        state.PosX         = updated.PosX;
-        state.PosY         = updated.PosY;
-        state.PosZ         = updated.PosZ;
-        state.RotYaw       = updated.RotYaw;
-        state.RotPitch     = updated.RotPitch;
-        state.Health       = updated.Health;
-        state.MaxHealth    = updated.MaxHealth;
+
+        // ── Position sanity check ──────────────────────────────────────────────
+        bool posValid =
+            updated.PosX >= MIN_WORLD_COORD && updated.PosX <= MAX_WORLD_COORD &&
+            updated.PosY >= MIN_WORLD_COORD && updated.PosY <= MAX_WORLD_COORD &&
+            updated.PosZ >= MIN_WORLD_COORD && updated.PosZ <= MAX_WORLD_COORD &&
+            !float.IsNaN(updated.PosX) && !float.IsNaN(updated.PosY) && !float.IsNaN(updated.PosZ);
+
+        bool posDeltaOk =
+            Math.Abs(updated.PosX - state.PosX) < MAX_POS_DELTA_PER_FRAME &&
+            Math.Abs(updated.PosY - state.PosY) < MAX_POS_DELTA_PER_FRAME &&
+            Math.Abs(updated.PosZ - state.PosZ) < MAX_POS_DELTA_PER_FRAME;
+
+        // On first read (all zeros) always accept position
+        bool firstRead = state.PosX == 0 && state.PosY == 0 && state.PosZ == 0;
+
+        if (posValid && (firstRead || posDeltaOk))
+        {
+            state.PosX = updated.PosX;
+            state.PosY = updated.PosY;
+            state.PosZ = updated.PosZ;
+        }
+
+        // ── Rotation sanity check ──────────────────────────────────────────────
+        if (!float.IsNaN(updated.RotYaw)   && Math.Abs(updated.RotYaw)   < 7f)   state.RotYaw   = updated.RotYaw;
+        if (!float.IsNaN(updated.RotPitch) && Math.Abs(updated.RotPitch) < 3.2f) state.RotPitch = updated.RotPitch;
+
+        // ── Health sanity check ────────────────────────────────────────────────
+        bool hpValid  = updated.Health >= MIN_HEALTH && updated.Health <= MAX_HEALTH && !float.IsNaN(updated.Health);
+        bool hpDeltaOk = Math.Abs(updated.Health - state.Health) < MAX_HEALTH_JUMP;
+        bool hpFirst   = state.Health == 0;
+
+        if (hpValid && (hpFirst || hpDeltaOk))
+        {
+            state.Health    = updated.Health;
+            state.MaxHealth = updated.MaxHealth > 0 ? updated.MaxHealth : state.MaxHealth;
+            // Propagate discovered addresses so the Fields panel always shows correct locations
+            if (updated.HealthAddr    != IntPtr.Zero) state.HealthAddr    = updated.HealthAddr;
+            if (updated.MaxHealthAddr != IntPtr.Zero) state.MaxHealthAddr = updated.MaxHealthAddr;
+        }
+
+        // Propagate position/rotation addresses on first successful read
+        if (updated.PosAddr != IntPtr.Zero && state.PosAddr == IntPtr.Zero)
+        {
+            state.PosAddr  = updated.PosAddr;
+            state.RotAddr  = updated.RotAddr;
+        }
+
         state.InventoryPtr = updated.InventoryPtr;
+        _badFrameCount = 0; // reset on good frame
     }
 
     public void Dispose()

@@ -11,7 +11,7 @@ namespace HyForce.Tabs;
 
 public class OpcodeManager : ITab
 {
-    public string Name => "Opcode Manager";
+    public string Name => "Opcodes";
 
     private readonly AppState _state;
     private string _searchFilter = "";

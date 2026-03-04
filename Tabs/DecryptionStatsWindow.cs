@@ -8,7 +8,7 @@ namespace HyForce.Tabs;
 
 public class DecryptionStatsWindow : ITab
 {
-    public string Name => "Decrypt Stats";
+    public string Name => "Dec Stats";
 
     private readonly AppState _state;
 

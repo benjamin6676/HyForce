@@ -17,7 +17,7 @@ namespace HyForce.Tabs;
 
 public class PacketFeedTab : ITab
 {
-    public string Name => "Packet Feed";
+    public string Name => "Packets";
 
     // -- Core state ------------------------------------------------------------
     private readonly AppState         _state;

@@ -9,7 +9,7 @@ namespace HyForce.Tabs;
 
 public class PacketAnalyticsTab : ITab
 {
-    public string Name => "Analytics";
+    public string Name => "Stats";
     private readonly AppState _state;
     private Dictionary<PacketCategory, int> _categoryStats = new();
     private List<PacketPattern>             _patterns        = new();

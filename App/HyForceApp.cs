@@ -312,72 +312,93 @@ public class HyForceApp
     // -- Diagnostic bar -------------------------------------------------------
     private void RenderDiagBar()
     {
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, Theme.Current?.ChildBg ?? Theme.ColBg3);
-        ImGui.BeginChild("##diagbar", new Vector2(0, 22), ImGuiChildFlags.None);
+        // Bright glowing bottom border on the diag bar
+        var diagBg = Theme.Current?.ChildBg ?? Theme.ColBg3;
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, diagBg);
+        ImGui.BeginChild("##diagbar", new Vector2(0, 24), ImGuiChildFlags.None);
+
+        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + 2); // vertical center
 
         bool udpOk = _state.UdpProxy.IsRunning;
         bool tcpOk = _state.TcpProxy.IsRunning;
-        Pill("UDP", udpOk); ImGui.SameLine(0, 8);
+        Pill("UDP", udpOk); ImGui.SameLine(0, 6);
         Pill("TCP", tcpOk);
 
         DiagSep();
 
-        ImGui.TextColored(Theme.ColTextMuted, "C>S"); ImGui.SameLine(0, 3);
-        ImGui.TextColored(Theme.ColSuccess,  $"{_state.PacketLog.PacketsCs:N0}");
-        ImGui.SameLine(0, 8);
-        ImGui.TextColored(Theme.ColTextMuted, "S>C"); ImGui.SameLine(0, 3);
-        ImGui.TextColored(Theme.ColAccent,   $"{_state.PacketLog.PacketsSc:N0}");
+        // Packet counts
+        DiagVal("C>S", $"{_state.PacketLog.PacketsCs:N0}", Theme.ColSuccess);
+        ImGui.SameLine(0, 6);
+        DiagVal("S>C", $"{_state.PacketLog.PacketsSc:N0}", Theme.ColAccent);
 
         DiagSep();
 
+        // Key/decryption status
         int keys = PacketDecryptor.DiscoveredKeys.Count;
-        ImGui.TextColored(Theme.ColTextMuted, "Keys"); ImGui.SameLine(0, 3);
-        ImGui.TextColored(keys > 0 ? Theme.ColSuccess : Theme.ColDanger, $"{keys}");
-        ImGui.SameLine(0, 8);
-        ImGui.TextColored(Theme.ColTextMuted, "Dec"); ImGui.SameLine(0, 3);
-        ImGui.TextColored(Theme.ColSuccess, $"{PacketDecryptor.SuccessfulDecryptions:N0}");
-        ImGui.SameLine(0, 8);
-        ImGui.TextColored(Theme.ColTextMuted, "Fail"); ImGui.SameLine(0, 3);
-        ImGui.TextColored(
-            PacketDecryptor.FailedDecryptions > 0 ? Theme.ColWarn : Theme.ColTextMuted,
-            $"{PacketDecryptor.FailedDecryptions:N0}");
+        DiagVal("Keys", $"{keys}", keys > 0 ? Theme.ColSuccess : Theme.ColDanger);
+        ImGui.SameLine(0, 6);
+        DiagVal("Dec",  $"{PacketDecryptor.SuccessfulDecryptions:N0}", Theme.ColSuccess);
+        if (PacketDecryptor.FailedDecryptions > 0)
+        {
+            ImGui.SameLine(0, 6);
+            DiagVal("Fail", $"{PacketDecryptor.FailedDecryptions:N0}", Theme.ColWarn);
+        }
 
         DiagSep();
 
         int items = Protocol.RegistrySyncParser.NumericIdToName.Count;
-        ImGui.TextColored(Theme.ColTextMuted, "Items"); ImGui.SameLine(0, 3);
-        ImGui.TextColored(items > 0 ? Theme.ColAccent : Theme.ColTextMuted, $"{items:N0}");
+        DiagVal("Items", $"{items:N0}", items > 0 ? Theme.ColAccent : Theme.ColTextMuted);
 
         DiagSep();
-        ImGui.TextColored(Theme.ColAccentDim, "F8"); ImGui.SameLine(0, 2);
-        ImGui.TextColored(Theme.ColTextMuted, ":Cap");
+        ImGui.TextColored(Theme.ColTextMuted, "F8:Cap");
 
-        // Right: theme + session timer
+        // Right-aligned: session timer + theme button
+        // Use SameLine with a fixed offset from window right so it never overlaps left content
         string sessionStr = _state.StartTime.HasValue
             ? FormatDuration(DateTime.Now - _state.StartTime.Value)
             : "idle";
-        float rX = ImGui.GetWindowWidth()
-            - ImGui.CalcTextSize(sessionStr).X
-            - ImGui.CalcTextSize(Theme.CurrentThemeName).X - 120;
-        if (rX > ImGui.GetCursorPosX()) ImGui.SetCursorPosX(rX);
 
-        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(Theme.ColAccent.X*.25f, Theme.ColAccent.Y*.25f, Theme.ColAccent.Z*.25f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.ColAccentMid);
-        ImGui.PushStyleColor(ImGuiCol.Text,          Theme.ColAccent);
-        ImGui.PushStyleColor(ImGuiCol.Border,        Theme.ColAccent with { W = .5f });
+        // Reserve 160px on the right for timer + theme button
+        const float RIGHT_RESERVE = 160f;
+        float rX = ImGui.GetWindowWidth() - RIGHT_RESERVE;
+        float curX = ImGui.GetCursorPosX();
+        if (rX > curX + 20) ImGui.SetCursorPosX(rX);
+
+        // Session timer (just text, compact)
+        ImGui.TextColored(Theme.ColTextMuted, sessionStr);
+        ImGui.SameLine(0, 8);
+
+        // Theme button — fixed 90px width so it never wraps
+        var ac = Theme.ColAccent;
+        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(ac.X*.18f, ac.Y*.18f, ac.Z*.18f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(ac.X*.30f, ac.Y*.30f, ac.Z*.30f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text,          ac);
+        ImGui.PushStyleColor(ImGuiCol.Border,        ac with { W = .70f });
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8f);
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(8f, 2f));
-        if (ImGui.Button($"[T] {Theme.CurrentThemeName}"))
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding,  new Vector2(5f, 1f));
+        if (ImGui.Button("[T]##theme", new Vector2(32, 0)))
             _showThemePopup = !_showThemePopup;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip($"Theme: {Theme.CurrentThemeName}");
         ImGui.PopStyleVar(2);
         ImGui.PopStyleColor(4);
 
-        ImGui.SameLine(0, 8);
-        ImGui.TextColored(Theme.ColTextMuted, sessionStr);
-
         ImGui.EndChild();
         ImGui.PopStyleColor();
+
+        // Accent separator line under diag bar
+        var drawList = ImGui.GetWindowDrawList();
+        var p0 = ImGui.GetCursorScreenPos();
+        drawList.AddLine(p0, new System.Numerics.Vector2(p0.X + ImGui.GetWindowWidth(), p0.Y),
+            ImGui.ColorConvertFloat4ToU32(Theme.ColAccent with { W = .25f }), 1f);
         ImGui.Separator();
+    }
+
+    private static void DiagVal(string label, string val, System.Numerics.Vector4 valCol)
+    {
+        ImGui.TextColored(Theme.ColTextMuted, label);
+        ImGui.SameLine(0, 3);
+        ImGui.TextColored(valCol, val);
     }
 
     private static void Pill(string label, bool ok)
@@ -402,37 +423,56 @@ public class HyForceApp
         ImGui.SameLine(0, 8);
     }
 
-    // -- Tab bar -- underline style matching preview ---------------------------
+    // -- Tab bar: fixed compact padding, horizontal scroll if needed ----------
     private void RenderTabBar()
     {
         ImGui.PushStyleColor(ImGuiCol.ChildBg, Theme.Current?.ChildBg ?? Theme.ColBg3);
-        ImGui.BeginChild("##tabbar", new Vector2(0, 36), ImGuiChildFlags.None);
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing,  new Vector2(0, 0));
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(12, 7));
+        // Tall enough to look good, narrow enough to not eat content space
+        ImGui.BeginChild("##tabbar", new Vector2(0, 28),
+            ImGuiChildFlags.None, ImGuiWindowFlags.HorizontalScrollbar);
+
+        // Compact fixed padding: 10px horizontal, 4px vertical — tabs never truncate
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing,  new Vector2(1, 0));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(10, 4));
+
+        var dl = ImGui.GetWindowDrawList();
 
         for (int i = 0; i < _tabs.Count; i++)
         {
             bool sel = _selectedTab == i;
 
-            // Transparent button background, text colored by selection
-            ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0,0,0,0));
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(.1f,.1f,.1f,.5f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0,0,0,0));
-            ImGui.PushStyleColor(ImGuiCol.Text, sel ? Theme.ColAccent : Theme.ColTextMuted);
-
-            if (ImGui.Button(_tabs[i].Name)) _selectedTab = i;
-            ImGui.PopStyleColor(4);
-
-            // Draw underline for active tab using DrawList
             if (sel)
             {
-                var min = ImGui.GetItemRectMin();
-                var max = ImGui.GetItemRectMax();
-                ImGui.GetWindowDrawList().AddLine(
-                    new Vector2(min.X + 4, max.Y - 2),
-                    new Vector2(max.X - 4, max.Y - 2),
-                    ImGui.ColorConvertFloat4ToU32(Theme.ColAccent),
-                    2f);
+                var ac = Theme.ColAccent;
+                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(ac.X*.14f, ac.Y*.14f, ac.Z*.14f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(ac.X*.22f, ac.Y*.22f, ac.Z*.22f, 1f));
+            }
+            else
+            {
+                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0,0,0,0));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(.06f,.06f,.08f,.8f));
+            }
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0,0,0,0));
+            ImGui.PushStyleColor(ImGuiCol.Text,   sel ? Theme.ColAccent : Theme.ColTextMuted);
+            ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(0,0,0,0)); // no per-button border
+
+            if (ImGui.Button(_tabs[i].Name)) _selectedTab = i;
+            ImGui.PopStyleColor(5);
+
+            // Scroll to active tab on first frame / when tab changes
+            if (sel && ImGui.IsItemVisible())
+                ImGui.SetScrollHereX(0.5f);
+
+            // Glowing underline
+            if (sel)
+            {
+                var mn = ImGui.GetItemRectMin();
+                var mx = ImGui.GetItemRectMax();
+                var ac = Theme.ColAccent;
+                dl.AddLine(new Vector2(mn.X+2, mx.Y-1), new Vector2(mx.X-2, mx.Y-1),
+                    ImGui.ColorConvertFloat4ToU32(ac with { W = .25f }), 3f);
+                dl.AddLine(new Vector2(mn.X+2, mx.Y-1), new Vector2(mx.X-2, mx.Y-1),
+                    ImGui.ColorConvertFloat4ToU32(ac), 1.5f);
             }
 
             if (i < _tabs.Count - 1) ImGui.SameLine();
@@ -441,6 +481,10 @@ public class HyForceApp
         ImGui.PopStyleVar(2);
         ImGui.EndChild();
         ImGui.PopStyleColor();
+
+        var p0 = ImGui.GetCursorScreenPos();
+        ImGui.GetWindowDrawList().AddLine(p0, new Vector2(p0.X + ImGui.GetWindowWidth(), p0.Y),
+            ImGui.ColorConvertFloat4ToU32(Theme.ColAccent with { W = .15f }), 1f);
         ImGui.Separator();
     }
 

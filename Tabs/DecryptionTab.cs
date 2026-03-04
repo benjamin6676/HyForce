@@ -1,11 +1,11 @@
-// FILE: Tabs/DecryptionTab.cs - ENHANCED: 4-Step Wizard, Visual Key Cards, RFC 9001 Reference
+// FILE: Tabs/DecryptionTab.cs
+// Fully automatic SSLKEYLOGFILE -- zero manual steps after first-time setup
 using HyForce.Core;
 using HyForce.Protocol;
 using HyForce.UI;
 using ImGuiNET;
 using System.Numerics;
 using System.Text;
-using static HyForce.Protocol.PacketDecryptor;
 
 namespace HyForce.Tabs;
 
@@ -14,1051 +14,647 @@ public class DecryptionTab : ITab
     public string Name => "Decryption";
 
     private readonly AppState _state;
-    private string _manualKey = "";
-    private int _selectedKeyType = 1;
-    private string _testData = "";
-    private int _selectedKeyIndex = -1;
-    private float _lastRefreshTime = 0;
-    private string _statusMessage = "";
-    private float _statusTime = 0;
-    private List<PacketDecryptor.EncryptionKey> _cachedKeys = new();
+
+    // Key management
+    private string   _manualKey        = "";
+    private int      _selectedKeyType  = 1;
+    private int      _selectedKeyIndex = -1;
+    private string   _statusMessage    = "";
+    private float    _statusTime       = 0;
+    private List<PacketDecryptor.EncryptionKey> _cachedKeys      = new();
     private DateTime _lastKeyCacheTime = DateTime.MinValue;
 
-    // ENHANCED: Wizard state
-    private int _wizardStep = 0; // 0=Not started, 1=Config, 2=Verify, 3=Test, 4=Troubleshoot
-    private bool _showWizard = true;
-    private bool _showRfcReference = false;
+    // Wizard / advanced
+    private bool _showAdvanced  = false;
+    private bool _showRfcRef    = false;
+    private int  _wizardStep    = 1;
 
-    // ENHANCED: Test lab
-    private string _testLabHex = "";
+    // Test lab
+    private string _testLabHex    = "";
     private string _testLabResult = "";
-    private bool _testLabRunning = false;
-    
+    private bool   _testLabRunning = false;
+    private PacketDecryptor.DecryptionResult? _lastResult;
+
+    // Layout
+    private float _leftW = 430f;
 
     public DecryptionTab(AppState state)
     {
         _state = state;
-        _state.OnKeysUpdated += OnKeysUpdated;
-    }
-
-    private void OnKeysUpdated()
-    {
-        _statusMessage = "Keys updated!";
-        _statusTime = (float)ImGui.GetTime();
-        _lastKeyCacheTime = DateTime.MinValue;
-    }
-
-    private void UpdateKeyCache()
-    {
-        if (DateTime.Now - _lastKeyCacheTime > TimeSpan.FromSeconds(5))
+        _state.OnKeysUpdated += () =>
         {
-            _cachedKeys = PacketDecryptor.DiscoveredKeys
-                .OrderByDescending(k => k.UseCount)
-                .Take(10)
-                .ToList();
-            _lastKeyCacheTime = DateTime.Now;
-        }
+            _statusMessage    = "New keys loaded!";
+            _statusTime       = (float)ImGui.GetTime();
+            _lastKeyCacheTime = DateTime.MinValue;
+        };
     }
 
+    // =========================================================================
     public void Render()
     {
         var avail = ImGui.GetContentRegionAvail();
 
         ImGui.Spacing();
-        ImGui.Text("  PACKET DECRYPTION  -  Manage Encryption Keys");
+        ImGui.TextColored(Theme.ColAccent, "PACKET DECRYPTION");
+        ImGui.SameLine(0, 6);
+        ImGui.TextColored(Theme.ColTextMuted, "-- Automatic TLS 1.3 / QUIC Key Management");
         ImGui.Separator();
         ImGui.Spacing();
 
-        // Status banner
-        RenderStatusBanner();
-
-        // === Session Key Log Control Panel ===
+        // ── Main auto-status card (always visible, most important) ────────────
+        RenderAutoStatusCard();
         ImGui.Spacing();
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.1f, 0.15f, 0.2f, 1f));
-        ImGui.BeginChild("##keylog_control", new Vector2(0, 85), ImGuiChildFlags.Borders);
 
-        ImGui.TextColored(Theme.ColAccent, "Session Key Log Control");
+        // ── Key stats bar ─────────────────────────────────────────────────────
+        RenderKeyStatsBar();
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
 
-        // Show the ACTIVE session file (set by AppState.Start()), not just env var
-        string? currentKeyLog = _state.GetActiveKeyLogFile(); // We'll add this method
-        if (string.IsNullOrEmpty(currentKeyLog))
-        {
-            // Fallback to env var if no active session
-            currentKeyLog = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Process)
-                ?? Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.User)
-                ?? Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Machine);
-        }
+        // ── Split: key list (left) + test lab (right) ─────────────────────────
+        float colH = Math.Max(220, avail.Y - ImGui.GetCursorPosY() - 10);
+        float rightW = avail.X - _leftW - 8;
+        if (rightW < 200) { _leftW = avail.X - 208; rightW = 200; }
 
-        ImGui.Text($"Current: {(currentKeyLog != null ? Path.GetFileName(currentKeyLog) : "Not set")}");
-
-        // Show file status
-        if (!string.IsNullOrEmpty(currentKeyLog) && File.Exists(currentKeyLog))
-        {
-            var info = new FileInfo(currentKeyLog);
-            ImGui.TextColored(Theme.ColTextMuted, $"Size: {info.Length} bytes | Modified: {info.LastWriteTime:HH:mm:ss}");
-        }
-
-        // Buttons
-        if (ImGui.Button("Prepare Fresh Key Log", new Vector2(180, 28)))
-        {
-            _state.PrepareFreshKeyLogManual();
-        }
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("Clear Key Log File", new Vector2(140, 28)))
-        {
-            _state.ClearKeyLogFile();
-        }
-
-        ImGui.TextColored(Theme.ColTextMuted, "Click 'Prepare Fresh' before starting Hytale");
-
+        ImGui.BeginChild("##dec_left",  new Vector2(_leftW, colH));
+        RenderKeyList();
         ImGui.EndChild();
-        ImGui.PopStyleColor();
+
+        ImGui.SameLine(0, 2);
+        ImGui.Button("##vsplit_d", new Vector2(4, colH));
+        if (ImGui.IsItemActive()) { _leftW += ImGui.GetIO().MouseDelta.X; _leftW = Math.Clamp(_leftW, 220, avail.X - 220); }
+        if (ImGui.IsItemHovered()) ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeEW);
+
+        ImGui.SameLine(0, 2);
+        ImGui.BeginChild("##dec_right", new Vector2(rightW, colH));
+        RenderTestLab();
+        ImGui.EndChild();
+
+        // ── Advanced / RFC reference ──────────────────────────────────────────
+        if (_showRfcRef) { ImGui.Spacing(); RenderRfcRef(); }
     }
 
-    // ENHANCED: Status banner with color coding
-    private void RenderStatusBanner()
+    // =========================================================================
+    // AUTO STATUS CARD — the main panel users see
+    // =========================================================================
+    private void RenderAutoStatusCard()
     {
-        var status = _state.GetKeyStatus();
+        var status   = _state.GetKeyStatus();
         bool hasKeys = status.TotalKeys > 0;
-        bool hasSuccess = status.SuccessfulDecryptions > 0;
+        bool hasDecr = status.SuccessfulDecryptions > 0;
+        bool needsSetup = _state.NeedsFirstTimeSetup;
 
-        Vector4 bannerColor;
-        string bannerText;
-        string icon;
+        // Choose card color and message
+        Vector4 cardCol;
+        string  headline;
+        string  subline;
 
-        if (hasSuccess)
+        if (hasDecr)
         {
-            bannerColor = new Vector4(0.2f, 0.8f, 0.3f, 1f);
-            bannerText = $"DECRYPTION ACTIVE - {status.SuccessfulDecryptions} packets decrypted";
-            icon = "OK";
+            cardCol  = Theme.ColSuccess;
+            headline = $"DECRYPTING  --  {status.SuccessfulDecryptions:N0} packets decrypted";
+            subline  = $"{status.TotalKeys} key(s) active  |  {Path.GetFileName(_state.PermanentKeyLogPath)}";
         }
         else if (hasKeys)
         {
-            bannerColor = new Vector4(0.9f, 0.7f, 0.2f, 1f);
-            bannerText = $"KEYS LOADED ({status.TotalKeys}) BUT DECRYPTION FAILING - Check derivation";
-            icon = "(!)";
+            cardCol  = Theme.ColWarn;
+            headline = $"KEYS READY ({status.TotalKeys})  --  waiting for QUIC traffic";
+            subline  = "Start capturing to see decryption results";
+        }
+        else if (needsSetup)
+        {
+            cardCol  = Theme.ColDanger;
+            headline = "ONE-TIME SETUP REQUIRED";
+            subline  = "SSLKEYLOGFILE has been set -- restart Hytale once, then everything is automatic.";
         }
         else
         {
-            bannerColor = new Vector4(0.9f, 0.3f, 0.2f, 1f);
-            bannerText = "NO KEYS - Set SSLKEYLOGFILE before starting Hytale";
-            icon = "XX";
+            cardCol  = Theme.ColWarn;
+            headline = "WAITING FOR HYTALE";
+            subline  = "Launch Hytale -- keys will appear here automatically when it connects.";
         }
 
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, bannerColor * 0.3f);
-        ImGui.PushStyleColor(ImGuiCol.Border, bannerColor);
-        ImGui.BeginChild("##status_banner", new Vector2(0, 40), ImGuiChildFlags.Borders);
+        // Card background
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(cardCol.X*.15f, cardCol.Y*.15f, cardCol.Z*.15f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Border,   cardCol with { W = .8f });
+        ImGui.BeginChild("##auto_card", new Vector2(0, needsSetup ? 120 : 82), ImGuiChildFlags.Borders);
 
-        ImGui.SetCursorPosY(10);
-        ImGui.TextColored(bannerColor, $"{icon} {bannerText}");
+        ImGui.Spacing();
+        ImGui.SetCursorPosX(10);
+        ImGui.TextColored(cardCol, headline);
+        ImGui.SetCursorPosX(10);
+        ImGui.TextColored(Theme.ColTextMuted, subline);
 
-        ImGui.SameLine(ImGui.GetContentRegionAvail().X - 120);
-        if (ImGui.Button(_showWizard ? "Hide Wizard" : "Show Wizard", new Vector2(110, 28)))
+        if (needsSetup)
         {
-            _showWizard = !_showWizard;
+            ImGui.Spacing();
+            ImGui.SetCursorPosX(10);
+            ImGui.TextColored(Theme.ColAccent, "What to do right now:");
+            ImGui.SetCursorPosX(18);
+            ImGui.TextColored(Theme.ColTextMuted,
+                "1. Close Hytale completely  2. Launch Hytale  3. Done forever.");
+            ImGui.SetCursorPosX(10);
+            ImGui.TextColored(Theme.ColTextMuted,
+                "After that one restart you never need to touch this tab again.");
+        }
+
+        ImGui.Spacing();
+        ImGui.SetCursorPosX(10);
+
+        // Action buttons -- only the ones relevant for current state
+        BtnAccent("Re-Import Keys", () =>
+        {
+            _state.ForceReImportKeys();
+            _statusMessage = "Re-importing...";
+            _statusTime    = (float)ImGui.GetTime();
+        });
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Re-reads the entire permanent log file.\nUse if HyForce was opened after Hytale was already running.");
+
+        ImGui.SameLine(0, 6);
+
+        BtnNeutral("Open Key Log File", () =>
+        {
+            try { System.Diagnostics.Process.Start("notepad.exe", _state.PermanentKeyLogPath); } catch { }
+        });
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(_state.PermanentKeyLogPath);
+
+        ImGui.SameLine(0, 6);
+
+        BtnNeutral(_showAdvanced ? "Hide Advanced" : "Advanced", () => _showAdvanced = !_showAdvanced);
+
+        if (!string.IsNullOrEmpty(_statusMessage) && ImGui.GetTime() - _statusTime < 3.0)
+        {
+            ImGui.SameLine(0, 10);
+            ImGui.TextColored(Theme.ColSuccess, _statusMessage);
         }
 
         ImGui.EndChild();
         ImGui.PopStyleColor(2);
 
-        if (!string.IsNullOrEmpty(_statusMessage) && ImGui.GetTime() - _statusTime < 3.0)
-        {
-            ImGui.TextColored(Theme.ColSuccess, _statusMessage);
-        }
+        // Advanced collapsible section
+        if (_showAdvanced) RenderAdvancedSection();
     }
 
-
-
-    // ENHANCED: 4-Step Decryption Wizard
-    private void RenderDecryptionWizard()
+    // =========================================================================
+    // ADVANCED SECTION (hidden by default)
+    // =========================================================================
+    private void RenderAdvancedSection()
     {
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.1f, 0.12f, 0.15f, 1f));
-        ImGui.BeginChild("##wizard", new Vector2(0, 240), ImGuiChildFlags.Borders);
-
-        ImGui.TextColored(Theme.ColAccent, "? Decryption Setup Wizard");
-        ImGui.SameLine();
-        if (ImGui.Button("Reset", new Vector2(60, 22)))
-        {
-            _wizardStep = 1;
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("RFC 9001 Reference", new Vector2(120, 22)))
-        {
-            _showRfcReference = !_showRfcReference;
-        }
-
-        // Step indicators
-        string[] steps = { "Config", "Verify", "Test", "Troubleshoot" };
-        float stepWidth = ImGui.GetContentRegionAvail().X / steps.Length;
-
         ImGui.Spacing();
-        for (int i = 0; i < steps.Length; i++)
-        {
-            bool isActive = _wizardStep == i + 1;
-            bool isComplete = _wizardStep > i + 1;
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(.10f,.10f,.13f,1f));
+        ImGui.BeginChild("##advanced", new Vector2(0, 0), ImGuiChildFlags.Borders | ImGuiChildFlags.AutoResizeY);
 
-            var color = isActive ? Theme.ColAccent :
-                       isComplete ? Theme.ColSuccess :
-                       Theme.ColTextMuted;
 
-            ImGui.PushStyleColor(ImGuiCol.Button, color);
-            if (ImGui.Button($"{i + 1}. {steps[i]}", new Vector2(stepWidth - 5, 28)))
-            {
-                _wizardStep = i + 1;
-            }
-            ImGui.PopStyleColor();
 
-            if (i < steps.Length - 1)
-                ImGui.SameLine();
-        }
-
-        ImGui.Spacing();
+        ImGui.TextColored(Theme.ColAccent, "Advanced / Manual Controls");
         ImGui.Separator();
+        ImGui.Spacing();
 
-        // Step content
-        switch (_wizardStep)
-        {
-            case 1: RenderStep1Config(); break;
-            case 2: RenderStep2Verify(); break;
-            case 3: RenderStep3Test(); break;
-            case 4: RenderStep4Troubleshoot(); break;
-            default: _wizardStep = 1; break;
-        }
-
-        // Navigation
-        ImGui.Separator();
-        if (_wizardStep > 1 && ImGui.Button("<- Previous", new Vector2(100, 28)))
-        {
-            _wizardStep--;
-        }
+        // Permanent log info
+        ImGui.TextColored(Theme.ColTextMuted, "Permanent key log path:");
         ImGui.SameLine();
-        if (_wizardStep < 4 && ImGui.Button("Next ->", new Vector2(100, 28)))
+        ImGui.TextColored(Theme.Current?.Text ?? Vector4.One, _state.PermanentKeyLogPath);
+
+
+        if (File.Exists(_state.PermanentKeyLogPath))
         {
-            _wizardStep++;
+            var fi = new FileInfo(_state.PermanentKeyLogPath);
+            ImGui.TextColored(Theme.ColTextMuted, $"Size: {fi.Length:N0} bytes  |  Modified: {fi.LastWriteTime:HH:mm:ss}  |  Lines with keys: ~{(fi.Length / 120)}");
         }
-
-        ImGui.EndChild();
-        ImGui.PopStyleColor();
-
-        // RFC 9001 Reference Panel
-        if (_showRfcReference)
-        {
-            RenderRfc9001Reference();
-        }
-    }
-
-    private void RenderStep1Config()
-    {
-        ImGui.TextColored(Theme.ColAccent, "Step 1: Configure SSLKEYLOGFILE");
-        ImGui.TextWrapped("The SSLKEYLOGFILE environment variable must be set BEFORE Hytale starts. This captures TLS 1.3 secrets for key derivation.");
 
         ImGui.Spacing();
-        ImGui.Text("Current export directory:");
-        ImGui.TextColored(Theme.ColTextMuted, _state.ExportDirectory);
 
-        if (ImGui.Button("Open Export Folder", new Vector2(140, 28)))
-        {
-            try
-            {
-                System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);
-            }
-            catch { }
-        }
+        // Show env var status
+        string? userVal = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.User);
+        string? machVal = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Machine);
+        bool userOk  = string.Equals(userVal,  _state.PermanentKeyLogPath, StringComparison.OrdinalIgnoreCase);
+        bool machOk  = string.Equals(machVal,  _state.PermanentKeyLogPath, StringComparison.OrdinalIgnoreCase);
 
+        ImGui.TextColored(Theme.ColTextMuted, "SSLKEYLOGFILE env var:");
         ImGui.SameLine();
-        if (ImGui.Button("Check for Key Files", new Vector2(140, 28)))
-        {
-            _state.RefreshAllKeys();
-        }
-
-        var keyFiles = Directory.GetFiles(_state.ExportDirectory, "*.log")
-            .Where(f => f.Contains("ssl", StringComparison.OrdinalIgnoreCase) ||
-                       f.Contains("key", StringComparison.OrdinalIgnoreCase))
-            .ToList();
-
-        if (keyFiles.Any())
-        {
-            ImGui.TextColored(Theme.ColSuccess, $"OK Found {keyFiles.Count} key file(s)");
-            foreach (var f in keyFiles.Take(3))
-            {
-                ImGui.TextColored(Theme.ColTextMuted, $"  - {Path.GetFileName(f)}");
-            }
-        }
+        if (userOk || machOk)
+            ImGui.TextColored(Theme.ColSuccess, $"OK  ({(userOk ? "User" : "Machine")} scope)");
         else
-        {
-            ImGui.TextColored(Theme.ColWarn, "(!) No key files found. Set SSLKEYLOGFILE and restart Hytale.");
-        }
-    }
-
-    private void RenderStep2Verify()
-    {
-        ImGui.TextColored(Theme.ColAccent, "Step 2: Verify Keys Loaded");
-
-        var status = _state.GetKeyStatus();
-
-        if (status.TotalKeys == 0)
-        {
-            ImGui.TextColored(Theme.ColDanger, "XX No keys available. Go back to Step 1.");
-            return;
-        }
-
-        ImGui.TextColored(Theme.ColSuccess, $"OK {status.TotalKeys} key(s) available");
-
-        // Visual key cards
-        ImGui.Spacing();
-        ImGui.Text("Key Sources:");
-
-        foreach (var source in status.KeySources.Take(3))
-        {
-            var count = PacketDecryptor.DiscoveredKeys.Count(k => k.Source == source);
-            var type = PacketDecryptor.DiscoveredKeys.First(k => k.Source == source).Type;
-
-            ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.15f, 0.2f, 0.25f, 1f));
-            ImGui.BeginChild($"##keycard_{source.GetHashCode()}", new Vector2(200, 60), ImGuiChildFlags.Borders);
-
-            ImGui.TextColored(Theme.ColAccent, Path.GetFileName(source));
-            ImGui.TextColored(Theme.ColTextMuted, $"{count} keys, {type}");
-
-            ImGui.EndChild();
-            ImGui.PopStyleColor();
-            ImGui.SameLine();
-        }
-        ImGui.NewLine();
-
-        // Derivation check
-        var sampleKey = PacketDecryptor.DiscoveredKeys.First();
-        bool hasDerivedKeys = sampleKey.Secret != null && sampleKey.Key.Length == 16;
-
-        if (hasDerivedKeys)
-        {
-            ImGui.TextColored(Theme.ColSuccess, "OK Keys properly derived via RFC 9001 HKDF");
-        }
-        else
-        {
-            ImGui.TextColored(Theme.ColWarn, "(!) Raw TLS secrets detected - derivation may be needed");
-        }
-    }
-
-    private void RenderStep3Test()
-    {
-        ImGui.TextColored(Theme.ColAccent, "Step 3: Test Decryption");
-        ImGui.TextWrapped("Use the Test Lab panel below to verify your keys work with actual packets.");
-
-        if (PacketDecryptor.DiscoveredKeys.Count == 0)
-        {
-            ImGui.TextColored(Theme.ColDanger, "? No keys available. Complete Step 2 first.");
-            return;
-        }
-
-        ImGui.Spacing();
-
-        // Single button to open/highlight Test Lab
-        if (ImGui.Button("Open Test Lab ?", new Vector2(150, 40)))
-        {
-            // Scroll to Test Lab or set focus
-            _state.AddInGameLog("[WIZARD] Switch to Test Lab panel below to run tests");
-        }
-
-        ImGui.SameLine();
-
-        if (ImGui.Button("Verify Key Derivation", new Vector2(180, 40)))
-        {
-            VerifyKeyDerivation();
-        }
-
-        // Show quick status
-        var status = _state.GetKeyStatus();
-        if (status.SuccessfulDecryptions > 0)
-        {
-            ImGui.TextColored(Theme.ColSuccess, $"? {status.SuccessfulDecryptions} successful decryptions so far!");
-        }
-        else if (status.TotalKeys > 0)
-        {
-            ImGui.TextColored(Theme.ColWarn, "? Keys loaded but no successful decryptions yet. Use Test Lab.");
-        }
-    }
-
-    private void RenderStep4Troubleshoot()
-    {
-        ImGui.TextColored(Theme.ColAccent, "Step 4: Troubleshooting");
-
-        var status = _state.GetKeyStatus();
-
-        // Diagnostic checklist
-        ImGui.Text("Common Issues:");
-
-        bool check1 = status.TotalKeys > 0;
-        bool check2 = check1 && PacketDecryptor.DiscoveredKeys.Any(k => k.Secret != null);
-        bool check3 = check2 && PacketDecryptor.SuccessfulDecryptions > 0;
-        bool check4 = File.Exists(Path.Combine(_state.ExportDirectory, "sslkeys.log"));
-
-        RenderCheckItem("SSLKEYLOGFILE set", check4);
-        RenderCheckItem("Keys loaded", check1);
-        RenderCheckItem("Keys derived (RFC 9001)", check2);
-        RenderCheckItem("Successful decryption", check3);
+            ImGui.TextColored(Theme.ColDanger, $"Not pointing at our file  (User={userVal ?? "unset"})");
 
         ImGui.Spacing();
         ImGui.Separator();
-
-        if (!check1)
-        {
-            ImGui.TextColored(Theme.ColWarn, "Issue: No keys found");
-            ImGui.BulletText("Set SSLKEYLOGFILE environment variable");
-            ImGui.BulletText("Restart Hytale completely");
-            ImGui.BulletText("Check that the log file is being written");
-        }
-        else if (!check2)
-        {
-            ImGui.TextColored(Theme.ColWarn, "Issue: Keys not properly derived");
-            ImGui.BulletText("TLS secrets need HKDF derivation with 'quic key'/'quic iv' labels");
-            ImGui.BulletText("Hytale may use custom Netty codec - check version compatibility");
-        }
-        else if (!check3)
-        {
-            ImGui.TextColored(Theme.ColWarn, "Issue: Decryption failing with valid keys");
-            ImGui.BulletText("Packet number reconstruction may be failing");
-            ImGui.BulletText("Header protection removal may need adjustment");
-            ImGui.BulletText("Try memory scanning for live keys during gameplay");
-        }
-        else
-        {
-            ImGui.TextColored(Theme.ColSuccess, "OK All checks passed! Decryption should be working.");
-        }
-
-        // Debug info
-        ImGui.Spacing();
-        if (ImGui.Button("Copy Debug Info", new Vector2(120, 28)))
-        {
-            var debug = $"Keys: {status.TotalKeys}\n" +
-                       $"Derived: {PacketDecryptor.DiscoveredKeys.Count(k => k.Secret != null)}\n" +
-                       $"Success: {status.SuccessfulDecryptions}\n" +
-                       $"Failed: {status.FailedDecryptions}";
-            CopyToClipboard(debug);
-        }
-    }
-
-    private void RenderCheckItem(string label, bool passed)
-    {
-        var color = passed ? Theme.ColSuccess : Theme.ColDanger;
-        var icon = passed ? "OK" : "XX";
-        ImGui.TextColored(color, $"{icon} {label}");
-    }
-
-    private void RenderRfc9001Reference()
-    {
-        ImGui.Spacing();
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.08f, 0.1f, 0.12f, 1f));
-        ImGui.BeginChild("##rfc_ref", new Vector2(0, 200), ImGuiChildFlags.Borders);
-
-        ImGui.TextColored(new Vector4(0.4f, 0.8f, 1f, 1f), "RFC 9001 Key Derivation Reference");
-        ImGui.Separator();
-
-        ImGui.Text("TLS Secret -> QUIC Keys:");
-        ImGui.TextColored(Theme.ColTextMuted, "client_traffic_secret_0 [from SSLKEYLOGFILE]");
-        ImGui.Text("v HKDF-Expand-Label with 'quic key', '', 16");
-        ImGui.TextColored(Theme.ColTextMuted, "= AEAD key (16 bytes for AES-128-GCM)");
-        ImGui.Text("v HKDF-Expand-Label with 'quic iv', '', 12");
-        ImGui.TextColored(Theme.ColTextMuted, "= IV (12 bytes)");
-        ImGui.Text("v HKDF-Expand-Label with 'quic hp', '', 16");
-        ImGui.TextColored(Theme.ColTextMuted, "= Header protection key");
-
-        ImGui.Separator();
-        ImGui.Text("Labels (hex):");
-        ImGui.TextColored(Theme.ColTextMuted, "quic key: 00100e746c7331332071756963206b657900");
-        ImGui.TextColored(Theme.ColTextMuted, "quic iv:  000c0d746c733133207175696320697600");
-        ImGui.TextColored(Theme.ColTextMuted, "quic hp:  00100d746c733133207175696320687000");
-
-        if (ImGui.Button("Copy Labels", new Vector2(100, 24)))
-        {
-            CopyToClipboard("quic key, quic iv, quic hp");
-        }
-
-        ImGui.EndChild();
-        ImGui.PopStyleColor();
-    }
-
-    private void RenderKeyManagement(float width)
-    {
-        // Auto-decrypt toggle
-        bool autoDecrypt = PacketDecryptor.AutoDecryptEnabled;
-        if (ImGui.Checkbox("Enable Auto-Decrypt (may cause lag)", ref autoDecrypt))
-        {
-            PacketDecryptor.AutoDecryptEnabled = autoDecrypt;
-            if (autoDecrypt)
-                _state.AddInGameLog("[DECRYPTION] Auto-decrypt enabled");
-            else
-                _state.AddInGameLog("[DECRYPTION] Auto-decrypt disabled");
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-
-        // Manual key entry
-        ImGui.TextColored(Theme.ColAccent, "Manual Key Entry");
+        ImGui.TextColored(Theme.ColTextMuted, "Manual key entry:");
 
         string[] keyTypes = { "AES-128", "AES-256", "XOR" };
-        ImGui.Combo("Key Type", ref _selectedKeyType, keyTypes, keyTypes.Length);
-
-        ImGui.InputText("Key (hex)", ref _manualKey, 256);
-        ImGui.TextColored(Theme.ColTextMuted, "Example: 48 65 6C 6C 6F or 48656C6C6F");
-
-        if (ImGui.Button("Add Key", new Vector2(120, 28)))
-        {
-            AddManualKey();
-        }
-
+        ImGui.SetNextItemWidth(120);
+        ImGui.Combo("##kt", ref _selectedKeyType, keyTypes, keyTypes.Length);
         ImGui.SameLine();
-
-        if (ImGui.Button("Clear All Keys", new Vector2(120, 28)))
-        {
-            PacketDecryptor.ClearKeys();
-            _state.AddInGameLog("[DECRYPTION] All keys cleared");
-            _lastKeyCacheTime = DateTime.MinValue;
-        }
+        ImGui.SetNextItemWidth(300);
+        ImGui.InputText("##mk", ref _manualKey, 256);
+        ImGui.SameLine();
+        BtnAccent("Add##mk", AddManualKey);
 
         ImGui.Spacing();
-        ImGui.Separator();
+        BtnDanger("Clear All Keys", () =>
+        {
+            PacketDecryptor.ClearKeys();
+            _state.AddInGameLog("[DECRYPT] All keys cleared");
+            _lastKeyCacheTime = DateTime.MinValue;
+        });
+        ImGui.SameLine(0, 6);
+        BtnDanger("Clear + Wipe Log File", () => _state.ClearPermanentKeyLog());
+        ImGui.SameLine(0, 6);
+        BtnNeutral("RFC 9001 Reference", () => _showRfcRef = !_showRfcRef);
+        ImGui.SameLine(0, 6);
+        BtnNeutral("Verify Derivation", VerifyKeyDerivation);
 
-        // Discovered keys list
+        // Auto-decrypt toggle
+        ImGui.Spacing();
+        bool ad = PacketDecryptor.AutoDecryptEnabled;
+        if (ImGui.Checkbox("Auto-Decrypt on capture", ref ad))
+        {
+            PacketDecryptor.AutoDecryptEnabled = ad;
+            _state.AddInGameLog($"[DECRYPT] Auto-decrypt {(ad ? "ON" : "OFF")}");
+        }
+        ImGui.Spacing();
+        BtnAccent("EMERGENCY: Scan ALL Key Locations", () =>
+        {
+            _state.ScanAllPossibleKeyLocations();
+        });
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Searches everywhere for SSL key logs and imports them");
+
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
+        ImGui.Spacing();
+    }
+
+    // =========================================================================
+    // KEY STATS BAR
+    // =========================================================================
+    private void RenderKeyStatsBar()
+    {
+        var st = _state.GetKeyStatus();
         UpdateKeyCache();
 
-        int totalKeys = PacketDecryptor.DiscoveredKeys.Count;
-        ImGui.TextColored(Theme.ColAccent, $"Discovered Keys ({totalKeys})");
+        // Mini stat pills
+        StatPill("Keys",    st.TotalKeys.ToString(),                   st.TotalKeys > 0 ? Theme.ColSuccess : Theme.ColTextMuted);
+        ImGui.SameLine(0, 4);
+        StatPill("Decrypted", st.SuccessfulDecryptions.ToString("N0"), st.SuccessfulDecryptions > 0 ? Theme.ColSuccess : Theme.ColTextMuted);
+        ImGui.SameLine(0, 4);
+        StatPill("Failed",  st.FailedDecryptions.ToString("N0"),       st.FailedDecryptions > 0 ? Theme.ColWarn : Theme.ColTextMuted);
+        ImGui.SameLine(0, 4);
 
-        ImGui.BeginChild("##key_list", new Vector2(0, 150), ImGuiChildFlags.Borders);
-
-        int index = 0;
-        foreach (var key in _cachedKeys)
+        // Source breakdown
+        var sources = st.KeySources.Select(Path.GetFileName).Distinct().Take(3).ToList();
+        if (sources.Any())
         {
-            ImGui.PushID(index++);
+            ImGui.TextColored(Theme.ColTextMuted, " from:");
+            foreach (var src in sources)
+            {
+                ImGui.SameLine(0, 4);
+                ImGui.TextColored(Theme.ColTextMuted, src ?? "?");
+            }
+        }
 
-            bool isSelected = _selectedKeyIndex == index - 1;
-            var timeAgo = DateTime.Now - key.DiscoveredAt;
-            string timeStr = timeAgo.TotalMinutes < 1 ? "now" : $"{timeAgo.TotalMinutes:F0}m";
-            string useStr = key.UseCount > 0 ? $" (used {key.UseCount}x)" : "";
-            string derivedStr = key.Secret != null && key.Key.Length > 0 ? " [RFC9001]" : "";
+        // Last key time
+        if (st.LastKeyAdded.HasValue)
+        {
+            ImGui.SameLine(0, 10);
+            ImGui.TextColored(Theme.ColTextMuted, $"last: {st.LastKeyAdded.Value:HH:mm:ss}");
+        }
+    }
+
+    // =========================================================================
+    // KEY LIST (left column)
+    // =========================================================================
+    private void RenderKeyList()
+    {
+        ImGui.TextColored(Theme.ColAccent, $"Active Keys  ({_cachedKeys.Count})");
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        ImGui.BeginChild("##klist", new Vector2(-1, -1), ImGuiChildFlags.Borders);
+
+        if (_cachedKeys.Count == 0)
+        {
+            ImGui.Spacing();
+            ImGui.SetCursorPosX(10);
+            ImGui.TextColored(Theme.ColTextMuted, "No keys yet.");
+            ImGui.SetCursorPosX(10);
+            ImGui.TextColored(Theme.ColTextMuted, "Launch Hytale -- they'll appear here automatically.");
+            ImGui.EndChild();
+            return;
+        }
+
+        for (int i = 0; i < _cachedKeys.Count; i++)
+        {
+            var  k   = _cachedKeys[i];
+            bool sel = _selectedKeyIndex == i;
+            ImGui.PushID(i);
+
+            var cc = k.Type switch
+            {
+                PacketDecryptor.EncryptionType.QUIC_Client1RTT    => Theme.ColSuccess,
+                PacketDecryptor.EncryptionType.QUIC_Server1RTT    => Theme.ColAccent,
+                PacketDecryptor.EncryptionType.QUIC_ClientHandshake => Theme.ColInfo,
+                PacketDecryptor.EncryptionType.QUIC_ServerHandshake => Theme.ColInfo,
+                PacketDecryptor.EncryptionType.QUIC_Client0RTT    => Theme.ColWarn,
+                _ => Theme.ColTextMuted
+            };
+
+            // Color bar
+            ImGui.PushStyleColor(ImGuiCol.Text, cc);
+            ImGui.Text("|");
+            ImGui.PopStyleColor();
+            ImGui.SameLine(0, 4);
 
             ImGui.BeginGroup();
+            string ago     = (DateTime.Now - k.DiscoveredAt).TotalMinutes < 1 ? "just now"
+                           : $"{(DateTime.Now - k.DiscoveredAt).TotalMinutes:F0}m ago";
+            string derived = k.Key.Length == 16 ? " [RFC9001]" : "";
+            bool   isSelected = ImGui.Selectable($"{k.Type}{derived}##k{i}", sel,
+                                                 ImGuiSelectableFlags.AllowOverlap | ImGuiSelectableFlags.SpanAllColumns,
+                                                 new Vector2(0, sel ? 52 : 32));
+            if (isSelected) _selectedKeyIndex = sel ? -1 : i;
 
-            if (isSelected)
-                ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColAccent);
+            ImGui.SameLine();
+            ImGui.TextColored(Theme.ColTextMuted, $"{ago}  used:{k.UseCount}x");
 
-            ImGui.Text($"{key.Type}{derivedStr} [{timeStr}]{useStr}");
-
-            if (isSelected)
-                ImGui.PopStyleColor();
-
-            ImGui.TextColored(Theme.ColTextMuted, $"  Source: {Path.GetFileName(key.Source)}");
-
-            string keyPreview = FormatKeyPreview(key.Key);
-            ImGui.Text($"  Key: {keyPreview}");
-
-            ImGui.EndGroup();
-
-            if (ImGui.IsItemClicked())
+            if (sel)
             {
-                _selectedKeyIndex = isSelected ? -1 : index - 1;
+                ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 8);
+                ImGui.TextColored(Theme.ColTextMuted, $"src: {Path.GetFileName(k.Source)}");
+                if (k.Key.Length > 0)
+                {
+                    string kp = BitConverter.ToString(k.Key.Take(8).ToArray()).Replace("-", " ") + "...";
+                    ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 8);
+                    ImGui.TextColored(Theme.ColTextMuted, $"key: {kp} ({k.Key.Length * 8}bit)");
+                }
             }
+            ImGui.EndGroup();
 
             ImGui.Separator();
             ImGui.PopID();
         }
 
-        if (_cachedKeys.Count == 0)
-        {
-            ImGui.TextColored(Theme.ColTextMuted, "No keys discovered yet");
-        }
-
         ImGui.EndChild();
     }
 
-    private void RenderTestLabAndStats(float width)
+    // =========================================================================
+    // TEST LAB (right column)
+    // =========================================================================
+    private void RenderTestLab()
     {
-        ImGui.TextColored(Theme.ColAccent, "?? Test Lab");
+        ImGui.TextColored(Theme.ColAccent, "Test Lab");
         ImGui.Separator();
-
-        // Quick test buttons
-        if (ImGui.Button("Verify Key Derivation (RFC 9001)", new Vector2(220, 32)))
-        {
-            VerifyKeyDerivation();
-        }
-        ImGui.SameLine();
-
-        if (ImGui.Button("Test Last QUIC Packet", new Vector2(160, 32)))
-        {
-            TestLastQuicPacket();
-        }
-
         ImGui.Spacing();
 
-        // Manual hex input
-        ImGui.InputTextMultiline("##testlab_hex", ref _testLabHex, 4096, new Vector2(width - 100, 80));
-        ImGui.SameLine();
+        BtnSuccess("Test Last QUIC Packet", TestLastQuicPacket);
+        ImGui.SameLine(0, 6);
+        BtnNeutral("Verify RFC 9001 Derivation", VerifyKeyDerivation);
 
-        if (ImGui.Button("Paste", new Vector2(80, 36)))
-        {
-            try { _testLabHex = TextCopy.ClipboardService.GetText() ?? ""; } catch { }
-        }
+        ImGui.Spacing();
+        ImGui.TextColored(Theme.ColTextMuted, "Manual hex:");
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputTextMultiline("##tlhex", ref _testLabHex, 8192, new Vector2(-1, 75));
 
-        if (ImGui.Button("Test", new Vector2(80, 36)))
-        {
-            TestManualHexDecrypt();
-        }
+        BtnAccent("Decrypt##tl", TestManualHexDecrypt);
+        ImGui.SameLine(0, 4);
+        BtnNeutral("Paste##tl", () => { try { _testLabHex = TextCopy.ClipboardService.GetText() ?? ""; } catch { } });
+        ImGui.SameLine(0, 4);
+        BtnNeutral("Clear##tl", () => { _testLabHex = ""; _testLabResult = ""; });
 
-        // Result display
-        if (!string.IsNullOrEmpty(_testLabResult))
-        {
-            var color = _testLabResult.StartsWith("SUCCESS") ? Theme.ColSuccess : Theme.ColDanger;
-            ImGui.TextColored(color, _testLabResult);
-        }
-
-        // Key status
+        ImGui.Spacing();
         ImGui.Separator();
-        var status = _state.GetKeyStatus();
-        ImGui.Text($"Keys: {status.TotalKeys} | Success: {status.SuccessfulDecryptions} | Failed: {status.FailedDecryptions}");
-    }
 
-    private void PrepareFreshKeyLog()
-    {
-        try
+        if (_testLabRunning)
+            ImGui.TextColored(Theme.ColWarn, "Running...");
+        else if (!string.IsNullOrEmpty(_testLabResult))
         {
-            // Clear old keys
-            PacketDecryptor.ClearKeys();
-            _state.AddInGameLog("[KEYLOG] Cleared old keys from memory");
-
-            // Generate session-specific filename
-            string sessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            string keyLogPath = Path.Combine(_state.ExportDirectory, $"sslkeys_session_{sessionId}.log");
-
-            // Ensure directory exists
-            Directory.CreateDirectory(_state.ExportDirectory);
-
-            // Create empty file (triggers file watcher)
-            File.WriteAllText(keyLogPath, "# Fresh session key log\r\n");
-
-            // Set environment variable for this process
-            Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.Process);
-
-            _state.AddInGameLog($"[KEYLOG] Fresh key log ready: {Path.GetFileName(keyLogPath)}");
-            _state.AddInGameLog("[KEYLOG] >>> NOW START HYTALE <<<");
-
-            // Update status
-            _statusMessage = "Fresh key log ready - start Hytale now!";
-            _statusTime = (float)ImGui.GetTime();
-
-            // Refresh key cache
-            _lastKeyCacheTime = DateTime.MinValue;
-        }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[KEYLOG] Error: {ex.Message}");
-        }
-    }
-
-    // ===== Supporting Methods =====
-
-    private PacketDecryptor.DecryptionResult? _lastDecryptionResult = null;
-
-    private void TestLastQuicPacket()
-    {
-        var lastQuic = _state.PacketLog.GetLast(50).LastOrDefault(p => !p.IsTcp);
-        if (lastQuic != null)
-        {
-            TestDecryptPacket(lastQuic);
+            var rc = _testLabResult.StartsWith("SUCCESS") ? Theme.ColSuccess : Theme.ColDanger;
+            ImGui.TextColored(rc, _testLabResult);
         }
         else
+            ImGui.TextColored(Theme.ColTextMuted, "Run a test to see results.");
+
+        if (_lastResult?.Success == true && _lastResult.DecryptedData != null)
         {
-            _state.AddInGameLog("[TESTLAB] No QUIC packets found in recent history");
-            _testLabResult = "No QUIC packets available";
-        }
+            ImGui.Spacing();
+            ImGui.Separator();
+            ImGui.TextColored(Theme.ColAccent, "Last Result:");
+            ImGui.TextColored(Theme.ColTextMuted, $"  {_lastResult.DecryptedData.Length}B  |  PN={_lastResult.PacketNumber}  |  {_lastResult.Metadata.GetValueOrDefault("algorithm","?")}");
+            string hex16 = BitConverter.ToString(_lastResult.DecryptedData.Take(16).ToArray()).Replace("-", " ");
+            ImGui.TextColored(Theme.ColSuccess, $"  {hex16}...");
 
-
-    }
-
-    private void TestLastTcpPacket()
-    {
-        var lastTcp = _state.PacketLog.GetLast(50).LastOrDefault(p => p.IsTcp);
-        if (lastTcp != null)
-        {
-            TestDecryptPacket(lastTcp);
-        }
-        else
-        {
-            _state.AddInGameLog("[TESTLAB] No TCP packets found in recent history");
-            _testLabResult = "No TCP packets available";
-        }
-    }
-
-    private void TestDecryptPacket(Data.PacketLogEntry pkt)
-    {
-        _testLabRunning = true;
-        _testLabResult = "Starting decryption test...";
-
-        Task.Run(() =>
-        {
-            try
+            BtnNeutral("Export Decrypted", () =>
             {
-                _state.AddInGameLog($"[TESTLAB] ========== DECRYPT TEST ==========");
-                _state.AddInGameLog($"[TESTLAB] Packet: {(pkt.IsTcp ? "TCP" : "QUIC")} 0x{pkt.OpcodeDecimal:X4}");
-                _state.AddInGameLog($"[TESTLAB] Size: {pkt.ByteLength} bytes");
-                _state.AddInGameLog($"[TESTLAB] Direction: {pkt.DirStr}");
-                _state.AddInGameLog($"[TESTLAB] First 16 bytes: {BitConverter.ToString(pkt.RawBytes.Take(16).ToArray())}");
-
-                // === DIAGNOSTIC: Check keys first ===
-                var keyStatus = _state.GetKeyStatus();
-                _state.AddInGameLog($"[TESTLAB] Available keys: {keyStatus.TotalKeys}");
-
-                if (keyStatus.TotalKeys == 0)
-                {
-                    _testLabResult = "FAILED: No encryption keys available";
-                    _state.AddInGameLog("[TESTLAB] XX No keys loaded - set SSLKEYLOGFILE and restart Hytale");
-                    _testLabRunning = false;
-                    return;
-                }
-
-                // Show key details
-                var firstKey = PacketDecryptor.DiscoveredKeys.First();
-                _state.AddInGameLog($"[TESTLAB] Using key: {firstKey.Type}");
-                _state.AddInGameLog($"[TESTLAB]   Key length: {firstKey.Key.Length} bytes (need 16 for AES-128)");
-                _state.AddInGameLog($"[TESTLAB]   IV length: {firstKey.IV.Length} bytes (need 12)");
-                _state.AddInGameLog($"[TESTLAB]   Has HP key: {firstKey.HeaderProtectionKey != null}");
-
-                if (!pkt.IsTcp && pkt.QuicInfo != null)
-                {
-                    _state.AddInGameLog($"[TESTLAB] QUIC Header: {pkt.QuicInfo.HeaderType}");
-                    _state.AddInGameLog($"[TESTLAB] Packet Number Length: {pkt.QuicInfo.PacketNumberLength}");
-                }
-
-                // === ATTEMPT DECRYPTION ===
-                var result = PacketDecryptor.TryDecryptManual(pkt.RawBytes, 15000);
-                _lastDecryptionResult = result;
-
-                if (result.Success && result.DecryptedData != null)
-                {
-                    _testLabResult = $"SUCCESS! Decrypted {result.DecryptedData.Length} bytes | PN: {result.PacketNumber} | Algo: {result.Metadata.GetValueOrDefault("algorithm", "unknown")}";
-                    _state.AddInGameLog($"[TESTLAB] OK SUCCESS!");
-                    _state.AddInGameLog($"[TESTLAB]   Decrypted bytes: {result.DecryptedData.Length}");
-                    _state.AddInGameLog($"[TESTLAB]   Packet Number: {result.PacketNumber}");
-                    _state.AddInGameLog($"[TESTLAB]   Algorithm: {result.Metadata.GetValueOrDefault("algorithm", "unknown")}");
-                    _state.AddInGameLog($"[TESTLAB]   First 32 bytes: {BitConverter.ToString(result.DecryptedData.Take(32).ToArray())}");
-                }
-                else
-                {
-                    _testLabResult = $"FAILED: {result.ErrorMessage}";
-                    _state.AddInGameLog($"[TESTLAB] XX FAILED: {result.ErrorMessage}");
-
-                    // === DETAILED DIAGNOSTICS BASED ON FAILURE TYPE ===
-                    if (result.ErrorMessage.Contains("authentication tag"))
-                    {
-                        _state.AddInGameLog("[TESTLAB]   -> AUTH TAG FAILURE: Key mismatch or wrong packet number");
-                        _state.AddInGameLog("[TESTLAB]   -> Try: Verify key derivation with RFC 9001 test");
-                        _state.AddInGameLog("[TESTLAB]   -> Try: Check if packet uses different cipher suite");
-                    }
-                    else if (result.ErrorMessage.Contains("header protection"))
-                    {
-                        _state.AddInGameLog("[TESTLAB]   -> HEADER PROTECTION FAILURE");
-                        _state.AddInGameLog("[TESTLAB]   -> Try: HP key may be wrong - check derivation");
-                        _state.AddInGameLog("[TESTLAB]   -> Try: Packet may use different HP algorithm");
-                    }
-                    else if (result.ErrorMessage.Contains("Timeout"))
-                    {
-                        _state.AddInGameLog("[TESTLAB]   -> TIMEOUT: Tried many combinations, all failed");
-                        _state.AddInGameLog("[TESTLAB]   -> Keys are likely wrong or packet is not encrypted");
-                    }
-                    else if (result.ErrorMessage.Contains("No valid keys"))
-                    {
-                        _state.AddInGameLog("[TESTLAB]   -> Keys found but marked invalid (check lengths)");
-                    }
-                    else if (result.ErrorMessage.Contains("Max attempts"))
-                    {
-                        _state.AddInGameLog("[TESTLAB]   -> BRUTE FORCE EXHAUSTED: Tried 5000+ PN/offset combos");
-                        _state.AddInGameLog("[TESTLAB]   -> Keys are likely correct but packet structure differs");
-                        _state.AddInGameLog("[TESTLAB]   -> Hytale may use custom Netty codec, not standard QUIC");
-                    }
-
-                    // === KEY VERIFICATION SUGGESTION ===
-                    _state.AddInGameLog("[TESTLAB] ");
-                    _state.AddInGameLog("[TESTLAB] RECOMMENDATION: Run 'Verify Key Derivation' to check");
-                    _state.AddInGameLog("[TESTLAB] that your TLS secrets are being converted to QUIC keys");
-                    _state.AddInGameLog("[TESTLAB] correctly per RFC 9001.");
-                }
-            }
-            catch (Exception ex)
-            {
-                _testLabResult = $"ERROR: {ex.Message}";
-                _state.AddInGameLog($"[TESTLAB] Exception: {ex.Message}");
-                _state.AddInGameLog($"[TESTLAB] Stack trace: {ex.StackTrace}");
-            }
-            finally
-            {
-                _testLabRunning = false;
-            }
-        });
-    }
-
-    private void TestManualHexDecrypt()
-    {
-        if (string.IsNullOrWhiteSpace(_testLabHex))
-        {
-            _testLabResult = "No hex data entered";
-            return;
-        }
-
-        _testLabRunning = true;
-        _testLabResult = "Parsing hex and decrypting...";
-
-        Task.Run(() =>
-        {
-            try
-            {
-                // Clean and parse hex
-                var cleanHex = new string(_testLabHex.Where(c => char.IsLetterOrDigit(c)).ToArray());
-
-                if (cleanHex.Length % 2 != 0)
-                {
-                    _testLabResult = "FAILED: Invalid hex length (must be even)";
-                    _testLabRunning = false;
-                    return;
-                }
-
-                byte[] data;
                 try
                 {
-                    data = Convert.FromHexString(cleanHex);
+                    string fn = Path.Combine(_state.ExportDirectory,
+                        $"decrypted_{DateTime.Now:yyyyMMdd_HHmmss}.bin");
+                    File.WriteAllBytes(fn, _lastResult.DecryptedData);
+                    _state.AddInGameLog($"[TESTLAB] Saved {Path.GetFileName(fn)}");
                 }
-                catch
-                {
-                    _testLabResult = "FAILED: Invalid hex format";
-                    _testLabRunning = false;
-                    return;
-                }
-
-                _state.AddInGameLog($"[TESTLAB] Manual hex test: {data.Length} bytes");
-
-                var result = PacketDecryptor.TryDecryptManual(data, 15000);
-                _lastDecryptionResult = result;
-
-                if (result.Success && result.DecryptedData != null)
-                {
-                    _testLabResult = $"SUCCESS! Decrypted {result.DecryptedData.Length} bytes | PN: {result.PacketNumber}";
-                    _state.AddInGameLog($"[TESTLAB] OK Manual decrypt SUCCESS");
-                }
-                else
-                {
-                    _testLabResult = $"FAILED: {result.ErrorMessage}";
-                    _state.AddInGameLog($"[TESTLAB] XX Manual decrypt failed: {result.ErrorMessage}");
-                }
-            }
-            catch (Exception ex)
-            {
-                _testLabResult = $"ERROR: {ex.Message}";
-            }
-            finally
-            {
-                _testLabRunning = false;
-            }
-        });
-    }
-
-    private void SaveDecryptedToFile(byte[] data)
-    {
-        try
-        {
-            string filename = Path.Combine(_state.ExportDirectory,
-                $"decrypted_{DateTime.Now:yyyyMMdd_HHmmss}.bin");
-            Directory.CreateDirectory(_state.ExportDirectory);
-            File.WriteAllBytes(filename, data);
-            _state.AddInGameLog($"[TESTLAB] Saved decrypted data to {filename}");
-        }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[TESTLAB] Save failed: {ex.Message}");
+                catch { }
+            });
         }
     }
 
-    private string FormatKeyPreview(byte[] key)
+    // =========================================================================
+    // RFC REFERENCE
+    // =========================================================================
+    private void RenderRfcRef()
     {
-        if (key.Length <= 16)
-            return BitConverter.ToString(key).Replace("-", " ");
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(.07f,.09f,.11f,1f));
+        ImGui.BeginChild("##rfc", new Vector2(0, 185), ImGuiChildFlags.Borders);
 
-        // Show first 8 and last 4 bytes for longer keys
-        var first = BitConverter.ToString(key.Take(8).ToArray()).Replace("-", " ");
-        var last = BitConverter.ToString(key.Skip(key.Length - 4).ToArray()).Replace("-", " ");
-        return $"{first} ... {last} ({key.Length} bytes)";
+        ImGui.TextColored(Theme.ColInfo, "RFC 9001 -- TLS 1.3 Secret -> QUIC Keys");
+        ImGui.Separator();
+        ImGui.TextColored(Theme.ColTextMuted, "From SSLKEYLOGFILE:  CLIENT_TRAFFIC_SECRET_0  (32 or 48 bytes)");
+        ImGui.TextColored(Theme.ColAccent,    "  -> HKDF-Expand-Label(secret, \"quic key\", \"\", 16)  =  AEAD key (AES-128-GCM)");
+        ImGui.TextColored(Theme.ColAccent,    "  -> HKDF-Expand-Label(secret, \"quic iv\",  \"\", 12)  =  IV");
+        ImGui.TextColored(Theme.ColAccent,    "  -> HKDF-Expand-Label(secret, \"quic hp\",  \"\", 16)  =  Header protection key");
+        ImGui.Spacing();
+        ImGui.TextColored(Theme.ColTextMuted, "Nonce = IV XOR packet_number  |  Cipher: AES-128-GCM");
+        ImGui.Separator();
+        ImGui.TextColored(Theme.ColTextMuted, "quic key: 00 10 0e 74 6c 73 31 33 20 71 75 69 63 20 6b 65 79 00");
+        ImGui.TextColored(Theme.ColTextMuted, "quic iv:  00 0c 0d 74 6c 73 31 33 20 71 75 69 63 20 69 76 00");
+        ImGui.TextColored(Theme.ColTextMuted, "quic hp:  00 10 0d 74 6c 73 31 33 20 71 75 69 63 20 68 70 00");
+        ImGui.Spacing();
+        BtnNeutral("Close", () => _showRfcRef = false);
+        ImGui.SameLine();
+        BtnNeutral("Copy Labels", () => { try { TextCopy.ClipboardService.SetText("quic key, quic iv, quic hp"); } catch { } });
+
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
+    }
+
+    // =========================================================================
+    // HELPERS
+    // =========================================================================
+    private void UpdateKeyCache()
+    {
+        if (DateTime.Now - _lastKeyCacheTime > TimeSpan.FromSeconds(3))
+        {
+            _cachedKeys       = PacketDecryptor.DiscoveredKeys.OrderByDescending(k => k.UseCount).Take(25).ToList();
+            _lastKeyCacheTime = DateTime.Now;
+        }
     }
 
     private void AddManualKey()
     {
         try
         {
-            var hexString = _manualKey.Replace(" ", "").Replace("-", "");
-            var keyBytes = Convert.FromHexString(hexString);
-
-            if (keyBytes.Length != 16 && keyBytes.Length != 32)
-            {
-                _state.AddInGameLog($"[ERROR] Key must be 16 or 32 bytes, got {keyBytes.Length}");
-                return;
-            }
-
+            var data = Convert.FromHexString(_manualKey.Replace(" ","").Replace("-",""));
+            if (data.Length != 16 && data.Length != 32)
+            { _state.AddInGameLog($"[KEY] Need 16 or 32 bytes, got {data.Length}"); return; }
             var key = new PacketDecryptor.EncryptionKey
             {
-                Key = keyBytes,
-                IV = new byte[12],
-                Type = _selectedKeyType switch
-                {
-                    0 => PacketDecryptor.EncryptionType.AES128GCM,
-                    1 => PacketDecryptor.EncryptionType.AES256GCM,
-                    2 => PacketDecryptor.EncryptionType.XOR,
-                    _ => PacketDecryptor.EncryptionType.AES256GCM
-                },
-                Source = "Manual Entry"
+                Key    = data,
+                IV     = new byte[12],
+                Type   = _selectedKeyType switch { 0 => PacketDecryptor.EncryptionType.AES128GCM,
+                                                   2 => PacketDecryptor.EncryptionType.XOR,
+                                                   _ => PacketDecryptor.EncryptionType.AES256GCM },
+                Source = "Manual"
             };
-
             PacketDecryptor.AddKey(key);
-            _state.AddInGameLog($"[DECRYPTION] Added manual {key.Type} key ({keyBytes.Length} bytes)");
-            _manualKey = "";
+            _state.AddInGameLog($"[KEY] Manual {key.Type} ({data.Length*8}bit) added");
+            _manualKey        = "";
             _lastKeyCacheTime = DateTime.MinValue;
         }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[ERROR] Invalid key format: {ex.Message}");
-        }
+        catch (Exception ex) { _state.AddInGameLog($"[KEY] {ex.Message}"); }
     }
 
+    private void TestLastQuicPacket()
+    {
+        var pkt = _state.PacketLog.GetLast(50).LastOrDefault(p => !p.IsTcp);
+        if (pkt == null) { _testLabResult = "No QUIC packets captured yet"; return; }
+        RunDecryptTest(pkt.RawBytes, $"QUIC 0x{pkt.OpcodeDecimal:X4}");
+    }
 
+    private void TestManualHexDecrypt()
+    {
+        if (string.IsNullOrWhiteSpace(_testLabHex)) { _testLabResult = "Enter hex data first"; return; }
+        try
+        {
+            var clean = new string(_testLabHex.Where(char.IsLetterOrDigit).ToArray());
+            if (clean.Length % 2 != 0) { _testLabResult = "Odd-length hex"; return; }
+            RunDecryptTest(Convert.FromHexString(clean), "manual hex");
+        }
+        catch (Exception ex) { _testLabResult = $"Parse error: {ex.Message}"; }
+    }
 
-    // Add this method to DecryptionTab class
+    private void RunDecryptTest(byte[] data, string label)
+    {
+        if (_testLabRunning) return;
+        _testLabRunning = true;
+        _testLabResult  = "Decrypting...";
+        Task.Run(() =>
+        {
+            try
+            {
+                _state.AddInGameLog($"[TESTLAB] {label} ({data.Length}B)");
+                var r = PacketDecryptor.TryDecryptManual(data, 15000);
+                _lastResult     = r;
+                _testLabResult  = r.Success && r.DecryptedData != null
+                    ? $"SUCCESS! {r.DecryptedData.Length}B  PN={r.PacketNumber}"
+                    : $"FAILED: {r.ErrorMessage}";
+                _state.AddInGameLog($"[TESTLAB] {_testLabResult}");
+            }
+            catch (Exception ex) { _testLabResult = $"ERROR: {ex.Message}"; }
+            finally { _testLabRunning = false; }
+        });
+    }
+
     private void VerifyKeyDerivation()
     {
-        _state.AddInGameLog("[DIAG] Running key derivation verification...");
-
-        try
+        Task.Run(() =>
         {
-            // RFC 9001 test vector from https://www.rfc-editor.org/rfc/rfc9001.html#name-initial-secrets
-            // These are the official test vectors for QUIC-TLS key derivation
-
-            // For client_initial with client_random = 0000000000000000000000000000000000000000000000000000000000000000
-            // initial_secret = HKDF-Extract(initial_salt, client_dst_connection_id)
-            // client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
-
-            // Using simpler test: directly test with known good vector
-            // From RFC 9001 Appendix A (sample packet)
-
-            var testSecret = Convert.FromHexString("c00cf151ca5be075ed0ebfb5c80323c42d0b93d0c1b2c177cf0733a5");
-
-            // Expected values for "quic key" (16 bytes), "quic iv" (12 bytes), "quic hp" (16 bytes)
-            var expectedKey = Convert.FromHexString("c6d98ff1461c9f2a8a3d8d26c0b0e7f0");
-            var expectedIV = Convert.FromHexString("e0459b3474bdd0e44a41ba14");
-            var expectedHP = Convert.FromHexString("25a282b9e82f06f2f73c5ebe6d3a056e");
-
-            _state.AddInGameLog("[DIAG] Testing with RFC 9001 test vector...");
-            _state.AddInGameLog($"[DIAG] Input secret: {BitConverter.ToString(testSecret)}");
-
-            var testKey = new PacketDecryptor.EncryptionKey
+            try
             {
-                Secret = testSecret,
-                Type = PacketDecryptor.EncryptionType.QUIC_Client1RTT,
-                Source = "RFC 9001 Test Vector"
-            };
-
-            // Call the fixed derivation
-            PacketDecryptor.DeriveQUICKeys(testKey);
-
-            bool keyOk = testKey.Key.Length == 16 && testKey.Key.SequenceEqual(expectedKey);
-            bool ivOk = testKey.IV.Length == 12 && testKey.IV.SequenceEqual(expectedIV);
-            bool hpOk = testKey.HeaderProtectionKey != null &&
-                        testKey.HeaderProtectionKey.Length == 16 &&
-                        testKey.HeaderProtectionKey.SequenceEqual(expectedHP);
-
-            _state.AddInGameLog($"[DIAG] Expected Key: {BitConverter.ToString(expectedKey)}");
-            _state.AddInGameLog($"[DIAG] Got Key:      {BitConverter.ToString(testKey.Key)}");
-            _state.AddInGameLog($"[DIAG] Key match:    {(keyOk ? "PASS OK" : "FAIL XX")}");
-
-            _state.AddInGameLog($"[DIAG] Expected IV:  {BitConverter.ToString(expectedIV)}");
-            _state.AddInGameLog($"[DIAG] Got IV:       {BitConverter.ToString(testKey.IV)}");
-            _state.AddInGameLog($"[DIAG] IV match:     {(ivOk ? "PASS OK" : "FAIL XX")}");
-
-            _state.AddInGameLog($"[DIAG] Expected HP:  {BitConverter.ToString(expectedHP)}");
-            _state.AddInGameLog($"[DIAG] Got HP:       {BitConverter.ToString(testKey.HeaderProtectionKey ?? Array.Empty<byte>())}");
-            _state.AddInGameLog($"[DIAG] HP match:     {(hpOk ? "PASS OK" : "FAIL XX")}");
-
-            if (keyOk && ivOk && hpOk)
-            {
-                _state.AddInGameLog("[DIAG] OK All RFC 9001 test vectors PASSED - HKDF implementation is correct");
-            }
-            else
-            {
-                _state.AddInGameLog("[DIAG] XX RFC 9001 test vectors FAILED - HKDF implementation has bugs");
-            }
-
-            // Also test with actual loaded keys if available
-            if (PacketDecryptor.DiscoveredKeys.Count > 0)
-            {
-                _state.AddInGameLog("[DIAG] Checking loaded keys...");
-                var firstKey = PacketDecryptor.DiscoveredKeys.First();
-                _state.AddInGameLog($"[DIAG]   First key type: {firstKey.Type}");
-                _state.AddInGameLog($"[DIAG]   Key length: {firstKey.Key.Length} bytes");
-                _state.AddInGameLog($"[DIAG]   IV length: {firstKey.IV.Length} bytes");
-                _state.AddInGameLog($"[DIAG]   Has HP key: {firstKey.HeaderProtectionKey != null}");
-
-                if (firstKey.Secret != null)
+                _state.AddInGameLog("[DIAG] RFC 9001 derivation check (Appendix A.1)...");
+                // RFC 9001 Appendix A.1 official test vector:
+                // client_initial_secret derived from DCID=8394c8f03e515708
+                var secret = Convert.FromHexString(
+                    "c00cf151ca5be075ed0ebfb5c80323c4" +
+                    "2d0b7bef575472db26359bdd9a4e507");   // 32 bytes (AES-128-GCM / SHA-256)
+                var k = new PacketDecryptor.EncryptionKey
                 {
-                    _state.AddInGameLog($"[DIAG]   Secret length: {firstKey.Secret.Length} bytes");
-                }
-                else
-                {
-                    _state.AddInGameLog("[DIAG]   (!) No secret stored - key was not derived from TLS");
-                }
+                    Secret = secret,
+                    Type   = PacketDecryptor.EncryptionType.QUIC_Client1RTT,
+                    Source = "RFC9001-TestVector"
+                };
+                PacketDecryptor.DeriveQUICKeys(k);
+
+                // RFC 9001 Appendix A.1 expected outputs:
+                bool kOk = k.Key.SequenceEqual(
+                    Convert.FromHexString("1f369613dd76d5467730efcbe3b1a22d"));
+                bool iOk = k.IV.SequenceEqual(
+                    Convert.FromHexString("fa044b2f42a3fd3b46fb255c"));
+                bool hOk = k.HeaderProtectionKey?.SequenceEqual(
+                    Convert.FromHexString("9f50449e04a0e810283a1e9933adedd2")) == true;
+
+                string kStr = kOk ? "PASS" : $"FAIL (got {(k.Key.Length > 0 ? Convert.ToHexString(k.Key) : "empty")})";
+                string iStr = iOk ? "PASS" : $"FAIL (got {(k.IV.Length  > 0 ? Convert.ToHexString(k.IV)  : "empty")})";
+                string hStr = hOk ? "PASS" : $"FAIL (got {(k.HeaderProtectionKey != null ? Convert.ToHexString(k.HeaderProtectionKey) : "null")})";
+
+                _state.AddInGameLog($"[DIAG] Key:{kStr}  IV:{iStr}  HP:{hStr}");
+                _state.AddInGameLog(kOk && iOk && hOk
+                    ? "[DIAG] ✓ RFC 9001 HKDF is correct"
+                    : "[DIAG] ✗ HKDF derivation failed -- see values above");
             }
-            else
-            {
-                _state.AddInGameLog("[DIAG] (!) No keys loaded yet");
-            }
-        }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[DIAG] Error during verification: {ex.Message}");
-            _state.AddInGameLog($"[DIAG] Stack: {ex.StackTrace}");
-        }
+            catch (Exception ex) { _state.AddInGameLog($"[DIAG] {ex.Message}"); }
+        });
     }
 
-    private void ExportKeys()
+    // ── Styled button helpers ─────────────────────────────────────────────────
+    private static void BtnAccent(string label, Action onClick)
     {
-        try
-        {
-            var sb = new StringBuilder();
-            sb.AppendLine("=== HYFORCE ENCRYPTION KEYS ===");
-            sb.AppendLine($"Export Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            sb.AppendLine();
-
-            foreach (var key in PacketDecryptor.DiscoveredKeys)
-            {
-                sb.AppendLine($"Type: {key.Type}");
-                sb.AppendLine($"Source: {key.Source}");
-                if (key.Secret != null)
-                    sb.AppendLine($"Secret: {Convert.ToHexString(key.Secret)}");
-                sb.AppendLine($"Key: {Convert.ToHexString(key.Key)}");
-                sb.AppendLine($"IV: {Convert.ToHexString(key.IV)}");
-                sb.AppendLine();
-            }
-
-            string filename = Path.Combine(_state.ExportDirectory,
-                $"keys_export_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-            Directory.CreateDirectory(_state.ExportDirectory);
-            File.WriteAllText(filename, sb.ToString());
-
-            _state.AddInGameLog($"[DECRYPTION] Keys exported to {filename}");
-        }
-        catch (Exception ex)
-        {
-            _state.AddInGameLog($"[ERROR] Export failed: {ex.Message}");
-        }
+        var c = Theme.ColAccent;
+        ImGui.PushStyleColor(ImGuiCol.Button,  new Vector4(c.X*.28f, c.Y*.28f, c.Z*.28f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(c.X*.42f, c.Y*.42f, c.Z*.42f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text,    c);
+        ImGui.PushStyleColor(ImGuiCol.Border,  c with { W = .65f });
+        if (ImGui.Button(label)) onClick();
+        ImGui.PopStyleColor(4);
     }
-
-    private void CopyToClipboard(string text)
+    private static void BtnSuccess(string label, Action onClick)
     {
-        try { TextCopy.ClipboardService.SetText(text); } catch { }
+        var c = Theme.ColSuccess;
+        ImGui.PushStyleColor(ImGuiCol.Button,  new Vector4(c.X*.25f, c.Y*.25f, c.Z*.25f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(c.X*.38f, c.Y*.38f, c.Z*.38f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text,    c);
+        ImGui.PushStyleColor(ImGuiCol.Border,  c with { W = .60f });
+        if (ImGui.Button(label)) onClick();
+        ImGui.PopStyleColor(4);
+    }
+    private static void BtnDanger(string label, Action onClick)
+    {
+        var c = Theme.ColDanger;
+        ImGui.PushStyleColor(ImGuiCol.Button,  new Vector4(c.X*.22f, c.Y*.22f, c.Z*.22f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(c.X*.35f, c.Y*.35f, c.Z*.35f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text,    c);
+        ImGui.PushStyleColor(ImGuiCol.Border,  c with { W = .55f });
+        if (ImGui.Button(label)) onClick();
+        ImGui.PopStyleColor(4);
+    }
+    private static void BtnNeutral(string label, Action onClick)
+    {
+        ImGui.PushStyleColor(ImGuiCol.Button, Theme.Current?.TabBg ?? Theme.ColBg3);
+        if (ImGui.Button(label)) onClick();
+        ImGui.PopStyleColor();
+    }
+    private static void StatPill(string label, string val, Vector4 col)
+    {
+        var bg = new Vector4(col.X*.25f, col.Y*.25f, col.Z*.25f, 1f);
+        ImGui.PushStyleColor(ImGuiCol.Button,  bg);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, bg);
+        ImGui.PushStyleColor(ImGuiCol.Text,    col);
+        ImGui.PushStyleColor(ImGuiCol.Border,  col with { W = .55f });
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8f);
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(8, 2));
+        ImGui.SmallButton($"{label}: {val}");
+        ImGui.PopStyleVar(2);
+        ImGui.PopStyleColor(4);
     }
 }

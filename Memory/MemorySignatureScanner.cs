@@ -407,16 +407,25 @@ public sealed class StructureValidator
         float y = BitConverter.ToSingle(data, offset + 4);
         float z = BitConverter.ToSingle(data, offset + 8);
 
-        if (float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z)) return 0;
-        if (float.IsInfinity(x) || float.IsInfinity(y) || float.IsInfinity(z)) return 0;
+        // Hard gates: NaN, infinity, or any subnormal are immediate disqualifiers
+        if (!float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z)) return 0;
 
-        double score = 0;
-        // World coords: reasonable magnitude
-        if (Math.Abs(x) < 100_000 && Math.Abs(y) < 10_000 && Math.Abs(z) < 100_000) score += 0.5;
-        // At least one component is non-zero
-        if (Math.Abs(x) > 0.01f || Math.Abs(y) > 0.01f || Math.Abs(z) > 0.01f) score += 0.3;
-        // Y is vertical in Hytale -- unlikely to be 0 unless on exact ground
-        if (y != 0) score += 0.2;
+        // HARD GATE: all three components must be within strict world bounds.
+        // Hytale world: X/Z ±30 000, Y 0–512 (bedrock to sky limit).
+        // If ANY component fails this, the triple is not a valid game position.
+        const float MAX_XZ = 30_000f;
+        const float MIN_Y  = -256f;
+        const float MAX_Y  =  512f;
+        if (Math.Abs(x) > MAX_XZ) return 0;
+        if (y < MIN_Y  || y > MAX_Y) return 0;
+        if (Math.Abs(z) > MAX_XZ) return 0;
+
+        // Soft scoring on top of the hard gate
+        double score = 0.5; // base: all three passed the range check
+        // Reasonable non-trivial values (not stuck at origin)
+        if (Math.Abs(x) > 0.5f || Math.Abs(z) > 0.5f) score += 0.3;
+        // Y > 0 means object is in the world (not at void level)
+        if (y > 0f) score += 0.2;
 
         return score;
     }
@@ -425,9 +434,14 @@ public sealed class StructureValidator
 
     public double ValidateHealthFloat(float value)
     {
-        if (float.IsNaN(value) || float.IsInfinity(value)) return 0;
-        if (value < 0 || value > 40) return 0;        // Hytale heart system: 0-20 hearts
-        return value > 0 && value <= 40 ? 0.8 : 0.3;
+        if (!float.IsFinite(value)) return 0;
+        // Hytale: 10 hearts = 20HP max by default; allow up to 40 for max-health items
+        // Must be positive (0 = dead, negative = impossible)
+        if (value <= 0f || value > 40f) return 0;
+        // Sweet spot: common player health range 0.5 – 20
+        if (value >= 0.5f && value <= 20f) return 0.9;
+        if (value > 20f && value <= 40f)   return 0.6; // extended health
+        return 0.3;
     }
 
     // -- Pointer array (entity list) ---------------------------------------
