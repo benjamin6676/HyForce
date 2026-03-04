@@ -98,24 +98,42 @@ public class AppState : IDisposable
     // Add manual prepare method for UI
     public void PrepareFreshKeyLogManual()
     {
-        ClearKeyLogFile();
-
-        string sessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-        string keyLogPath = Path.Combine(ExportDirectory, $"sslkeys_session_{sessionId}.log");
-
-        _activeKeyLogFile = keyLogPath;
-        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.Process);
-
         try
         {
-            Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.User);
+            // Generate session-specific filename
+            string sessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string keyLogPath = Path.Combine(ExportDirectory, $"sslkeys_session_{sessionId}.log");
+
+            // Ensure directory exists
+            Directory.CreateDirectory(ExportDirectory);
+
+            // Create empty file (this triggers file watcher)
+            File.WriteAllText(keyLogPath, $"# HyForce Session {sessionId}\r\n");
+
+            // CRITICAL: Set for THIS PROCESS ONLY - Hytale must be restarted to pick this up
+            Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.Process);
+
+            // Also try User scope for persistence
+            try
+            {
+                Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.User);
+            }
+            catch { /* May not have permissions */ }
+
+            // Track this as the active file
+            _activeKeyLogFile = keyLogPath;
+
+            AddInGameLog($"[KEYLOG] Fresh key log ready: {Path.GetFileName(keyLogPath)}");
+            AddInGameLog("[KEYLOG] >>> RESTART HYTALE NOW <<<");
+            AddInGameLog("[KEYLOG] (Env var changes only take effect on process start)");
+
+            // Setup watcher for this specific file
+            SetupSessionKeyWatcher(keyLogPath);
         }
-        catch { }
-
-        File.WriteAllText(keyLogPath, $"# HyForce Session {sessionId} - Prepared manually\r\n");
-
-        AddInGameLog($"[KEYLOG] Fresh key log ready: {Path.GetFileName(keyLogPath)}");
-        AddInGameLog("[KEYLOG] >>> START HYTALE NOW <<<");
+        catch (Exception ex)
+        {
+            AddInGameLog($"[KEYLOG] Error: {ex.Message}");
+        }
     }
 
 
@@ -335,44 +353,46 @@ public class AppState : IDisposable
             }
 
             var fileInfo = new FileInfo(sessionFilePath);
-            AddInGameLog($"[KEYS] Scanning {Path.GetFileName(sessionFilePath)} ({fileInfo.Length} bytes)");
+            var content = File.ReadAllText(sessionFilePath);
+            var lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                              .Where(l => !string.IsNullOrWhiteSpace(l) && !l.StartsWith("#"))
+                              .ToList();
+
+            AddInGameLog($"[KEYS] Scanning {Path.GetFileName(sessionFilePath)} ({fileInfo.Length} bytes, {lines.Count} data lines)");
 
             int keysAdded = 0;
-            int linesChecked = 0;
-            int quicLinesFound = 0;
+            int lineNum = 0;
 
-            using (var fs = new FileStream(sessionFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var reader = new StreamReader(fs))
+            foreach (var line in lines)
             {
-                string? line;
-                while ((line = reader.ReadLine()) != null)
+                lineNum++;
+
+                // Debug: show first few lines
+                if (lineNum <= 3)
                 {
-                    linesChecked++;
+                    AddInGameLog($"[KEYS-DEBUG] Line {lineNum}: {line.Substring(0, Math.Min(60, line.Length))}...");
+                }
 
-                    if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#"))
-                        continue;
+                if (!IsHytaleQuicKey(line))
+                {
+                    if (lineNum <= 3) AddInGameLog($"[KEYS-DEBUG]   -> Filtered out (not QUIC key)");
+                    continue;
+                }
 
-                    // Debug: show first few lines
-                    if (linesChecked <= 5)
-                    {
-                        AddInGameLog($"[KEYS-DEBUG] Line {linesChecked}: {line.Substring(0, Math.Min(50, line.Length))}...");
-                    }
-
-                    if (IsHytaleQuicKey(line))
-                    {
-                        quicLinesFound++;
-                        var key = ParseSSLKeyLogLine(line, sessionFilePath);
-                        if (key != null)
-                        {
-                            PacketDecryptor.AddKey(key);
-                            keysAdded++;
-                            AddInGameLog($"[KEYS] Added {key.Type} key");
-                        }
-                    }
+                var key = ParseSSLKeyLogLine(line, sessionFilePath);
+                if (key != null)
+                {
+                    PacketDecryptor.AddKey(key);
+                    keysAdded++;
+                    AddInGameLog($"[KEYS] Added {key.Type} key ({key.Secret?.Length * 8} bits)");
+                }
+                else if (lineNum <= 3)
+                {
+                    AddInGameLog($"[KEYS-DEBUG]   -> Parse failed");
                 }
             }
 
-            AddInGameLog($"[KEYS] Scanned {linesChecked} lines, found {quicLinesFound} QUIC entries, added {keysAdded} keys");
+            AddInGameLog($"[KEYS] Scan complete: {keysAdded} keys added from {lines.Count} lines");
 
             if (keysAdded > 0)
             {
@@ -388,22 +408,26 @@ public class AppState : IDisposable
     private bool IsHytaleQuicKey(string line)
     {
         // Hytale uses QUIC which produces these specific labels
-        // Browsers produce CLIENT_RANDOM, CLIENT_TRAFFIC_SECRET, etc. for TLS
+        // Be more permissive - check for any QUIC/TLS 1.3 key labels
         string[] quicLabels =
         {
         "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
         "SERVER_HANDSHAKE_TRAFFIC_SECRET",
         "CLIENT_TRAFFIC_SECRET_0",
         "SERVER_TRAFFIC_SECRET_0",
+        "CLIENT_TRAFFIC_SECRET_1",  // Added - some implementations use _1
+        "SERVER_TRAFFIC_SECRET_1",
         "CLIENT_EARLY_TRAFFIC_SECRET",
-        "EXPORTER_SECRET"
+        "EXPORTER_SECRET",
+        "EARLY_EXPORTER_SECRET"
     };
 
-        // Must start with a QUIC label and have 3 parts (label + client_random + secret)
         var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length < 3) return false;
 
-        return quicLabels.Any(label => parts[0].Equals(label, StringComparison.OrdinalIgnoreCase));
+        // Check if it starts with any QUIC label (case insensitive)
+        return quicLabels.Any(label =>
+            parts[0].Equals(label, StringComparison.OrdinalIgnoreCase));
     }
 
     public void ClearKeyLogFile()
@@ -522,15 +546,34 @@ public class AppState : IDisposable
         try
         {
             var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 3) return null;
+            if (parts.Length < 3)
+            {
+                Log.Warn($"Parse failed: only {parts.Length} parts", "Keys");
+                return null;
+            }
 
             string label = parts[0];
 
             // Double-check it's a QUIC label we want
-            if (!IsHytaleQuicKey(line)) return null;
+            if (!IsHytaleQuicKey(line))
+            {
+                Log.Warn($"Parse failed: not a QUIC key label", "Keys");
+                return null;
+            }
 
-            byte[] clientRandom = Convert.FromHexString(parts[1]);
-            byte[] secret = Convert.FromHexString(parts[2]);
+            byte[] clientRandom;
+            byte[] secret;
+
+            try
+            {
+                clientRandom = Convert.FromHexString(parts[1]);
+                secret = Convert.FromHexString(parts[2]);
+            }
+            catch (FormatException ex)
+            {
+                Log.Warn($"Hex decode failed: {ex.Message}", "Keys");
+                return null;
+            }
 
             // Validate lengths
             if (clientRandom.Length != 32)
@@ -538,13 +581,14 @@ public class AppState : IDisposable
                 Log.Warn($"Unexpected client_random length: {clientRandom.Length} bytes", "Keys");
             }
 
+            // 32B = AES-128/SHA-256, 48B = AES-256/SHA-384
             if (secret.Length != 32 && secret.Length != 48)
             {
                 Log.Warn($"Unusual secret length: {secret.Length}B (expected 32 or 48)", "Keys");
             }
 
             // Determine key type based on label
-            var keyType = label switch
+            var keyType = label.ToUpper() switch
             {
                 "CLIENT_TRAFFIC_SECRET_0" => PacketDecryptor.EncryptionType.QUIC_Client1RTT,
                 "SERVER_TRAFFIC_SECRET_0" => PacketDecryptor.EncryptionType.QUIC_Server1RTT,
@@ -566,13 +610,14 @@ public class AppState : IDisposable
             // Derive actual QUIC keys from TLS secret
             PacketDecryptor.DeriveQUICKeys(key);
 
+            if (key.Key.Length == 0)
+            {
+                Log.Warn("Key derivation failed - empty key produced", "Keys");
+                return null;
+            }
+
             Log.Success($"Parsed {label} ({secret.Length * 8} bits) -> {keyType}", "Keys");
             return key;
-        }
-        catch (FormatException ex)
-        {
-            Log.Warn($"Hex decode failed: {ex.Message}", "Keys");
-            return null;
         }
         catch (Exception ex)
         {
