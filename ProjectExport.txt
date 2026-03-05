@@ -1209,6 +1209,9 @@ public class AppState : IDisposable
     public string ExportDirectory { get; set; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "HyForce", "Exports");
+    // SessionLogPath: auto-created per-session, dual-write with in-game log
+    public string SessionLogPath { get; private set; } = string.Empty;
+    private readonly object _sessionLogLock = new();
 
     public event PacketReceivedHandler? OnPacketReceived;
     public event Action? OnSecurityEvent;
@@ -1217,9 +1220,9 @@ public class AppState : IDisposable
 
     private System.Timers.Timer? _autoDecryptTimer;
     private FileSystemWatcher? _sslKeyWatcher;
-    private DateTime _lastKeyLoadTime = DateTime.MinValue;
-    private DateTime _sessionStartTime = DateTime.MinValue;  // used for system key log import window
-    private long _sysKeyLogPosition = 0;                  // file position for incremental reads
+    private DateTime _lastKeyLoadTime     = DateTime.MinValue;
+    private DateTime _sessionStartTime    = DateTime.MinValue;  // used for system key log import window
+    private long     _sysKeyLogPosition   = 0;                  // file position for incremental reads
     private readonly object _keyLoadLock = new();
     private readonly Queue<string> _pendingKeyFiles = new();
     private readonly System.Timers.Timer _retryTimer;
@@ -1229,10 +1232,10 @@ public class AppState : IDisposable
     private string? _activeKeyLogFile = null;
 
     // ── Permanent key log fields ──────────────────────────────────────────
-    public string PermanentKeyLogPath { get; private set; } = "";
-    private long _permFileReadPos = 0;
-    private bool _permanentLogReady = false;
-    public bool NeedsFirstTimeSetup => !_permanentLogReady;
+    public  string PermanentKeyLogPath { get; private set; } = "";
+    private long   _permFileReadPos    = 0;
+    private bool   _permanentLogReady  = false;
+    public  bool   NeedsFirstTimeSetup => !_permanentLogReady;
 
     public AppState()
     {
@@ -1251,8 +1254,9 @@ public class AppState : IDisposable
         TcpProxy.OnPacket += _tcpPacketHandlerDelegate;
 
         Directory.CreateDirectory(ExportDirectory);
-
-
+        // Create session log file immediately
+        SessionLogPath = Path.Combine(ExportDirectory,
+            $"hyforce_session_{DateTime.Now:yyyyMMdd_HHmmss}.log");
 
         SetupAutoDecryption();
 
@@ -1293,11 +1297,11 @@ public class AppState : IDisposable
             Directory.CreateDirectory(hyforceAppData);
             PermanentKeyLogPath = Path.Combine(hyforceAppData, "sslkeys_permanent.log");
 
-            string? existingUser = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.User);
+            string? existingUser    = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.User);
             string? existingMachine = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Machine);
 
             bool pointingAtOurs =
-                string.Equals(existingUser, PermanentKeyLogPath, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(existingUser,    PermanentKeyLogPath, StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(existingMachine, PermanentKeyLogPath, StringComparison.OrdinalIgnoreCase);
 
             if (!pointingAtOurs)
@@ -1388,7 +1392,7 @@ public class AppState : IDisposable
 
             try
             {
-                string? dir = Path.GetDirectoryName(filePath);
+                string? dir  = Path.GetDirectoryName(filePath);
                 string? file = Path.GetFileName(filePath);
                 if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(file)) continue;
                 if (!Directory.Exists(dir)) continue;
@@ -1398,14 +1402,14 @@ public class AppState : IDisposable
 
                 var watcher = new FileSystemWatcher(dir)
                 {
-                    Filter = file,
-                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size,
+                    Filter              = file,
+                    NotifyFilter        = NotifyFilters.LastWrite | NotifyFilters.Size,
                     EnableRaisingEvents = true
                 };
 
                 // Capture for closure
                 string capturedPath = filePath;
-                long capturedPos = pos;
+                long   capturedPos  = pos;
 
                 watcher.Changed += (_, _e) =>
                 {
@@ -1532,13 +1536,13 @@ public class AppState : IDisposable
         {
             _sslKeyWatcher?.Dispose();
 
-            string dir = Path.GetDirectoryName(PermanentKeyLogPath)!;
+            string dir  = Path.GetDirectoryName(PermanentKeyLogPath)!;
             string file = Path.GetFileName(PermanentKeyLogPath)!;
 
             _sslKeyWatcher = new FileSystemWatcher(dir)
             {
-                Filter = file,
-                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size,
+                Filter              = file,
+                NotifyFilter        = NotifyFilters.LastWrite | NotifyFilters.Size,
                 EnableRaisingEvents = true
             };
 
@@ -1791,13 +1795,30 @@ public class AppState : IDisposable
         }
     }
 
-    public void AddInGameLog(string message)
+    public IEnumerable<string> GetRecentLog(int count = 100)
     {
         lock (InGameLog)
+            return InGameLog.TakeLast(count).ToList();
+    }
+
+    public void AddInGameLog(string message)
+    {
+        var stamped = $"[{DateTime.Now:HH:mm:ss}] {message}";
+        // ── Write to in-game log buffer ──
+        lock (InGameLog)
         {
-            InGameLog.Add($"[{DateTime.Now:HH:mm:ss}] {message}");
+            InGameLog.Add(stamped);
             while (InGameLog.Count > MaxInGameLogLines)
                 InGameLog.RemoveAt(0);
+        }
+        // ── Dual-write to session log file (always-on, never lose logs) ──
+        if (!string.IsNullOrEmpty(SessionLogPath))
+        {
+            lock (_sessionLogLock)
+            {
+                try { File.AppendAllText(SessionLogPath, stamped + "\n"); }
+                catch { /* never crash from log write failure */ }
+            }
         }
     }
 
@@ -1808,6 +1829,11 @@ public class AppState : IDisposable
 
         _sessionStartTime = DateTime.Now;
         AddInGameLog("[SESSION] === Starting Capture Session ===");
+        AddInGameLog($"[SESSION] Live log: {SessionLogPath}");
+
+        // Tag all recently-loaded keys as current session, prioritize in decryption
+        PacketDecryptor.MarkSessionStart();
+        AddInGameLog($"[SESSION] Current-session keys marked for priority decryption");
 
         // ── KEY PRESERVATION: Do NOT clear keys or overwrite SSLKEYLOGFILE ──
         // Keys loaded from the permanent log are still valid. Hytale writes to
@@ -1823,11 +1849,15 @@ public class AppState : IDisposable
             await ImportAllKnownKeyFiles();
         });
 
-        // Start proxies
-        int tcpListenPort = ListenPort + 1;
-        TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, TargetPort);
-        Thread.Sleep(50);
+        // Start proxies — Hytale uses QUIC/UDP ONLY (confirmed from protocol docs)
+        // TCP proxy is disabled: adds overhead and can interfere with QUIC connections
+        // int tcpListenPort = ListenPort + 1;
+        // TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, TargetPort);
+        // Thread.Sleep(50);
         UdpProxy.Start("0.0.0.0", ListenPort, TargetHost, TargetPort);
+        // IP isolation: only accept packets from our target server
+        UdpProxy.FilterToServerIp = TargetHost;
+        AddInGameLog($"[SESSION] UDP-only mode | IP filter: {TargetHost}");
 
         StartTime = DateTime.Now;
         _autoDecryptTimer?.Start();
@@ -2117,11 +2147,6 @@ public class AppState : IDisposable
                 return null;
             }
 
-            // DEBUG: Log what we found
-            Console.WriteLine($"[KEY-PARSE] Label: {label}");
-            Console.WriteLine($"[KEY-PARSE] ClientRandom: {BitConverter.ToString(clientRandom.Take(8).ToArray())}... ({clientRandom.Length} bytes)");
-            Console.WriteLine($"[KEY-PARSE] Secret: {BitConverter.ToString(secret.Take(8).ToArray())}... ({secret.Length} bytes)");
-
             // Validate lengths
             if (clientRandom.Length != 32)
             {
@@ -2162,11 +2187,6 @@ public class AppState : IDisposable
                 Log.Warn("Key derivation failed - empty key produced", "Keys");
                 return null;
             }
-
-            // DEBUG: Log derived keys
-            Console.WriteLine($"[KEY-PARSE] Derived Key: {BitConverter.ToString(key.Key.Take(8).ToArray())}... ({key.Key.Length} bytes)");
-            Console.WriteLine($"[KEY-PARSE] Derived IV: {BitConverter.ToString(key.IV)}");
-            Console.WriteLine($"[KEY-PARSE] Derived HP: {BitConverter.ToString(key.HeaderProtectionKey?.Take(8).ToArray() ?? new byte[0])}...");
 
             Log.Success($"Parsed {label} ({secret.Length * 8} bits) -> {keyType}", "Keys");
             return key;
@@ -2329,6 +2349,32 @@ public class AppState : IDisposable
         return errorCode == 32 || errorCode == 33;
     }
 
+    public void RefreshAllKeys()
+    {
+        AddInGameLog("[KEYS] Refreshing keys...");
+
+        // Get current session file
+        string? currentLog = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Process);
+
+        if (!string.IsNullOrEmpty(currentLog) && File.Exists(currentLog))
+        {
+            ScanSessionKeyFile(currentLog); // Use new method
+        }
+        else
+        {
+            // Fallback: look for any session file
+            var sessionFiles = Directory.GetFiles(ExportDirectory, "sslkeys_session_*.log")
+                .OrderByDescending(f => new FileInfo(f).LastWriteTime)
+                .FirstOrDefault();
+
+            if (sessionFiles != null)
+            {
+                ScanSessionKeyFile(sessionFiles);
+            }
+        }
+
+        OnKeysUpdated?.Invoke();
+    }
 
     // -------------------------------------------------------------------------
     // Import keys from the SYSTEM-WIDE SSLKEYLOGFILE incrementally:
@@ -2358,8 +2404,8 @@ public class AppState : IDisposable
 
         try
         {
-            using var fs = new FileStream(sysFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            long fileLen = fs.Length;
+            using var fs     = new FileStream(sysFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            long fileLen     = fs.Length;
 
             // If session just started, read from the current end (only future entries)
             // If _sysKeyLogPosition == 0 this is first call - start from beginning
@@ -2420,8 +2466,6 @@ public class AppState : IDisposable
                 : (DateTime?)null
         };
     }
-
-
 
 
 
@@ -2505,8 +2549,6 @@ public class AppState : IDisposable
         Log.Info("[HyForce] All data cleared", "System");
         AddInGameLog("All data cleared");
     }
-
-
 
     public string GenerateDiagnostics()
     {
@@ -2827,99 +2869,6 @@ public class AppState : IDisposable
 
         GC.SuppressFinalize(this);
     }
-
-    /// <summary>
-    /// Aggressively scan ALL possible SSL key log locations
-    /// </summary>
-    public void ScanAllPossibleKeyLocations()
-    {
-        AddInGameLog("[KEY-SCAN] Searching for SSL keys in all possible locations...");
-        Console.WriteLine("[KEY-SCAN] ========================================");
-
-        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        // 1. All environment variable scopes
-        foreach (var scope in new[] { EnvironmentVariableTarget.Machine, EnvironmentVariableTarget.User, EnvironmentVariableTarget.Process })
-        {
-            string? v = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", scope);
-            if (!string.IsNullOrEmpty(v))
-            {
-                candidates.Add(v);
-                Console.WriteLine($"[KEY-SCAN] From env var [{scope}]: {v}");
-            }
-        }
-
-        // 2. Common hardcoded fallback locations
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] commonPaths = new[]
-        {
-        Path.Combine(home, "sslkeys.log"),
-        Path.Combine(home, ".ssl", "sslkeys.log"),
-        Path.Combine(home, "AppData", "Roaming", "HyForce", "Exports", "sslkeys.log"),
-        Path.Combine(home, "source", "repos", "HyForce", "Exported logs", "sslkeys.log"),
-        Path.Combine(ExportDirectory, "sslkeys.log"),
-        PermanentKeyLogPath,
-        Path.Combine(home, "AppData", "Local", "Hytale", "sslkeys.log"),
-        Path.Combine(home, "AppData", "Roaming", "Hytale", "sslkeys.log"),
-        @"C:\ProgramData\sslkeys.log",
-        Path.Combine(Path.GetTempPath(), "sslkeys.log"),
-    };
-
-        foreach (var path in commonPaths)
-        {
-            if (!string.IsNullOrEmpty(path))
-            {
-                candidates.Add(path);
-            }
-        }
-
-        Console.WriteLine($"[KEY-SCAN] Total candidates to check: {candidates.Count}");
-
-        int totalKeys = 0;
-        foreach (var path in candidates.Where(File.Exists))
-        {
-            try
-            {
-                var fi = new FileInfo(path);
-                Console.WriteLine($"[KEY-SCAN] Checking: {path} ({fi.Length} bytes, modified {fi.LastWriteTime:HH:mm:ss})");
-
-                var lines = File.ReadAllLines(path);
-                int keyLines = lines.Count(l => !string.IsNullOrWhiteSpace(l) && !l.Trim().StartsWith("#") && l.Contains("SECRET"));
-                Console.WriteLine($"[KEY-SCAN]   -> {keyLines} potential key lines");
-
-                if (keyLines > 0)
-                {
-                    _permFileReadPos = 0;
-                    int added = ImportKeyFileOnce(path);
-                    if (added > 0)
-                    {
-                        totalKeys += added;
-                        AddInGameLog($"[KEY-SCAN] Found {added} keys in: {Path.GetFileName(path)}");
-                        Console.WriteLine($"[KEY-SCAN]   -> IMPORTED {added} keys!");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[KEY-SCAN] Error reading {path}: {ex.Message}");
-            }
-        }
-
-        Console.WriteLine($"[KEY-SCAN] ========================================");
-        Console.WriteLine($"[KEY-SCAN] Total keys imported: {totalKeys}");
-
-        if (totalKeys == 0)
-        {
-            AddInGameLog("[KEY-SCAN] No keys found anywhere!");
-            AddInGameLog("[KEY-SCAN] Make sure:");
-            AddInGameLog("  1. Hytale is running");
-            AddInGameLog("  2. You connected to a server (triggers TLS handshake)");
-            AddInGameLog("  3. Hytale was started AFTER HyForce (env var must be set first)");
-        }
-
-        OnKeysUpdated?.Invoke();
-    }
-
 }
 
 // In AppState.cs, update the KeyStatus class:
@@ -7112,10 +7061,14 @@ public class UdpProxy : IDisposable
         _log.Info("[UDP] Client->Server loop ended", "UDP");
     }
 
+    // Public: set to only process packets from this IP (empty = all)
+    public string FilterToServerIp { get; set; } = string.Empty;
+
     private async Task ServerToClientLoop(CancellationToken ct)
     {
         _log.Info("[UDP] Server->Client loop started", "UDP");
         var buffer = new byte[65536];
+        var expectedServerIp = _serverEp.Address.ToString();
 
         while (!ct.IsCancellationRequested && IsRunning)  // FIX: Check IsRunning
         {
@@ -7138,6 +7091,16 @@ public class UdpProxy : IDisposable
                 int received = socketResult.ReceivedBytes;
 
                 if (received == 0) continue;
+
+                // IP ISOLATION: Only process packets from our target server
+                // This prevents noise from other UDP sources flooding the decrypt queue
+                var actualSenderEp = socketResult.RemoteEndPoint as IPEndPoint;
+                if (actualSenderEp != null && !string.IsNullOrEmpty(expectedServerIp) &&
+                    actualSenderEp.Address.ToString() != expectedServerIp)
+                {
+                    // Not from our server — silently drop, don't forward or log
+                    continue;
+                }
 
                 // Copy data immediately
                 var serverData = new byte[received];
@@ -7613,27 +7576,31 @@ namespace HyForce
         private static Dictionary<string, ConnectionKeys> _connectionKeys = new();
         private static List<DecryptionAttempt> _attemptLog = new();
         private static readonly object _lock = new object();
-
+        
+        // Packet number tracking per key for proper nonce reconstruction (RFC 9000 §A.3)
+        // Key = key secret hash, Value = largest successfully decoded packet number
+        private static readonly Dictionary<string, long> _largestPktNum = new();
+        
         // Safety settings - TUNED FOR NO LAG
-        public static int MaxDCIDLengthToTry { get; set; } = 3; // Very limited to prevent hangs
-        public static int DecryptionTimeoutMs { get; set; } = 50; // Very short timeout
+        public static int MaxDCIDLengthToTry { get; set; } = 20; // Netty QUIC 1-RTT DCID 0-20 bytes
+        public static int DecryptionTimeoutMs { get; set; } = 100; // 100ms per attempt
         public static bool EnableDebugLogging { get; set; } = true;
-
+        
         public static bool DebugMode { get; set; } = true;
         public static bool AutoDecryptEnabled { get; set; } = false; // DISABLED by default to prevent lag
         public static int SkippedDecryptions { get; set; } = 0;
-        public static HkdfLabelFormat CurrentLabelFormat { get; set; } = HkdfLabelFormat.RFC9001_NoPrefix;
-
+        public static HkdfLabelFormat CurrentLabelFormat { get; set; } = HkdfLabelFormat.RFC8446_WithPrefix; // RFC 9001 §5.1 requires "tls13 " prefix (confirmed by test vector)
+        
         public static List<EncryptionKey> DiscoveredKeys => GetAllKeys();
         public static int TotalAttempts => _attemptLog.Count;
         public static int SuccessfulDecryptions => _attemptLog.Count(a => a.Success);
         public static int FailedDecryptions => _attemptLog.Count(a => !a.Success);
         public static int ConnectionCount { get { lock (_lock) return _connectionKeys.Count; } }
-
+        
         public enum HkdfLabelFormat { RFC9001_NoPrefix, RFC8446_WithPrefix, QUICv2, TestVector }
         public enum EncryptionType { QUIC_Client1RTT, QUIC_Server1RTT, QUIC_ClientHandshake, QUIC_ServerHandshake, QUIC_Client0RTT }
         public enum PacketDirection { ClientToServer, ServerToClient }
-
+        
         public class EncryptionKey
         {
             public byte[] Secret { get; set; }
@@ -7647,7 +7614,7 @@ namespace HyForce
             public bool IsClient => Type == EncryptionType.QUIC_Client1RTT || Type == EncryptionType.QUIC_ClientHandshake || Type == EncryptionType.QUIC_Client0RTT;
             public bool IsValid => Key != null && Key.Length > 0 && IV != null && IV.Length > 0;
         }
-
+        
         public class DecryptionResult
         {
             public bool Success { get; set; }
@@ -7659,23 +7626,42 @@ namespace HyForce
             public int DCIDLengthUsed { get; set; }
             public Dictionary<string, string> DebugInfo { get; set; } = new();
         }
-
+        
         public class EncryptionResult
         {
             public bool Success { get; set; }
             public byte[] EncryptedData { get; set; }
             public string ErrorMessage { get; set; }
         }
-
+        
         private class ConnectionKeys
         {
             public string ClientRandom { get; set; }
             public EncryptionKey ClientKey { get; set; }
             public EncryptionKey ServerKey { get; set; }
             public int SuccessfulDCIDLength { get; set; } = -1;
+            public bool IsCurrentSession { get; set; } = false;  // added after last Start()
+            public DateTime AddedAt { get; set; } = DateTime.Now;
             public bool IsComplete => ClientKey?.IsValid == true && ServerKey?.IsValid == true;
         }
 
+        // Timestamp of last Start() call — keys added after this are "current session"
+        private static DateTime _sessionStartTime = DateTime.MinValue;
+
+        /// <summary>Call when capture session starts to mark future keys as current-session.</summary>
+        public static void MarkSessionStart()
+        {
+            lock (_lock)
+            {
+                _sessionStartTime = DateTime.Now;
+                // Mark any keys added within the last 30 seconds as current session
+                // (handles keys that loaded just before Start() was clicked)
+                var cutoff = _sessionStartTime.AddSeconds(-30);
+                foreach (var conn in _connectionKeys.Values)
+                    if (conn.AddedAt >= cutoff) conn.IsCurrentSession = true;
+            }
+        }
+        
         private class DecryptionAttempt
         {
             public DateTime Timestamp { get; set; }
@@ -7684,38 +7670,46 @@ namespace HyForce
             public bool Success { get; set; }
             public string Details { get; set; }
         }
-
+        
         // ============ PUBLIC API ============
-
+        
         public static void AddKey(EncryptionKey key)
         {
             if (key?.Secret == null) return;
-
+            
             lock (_lock)
             {
                 if (key.Key == null || key.IV == null || key.HeaderProtectionKey == null)
                     DeriveQUICKeys(key);
                 if (!key.IsValid) return;
-
+                
                 string connId = GenerateConnectionId(key);
                 if (!_connectionKeys.ContainsKey(connId))
                     _connectionKeys[connId] = new ConnectionKeys { ClientRandom = connId };
-
+                
                 if (key.IsClient) _connectionKeys[connId].ClientKey = key;
-                else _connectionKeys[connId].ServerKey = key;
 
-                if (EnableDebugLogging)
-                    Console.WriteLine($"[KEY] Added {(key.IsClient ? "client" : "server")} key");
+                // Tag as current-session if added after last Start()
+                if (_sessionStartTime != DateTime.MinValue &&
+                    DateTime.Now >= _sessionStartTime.AddSeconds(-30))
+                {
+                    _connectionKeys[connId].IsCurrentSession = true;
+                    _connectionKeys[connId].AddedAt = DateTime.Now;  // This was line 138
+                }
+                else
+                {
+                    _connectionKeys[connId].ServerKey = key;
+                }
             }
         }
-
+        
         public static void DeriveQUICKeys(EncryptionKey key)
         {
             if (key?.Secret == null) return;
             int keyLen = key.Secret.Length == 48 ? 32 : 16;
             int ivLen = 12;
             int hpLen = key.Secret.Length == 48 ? 32 : 16;
-
+            
             try
             {
                 key.Key = HkdfExpandLabelQUIC(key.Secret, "quic key", keyLen, CurrentLabelFormat);
@@ -7724,60 +7718,95 @@ namespace HyForce
             }
             catch { }
         }
-
+        
         public static byte[] TryDecrypt(byte[] packet, EncryptionKey key, int dcidLength)
         {
             if (packet == null || packet.Length < 20) return null;
             if (key?.Key == null) return null;
-
+            
             try
             {
                 return TryDecryptInternal(packet, key, dcidLength);
             }
             catch { return null; }
         }
-
+        
         /// <summary>
-        /// SAFE TryDecrypt - returns immediately, no blocking
+        /// Non-blocking fire-and-forget decrypt for auto-decrypt pipeline.
+        /// Enqueues packet; background worker processes it and fires OnDecrypted.
+        /// Returns immediately — NEVER blocks the calling thread.
         /// </summary>
         public static DecryptionResult TryDecrypt(byte[] packet)
         {
             if (!AutoDecryptEnabled)
                 return new DecryptionResult { Success = false, Error = "Auto-decrypt disabled" };
 
-            // Run on background thread with timeout
-            byte[] result = null;
-            var task = Task.Run(() => TryDecryptWithAllKeysInternal(packet));
-
-            if (task.Wait(DecryptionTimeoutMs))
-                result = task.Result;
-
-            return new DecryptionResult
+            // HP pre-filter: check if ANY (key,dcid) combo could produce a valid short-header
+            // before committing to AES-GCM. This eliminates ~87.5% of bad attempts cheaply.
+            if (packet.Length > 21 && (packet[0] & 0x80) == 0) // short header
             {
-                Success = result != null,
-                DecryptedData = result,
-                Error = result == null ? "Timeout or all attempts failed" : null
-            };
-        }
+                bool anyValid = false;
+                lock (_lock)
+                {
+                    var conns = _connectionKeys.Values
+                        .Where(c => c.IsCurrentSession)
+                        .Concat(_connectionKeys.Values.Where(c => !c.IsCurrentSession))
+                        .Take(MaxSessionsToSearch)
+                        .ToList();
 
+                    foreach (var conn in conns)
+                    {
+                        foreach (var key in new[] { conn.ServerKey, conn.ClientKey })
+                        {
+                            if (key?.HeaderProtectionKey == null) continue;
+                            if (conn.SuccessfulDCIDLength >= 0)
+                            {
+                                if (HPFilterPass(packet, key.HeaderProtectionKey, conn.SuccessfulDCIDLength))
+                                { anyValid = true; break; }
+                            }
+                            else
+                            {
+                                for (int d = 0; d <= 20; d++)
+                                    if (HPFilterPass(packet, key.HeaderProtectionKey, d))
+                                    { anyValid = true; break; }
+                            }
+                            if (anyValid) break;
+                        }
+                        if (anyValid) break;
+                    }
+                }
+                if (!anyValid)
+                {
+                    SkippedDecryptions++;
+                    return new DecryptionResult { Success = false, Error = "HP pre-filter: no valid key/DCID found" };
+                }
+            }
+
+            // Enqueue for background worker — does NOT block
+            if (!_decryptQueue.IsAddingCompleted)
+                _decryptQueue.TryAdd(packet);
+
+            return new DecryptionResult { Success = false, Error = "Queued for background decryption" };
+        }
+        
         public static DecryptionResult TryDecryptManual(byte[] packet, int timeoutMs)
         {
             return TryDecryptManual(packet, 8, CurrentLabelFormat);
         }
-
+        
         public static DecryptionResult TryDecryptManual(byte[] packet, int dcidLength, HkdfLabelFormat format)
         {
             var oldFormat = CurrentLabelFormat;
             CurrentLabelFormat = format;
-
+            
             byte[] result = null;
             var task = Task.Run(() => TryDecryptWithAllKeysInternal(packet));
-
+            
             if (task.Wait(DecryptionTimeoutMs))
                 result = task.Result;
-
+            
             CurrentLabelFormat = oldFormat;
-
+            
             return new DecryptionResult
             {
                 Success = result != null,
@@ -7786,24 +7815,85 @@ namespace HyForce
                 DCIDLengthUsed = dcidLength
             };
         }
-
+        
         public static EncryptionResult TryEncrypt(byte[] plaintext, PacketDirection direction)
         {
             if (plaintext == null)
                 return new EncryptionResult { Success = false, ErrorMessage = "Plaintext is null" };
-
+            
             // Return plaintext for now - encryption is complex
             return new EncryptionResult { Success = true, EncryptedData = plaintext };
         }
+        
+        // Background decrypt pipeline
+        private static System.Collections.Concurrent.BlockingCollection<byte[]> _decryptQueue
+            = new System.Collections.Concurrent.BlockingCollection<byte[]>(500); // cap at 500 queued
+        private static System.Threading.Thread? _decryptWorker;
+        public static int MaxSessionsToSearch { get; set; } = 5; // only try N most recent sessions
 
-        public static void StartAutoDecrypt() { }
-        public static void StopAutoDecrypt() { }
+        // Fired when a packet is successfully decrypted
+        public static event Action<byte[], byte[]>? OnDecrypted; // (encrypted, decrypted)
 
+        public static void StartAutoDecrypt()
+        {
+            if (_decryptWorker?.IsAlive == true) return;
+            _decryptWorker = new System.Threading.Thread(DecryptWorkerLoop)
+            {
+                IsBackground = true,
+                Name = "HyForce-DecryptWorker",
+                Priority = System.Threading.ThreadPriority.BelowNormal // never starve UI
+            };
+            _decryptWorker.Start();
+        }
+
+        public static void StopAutoDecrypt()
+        {
+            // Drain queue; worker exits on its own
+            while (_decryptQueue.TryTake(out _)) { }
+        }
+
+        private static void DecryptWorkerLoop()
+        {
+            foreach (var packet in _decryptQueue.GetConsumingEnumerable())
+            {
+                try
+                {
+                    var result = TryDecryptWithAllKeysInternal(packet);
+                    if (result != null)
+                    {
+                        _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = true });
+                        OnDecrypted?.Invoke(packet, result);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// HP pre-filter: compute header-protection mask for the given dcidLen
+        /// and check if the unprotected first byte is a valid QUIC short-header byte.
+        /// RFC 9000 §17.3: Fixed bit (0x40) must be 1, Reserved bits (0x18) must be 0.
+        /// Returns true = this (key, dcid) combo is PLAUSIBLE (still needs AES-GCM to confirm).
+        /// Returns false = impossible, skip AES-GCM entirely.
+        /// </summary>
+        private static bool HPFilterPass(byte[] packet, byte[] hpKey, int dcidLen)
+        {
+            try
+            {
+                int sampleOffset = 1 + dcidLen + 4;
+                if (sampleOffset + 16 > packet.Length) return false;
+                var mask = ComputeHPMask(hpKey, packet.Skip(sampleOffset).Take(16).ToArray());
+                byte unprotected = (byte)((packet[0] & 0xE0) | ((packet[0] & 0x1F) ^ (mask[0] & 0x1F)));
+                return (unprotected & 0x40) != 0 && (unprotected & 0x18) == 0;
+            }
+            catch { return false; }
+        }
+        
         public static void ClearKeys()
         {
             lock (_lock) { _connectionKeys.Clear(); _attemptLog.Clear(); }
         }
-
+        
         public static string GetStats()
         {
             lock (_lock)
@@ -7812,7 +7902,7 @@ namespace HyForce
                 return $"Conn: {ConnectionCount}, Keys: {DiscoveredKeys.Count}, Success: {SuccessfulDecryptions}/{TotalAttempts} ({successRate:F1}%)";
             }
         }
-
+        
         public static Dictionary<string, object> GetDebugStats()
         {
             lock (_lock)
@@ -7829,7 +7919,7 @@ namespace HyForce
                 };
             }
         }
-
+        
         public static bool IsLikelyEncrypted(byte[] data)
         {
             if (data == null || data.Length < 10) return false;
@@ -7839,7 +7929,7 @@ namespace HyForce
             bool validQUIC = isLongHeader || (isShortHeader && data.Length > 20);
             return validQUIC && entropy > 6.5;
         }
-
+        
         public static void LoadSSLKeyLog(string filePath)
         {
             if (!File.Exists(filePath))
@@ -7847,16 +7937,16 @@ namespace HyForce
                 Console.WriteLine($"[SSL] File not found: {filePath}");
                 return;
             }
-
+            
             lock (_lock)
             {
                 var lines = File.ReadAllLines(filePath);
                 int clientCount = 0, serverCount = 0;
-
+                
                 foreach (var line in lines)
                 {
                     if (string.IsNullOrWhiteSpace(line)) continue;
-
+                    
                     var clientMatch = Regex.Match(line, @"CLIENT_TRAFFIC_SECRET_0\s+([0-9a-fA-F]{64})\s+([0-9a-fA-F]+)");
                     if (clientMatch.Success)
                     {
@@ -7872,7 +7962,7 @@ namespace HyForce
                         clientCount++;
                         continue;
                     }
-
+                    
                     var serverMatch = Regex.Match(line, @"SERVER_TRAFFIC_SECRET_0\s+([0-9a-fA-F]{64})\s+([0-9a-fA-F]+)");
                     if (serverMatch.Success)
                     {
@@ -7888,25 +7978,25 @@ namespace HyForce
                         serverCount++;
                     }
                 }
-
+                
                 Console.WriteLine($"[SSL] Loaded {clientCount} client, {serverCount} server keys");
             }
         }
-
+        
         public static string TestKeyDerivation()
         {
             var keys = GetAllKeys();
             if (keys.Count == 0) return "No keys available";
             return TestKeyDerivation(keys[0].Secret);
         }
-
+        
         public static string TestKeyDerivation(byte[] secret)
         {
             if (secret == null) return "Secret is null";
             var sb = new StringBuilder();
             sb.AppendLine("=== Key Derivation Test ===");
             int keyLen = secret.Length == 48 ? 32 : 16;
-
+            
             foreach (HkdfLabelFormat format in Enum.GetValues<HkdfLabelFormat>())
             {
                 try
@@ -7918,7 +8008,7 @@ namespace HyForce
             }
             return sb.ToString();
         }
-
+        
         public static string DumpAllKeys()
         {
             lock (_lock)
@@ -7934,16 +8024,16 @@ namespace HyForce
                 return sb.ToString();
             }
         }
-
+        
         // ============ PRIVATE ============
-
+        
         private static string GenerateConnectionId(EncryptionKey key)
         {
             using var sha = SHA256.Create();
             var hash = sha.ComputeHash(key.Secret);
             return BitConverter.ToString(hash.Take(16).ToArray()).Replace("-", "").ToLower();
         }
-
+        
         private static List<EncryptionKey> GetAllKeys()
         {
             lock (_lock)
@@ -7957,43 +8047,71 @@ namespace HyForce
                 return keys;
             }
         }
-
+        
         private static byte[] TryDecryptWithAllKeysInternal(byte[] packet)
         {
             if (packet == null || packet.Length < 20) return null;
 
             lock (_lock)
             {
-                bool isClientPacket = IsClientPacket(packet);
-                var connections = _connectionKeys.Values
-                    .Where(c => isClientPacket ? c.ClientKey?.IsValid == true : c.ServerKey?.IsValid == true)
-                    .Take(5) // Limit connections
+                // Order: current-session connections first (most likely match), then rest
+                // Current-session keys first; cap total sessions to avoid O(n*dcid) explosion
+                var current = _connectionKeys.Values
+                    .Where(c => c.IsCurrentSession)
+                    .OrderByDescending(c => c.AddedAt)
+                    .Take(MaxSessionsToSearch)
                     .ToList();
+                var others = _connectionKeys.Values
+                    .Where(c => !c.IsCurrentSession)
+                    .OrderByDescending(c => c.AddedAt)
+                    .Take(Math.Max(1, MaxSessionsToSearch - current.Count))
+                    .ToList();
+                var ordered = current.Concat(others).ToList();
+                if (ordered.Count == 0) return null;
 
-                if (connections.Count == 0) return null;
-
-                foreach (var conn in connections)
+                foreach (var conn in ordered)
                 {
-                    var key = isClientPacket ? conn.ClientKey : conn.ServerKey;
-
-                    // Very limited DCID lengths to prevent hangs
+                    // Fast path: if we already know the working DCID length, use it
+                    // HP filter already ran above; here we only reach surviving combos
+                    // Try known-good DCID length first, then Netty defaults (20), then scan
+                    // CONFIRMED: Hytale server uses SCID=0 (from Initial packet capture)
+                    // So 1-RTT short-header DCID = 0 bytes. Try 0 FIRST.
                     int[] dcidLengths = conn.SuccessfulDCIDLength >= 0
                         ? new[] { conn.SuccessfulDCIDLength }
-                        : new[] { 0, 8, 16 }.Take(MaxDCIDLengthToTry).ToArray();
+                        : new[] { 0, 8, 20, 4, 16, 12, 1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19 };
 
-                    foreach (int dcidLen in dcidLengths)
+                    // 1-RTT server key first (S2C ~95% of traffic); skip 0RTT/Handshake for auto-decrypt
+                    var keysToTry = new List<EncryptionKey>();
+                    if (conn.ServerKey?.IsValid == true &&
+                        conn.ServerKey.Type == EncryptionType.QUIC_Server1RTT)
+                        keysToTry.Add(conn.ServerKey);
+                    if (conn.ClientKey?.IsValid == true &&
+                        conn.ClientKey.Type == EncryptionType.QUIC_Client1RTT)
+                        keysToTry.Add(conn.ClientKey);
+                    // Fallback: any valid key if no 1RTT found
+                    if (keysToTry.Count == 0)
                     {
-                        try
+                        if (conn.ServerKey?.IsValid == true) keysToTry.Add(conn.ServerKey);
+                        if (conn.ClientKey?.IsValid == true) keysToTry.Add(conn.ClientKey);
+                    }
+
+                    foreach (var key in keysToTry)
+                    {
+                        foreach (int dcidLen in dcidLengths)
                         {
-                            var result = TryDecryptInternal(packet, key, dcidLen);
-                            if (result != null)
+                            try
                             {
-                                conn.SuccessfulDCIDLength = dcidLen;
-                                _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = true });
-                                return result;
+                                var result = TryDecryptInternal(packet, key, dcidLen);
+                                if (result != null)
+                                {
+                                    conn.SuccessfulDCIDLength = dcidLen;
+                                    conn.IsCurrentSession = true; // it works, lock it in
+                                    _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = true });
+                                    return result;
+                                }
                             }
+                            catch { }
                         }
-                        catch { }
                     }
                 }
 
@@ -8001,14 +8119,14 @@ namespace HyForce
                 return null;
             }
         }
-
+        
         private static byte[] TryDecryptInternal(byte[] packet, EncryptionKey key, int dcidLen)
         {
             byte firstByte = packet[0];
             bool isLongHeader = (firstByte & 0x80) != 0;
             return isLongHeader ? TryDecryptLongHeader(packet, key, dcidLen) : TryDecryptShortHeader(packet, key, dcidLen);
         }
-
+        
         private static byte[] TryDecryptLongHeader(byte[] packet, EncryptionKey key, int dcidLen)
         {
             try
@@ -8026,7 +8144,7 @@ namespace HyForce
                 if ((packet[0] & 0x30) == 0x00)
                 {
                     if (packet.Length < offset + 1) return null;
-                    int tokenLen = ReadVarInt(packet, ref offset); offset += tokenLen;
+                    int tokenLen = (int)ReadVarInt(packet, ref offset); offset += tokenLen;
                 }
                 if (packet.Length < offset + 2) return null;
                 int length = (int)ReadVarInt(packet, ref offset);
@@ -8034,7 +8152,9 @@ namespace HyForce
                 if (packet.Length < sampleOffset + 16) return null;
                 byte[] sample = packet.Skip(sampleOffset).Take(16).ToArray();
                 byte[] mask = ComputeHPMask(key.HeaderProtectionKey, sample);
-                byte packetNumberLength = (byte)((packet[0] & 0x03) + 1);
+                // RFC 9001 §5.4.1: must remove HP from first byte BEFORE reading PN length
+                byte unprotectedFirstLH = (byte)(packet[0] ^ (mask[0] & 0x0F));
+                byte packetNumberLength = (byte)((unprotectedFirstLH & 0x03) + 1);
                 byte[] decryptedPnBytes = new byte[packetNumberLength];
                 for (int i = 0; i < packetNumberLength; i++) decryptedPnBytes[i] = (byte)(packet[pnOffset + i] ^ mask[i + 1]);
                 int payloadOffset = pnOffset + packetNumberLength, payloadLength = packet.Length - payloadOffset;
@@ -8042,8 +8162,10 @@ namespace HyForce
                 byte[] nonce = new byte[12];
                 Buffer.BlockCopy(key.IV, 0, nonce, 0, 12);
                 for (int i = 0; i < packetNumberLength; i++) nonce[11 - i] ^= decryptedPnBytes[packetNumberLength - 1 - i];
+                // RFC 9001 §5.3: AAD must contain unprotected header
                 byte[] aad = packet.Take(payloadOffset).ToArray();
-                aad[0] = (byte)(packet[0] ^ (mask[0] & 0x0F));
+                aad[0] = unprotectedFirstLH;
+                for (int i = 0; i < packetNumberLength; i++) aad[pnOffset + i] = decryptedPnBytes[i];
                 byte[] ciphertext = packet.Skip(payloadOffset).ToArray();
                 byte[] plaintext = new byte[ciphertext.Length - 16];
                 byte[] tag = ciphertext.Skip(ciphertext.Length - 16).ToArray();
@@ -8053,7 +8175,7 @@ namespace HyForce
             }
             catch { return null; }
         }
-
+        
         private static byte[] TryDecryptShortHeader(byte[] packet, EncryptionKey key, int dcidLen)
         {
             try
@@ -8068,25 +8190,60 @@ namespace HyForce
                 byte unprotectedFirstByte = (byte)((packet[0] & 0xE0) | (protectedBits ^ (mask[0] & 0x1F)));
                 int packetNumberLength = (unprotectedFirstByte & 0x03) + 1;
                 int pnOffset = dcidEnd;
-                byte[] decryptedPnBytes = new byte[packetNumberLength];
-                for (int i = 0; i < packetNumberLength; i++) decryptedPnBytes[i] = (byte)(packet[pnOffset + i] ^ mask[i + 1]);
+                
+                // Decode truncated packet number from wire
+                long truncatedPN = 0;
+                for (int i = 0; i < packetNumberLength; i++)
+                    truncatedPN = (truncatedPN << 8) | (byte)(packet[pnOffset + i] ^ mask[i + 1]);
+                
+                // RFC 9000 §A.3: Reconstruct full 62-bit packet number from truncated value
+                string keyId = BitConverter.ToString(SHA256.HashData(key.Secret).Take(8).ToArray());
+                long largestAcked = _largestPktNum.TryGetValue(keyId, out var lp) ? lp : 0;
+                long fullPN = ReconstructPacketNumber(truncatedPN, packetNumberLength, largestAcked);
+                
                 int payloadOffset = pnOffset + packetNumberLength, payloadLength = packet.Length - payloadOffset;
                 if (payloadLength < 16) return null;
+                
+                // Build nonce: IV XOR full 62-bit packet number (big-endian into last 8 bytes)
                 byte[] nonce = new byte[12];
                 Buffer.BlockCopy(key.IV, 0, nonce, 0, 12);
-                for (int i = 0; i < packetNumberLength; i++) nonce[11 - i] ^= decryptedPnBytes[packetNumberLength - 1 - i];
+                for (int i = 0; i < 8; i++)
+                    nonce[11 - i] ^= (byte)(fullPN >> (i * 8));
+                
+                // RFC 9001 §5.3: AAD must contain unprotected header (first byte + unprotected PN bytes)
                 byte[] aad = packet.Take(payloadOffset).ToArray();
                 aad[0] = unprotectedFirstByte;
+                for (int i = 0; i < packetNumberLength; i++)
+                    aad[pnOffset + i] = (byte)(packet[pnOffset + i] ^ mask[i + 1]);
                 byte[] ciphertext = packet.Skip(payloadOffset).ToArray();
                 byte[] plaintext = new byte[ciphertext.Length - 16];
                 byte[] tag = ciphertext.Skip(ciphertext.Length - 16).ToArray();
                 using var aes = new AesGcm(key.Key, 16);
                 aes.Decrypt(nonce, ciphertext.Take(ciphertext.Length - 16).ToArray(), tag, plaintext, aad);
+                
+                // Success: update largest seen packet number for future reconstruction
+                if (fullPN > largestAcked)
+                    lock (_lock) { _largestPktNum[keyId] = fullPN; }
+                
                 return plaintext;
             }
             catch { return null; }
         }
-
+        
+        // RFC 9000 §A.3: decode_packet_number
+        private static long ReconstructPacketNumber(long truncated, int pnLen, long largestAcked)
+        {
+            long pnWin    = 1L << (pnLen * 8);
+            long pnHalf   = pnWin / 2;
+            long pnMask   = pnWin - 1;
+            long candidate = (largestAcked & ~pnMask) | truncated;
+            if (candidate <= largestAcked - pnHalf && candidate + pnWin < (1L << 62))
+                return candidate + pnWin;
+            if (candidate >  largestAcked + pnHalf && candidate >= pnWin)
+                return candidate - pnWin;
+            return candidate;
+        }
+        
         private static byte[] ComputeHPMask(byte[] hpKey, byte[] sample)
         {
             try
@@ -8100,7 +8257,7 @@ namespace HyForce
             }
             catch { return new byte[16]; }
         }
-
+        
         private static byte[] HkdfExpandLabelQUIC(byte[] secret, string label, int length, HkdfLabelFormat format)
         {
             string actualLabel = format switch
@@ -8119,7 +8276,7 @@ namespace HyForce
             byte[] hkdfLabel = ms.ToArray();
             return HkdfExpand(secret, hash, hkdfLabel, length);
         }
-
+        
         private static byte[] HkdfExpand(byte[] prk, byte[] hash, byte[] info, int length)
         {
             using var hmac = new HMACSHA256();
@@ -8138,9 +8295,9 @@ namespace HyForce
             }
             return okm;
         }
-
+        
         private static bool IsClientPacket(byte[] packet) { return (packet[0] & 0x40) != 0; }
-
+        
         private static long ReadVarInt(byte[] data, ref int offset)
         {
             if (offset >= data.Length) return 0;
@@ -8151,7 +8308,7 @@ namespace HyForce
             offset += len;
             return value;
         }
-
+        
         private static double CalculateEntropy(byte[] data)
         {
             var frequencies = new Dictionary<byte, int>();
@@ -8161,7 +8318,7 @@ namespace HyForce
             foreach (var freq in frequencies.Values) { double probability = (double)freq / length; entropy -= probability * Math.Log(probability, 2); }
             return entropy;
         }
-
+        
         private static byte[] HexToBytes(string hex)
         {
             hex = hex.Trim();
@@ -8180,62 +8337,74 @@ using HyForce.Data;
 using HyForce.Networking;
 using System;
 using System.Collections.Generic;
+using System.IO;
 
 namespace HyForce.Protocol
 {
     /// <summary>
-    /// SIMPLIFIED PacketHandler - No blocking, no lag
+    /// PacketHandler v16 — fully non-blocking.
+    /// Auto-decrypt is processed on a dedicated background worker (never the UI thread).
     /// </summary>
     public class PacketHandler
     {
         private readonly AppState _state;
-        private readonly HashSet<ushort> _interestingOpcodes = new();
+        private volatile int _decryptSuccesses;
+        private volatile int _decryptFailures;
+
+        public int DecryptSuccesses => _decryptSuccesses;
+        public int DecryptFailures  => _decryptFailures;
 
         public PacketHandler(AppState state)
         {
             _state = state;
+
+            // Wire up the background decrypt result event
+            PacketDecryptor.OnDecrypted -= HandleDecrypted; // safety: remove first
+            PacketDecryptor.OnDecrypted += HandleDecrypted;
         }
 
         /// <summary>
-        /// Process packet - FAST, no blocking
+        /// Called from the OnDecrypted background event — NOT on UI thread.
+        /// </summary>
+        private void HandleDecrypted(byte[] encrypted, byte[] decrypted)
+        {
+            System.Threading.Interlocked.Increment(ref _decryptSuccesses);
+            _state.AddInGameLog($"[DECRYPT] ✓ {decrypted.Length}B decrypted");
+
+            // Future: parse Hytale frames from decrypted bytes here
+        }
+
+        /// <summary>
+        /// Process packet — ALWAYS returns immediately, zero blocking.
         /// </summary>
         public void ProcessPacket(CapturedPacket packet)
         {
             try
             {
-                // Quick log - no complex operations
-                if (PacketDecryptor.DebugMode)
-                {
-                    Console.WriteLine($"[PACKET] {packet.SequenceId} - {packet.RawBytes.Length}b - 0x{packet.Opcode:X4}");
-                }
+                if (packet?.RawBytes == null || packet.RawBytes.Length < 20) return;
 
-                // Only attempt decryption if auto-decrypt is enabled AND we have keys
+                // Short header 1-RTT = post-handshake gameplay packets
+                bool isShortHeader = (packet.RawBytes[0] & 0x80) == 0;
+                if (!isShortHeader) return; // skip long-header (handshake etc.)
+
                 if (PacketDecryptor.AutoDecryptEnabled && PacketDecryptor.DiscoveredKeys.Count > 0)
                 {
-                    // Quick check if encrypted
-                    if (packet.RawBytes.Length > 20 && (packet.RawBytes[0] & 0x80) == 0)
+                    // Enqueue for background worker — never blocks here
+                    var result = PacketDecryptor.TryDecrypt(packet.RawBytes);
+                    if (!result.Success &&
+                        result.Error != null &&
+                        !result.Error.StartsWith("Queued") &&
+                        !result.Error.StartsWith("Auto-decrypt disabled"))
                     {
-                        // Try decrypt - this is async and has timeout
-                        var result = PacketDecryptor.TryDecrypt(packet.RawBytes);
-
-                        if (result?.Success == true && result.DecryptedData != null)
-                        {
-                            _state.AddInGameLog($"[DECRYPT] {packet.Opcode:X4} OK ({result.DecryptedData.Length}b)");
-                        }
-                        else if (PacketDecryptor.DebugMode)
-                        {
-                            Console.WriteLine($"[DECRYPT] {packet.Opcode:X4} FAIL");
-                        }
+                        System.Threading.Interlocked.Increment(ref _decryptFailures);
                     }
                 }
             }
-            catch
-            {
-                // Silently fail - don't crash the game
-            }
+            catch { }
         }
     }
 }
+
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Protocol\PacketInspector.cs =====
@@ -8476,6 +8645,359 @@ public class PacketPattern
     public bool IsBurst { get; set; }
     public double RatePerSecond { get; set; }
 }
+
+
+===== FILE: C:\Users\benja\source\repos\HyForce\Protocol\QUICDecryptionDiagnostic.cs =====
+
+// QUICDecryptionDiagnostic.cs
+// Deep diagnostic tool for QUIC packet decryption failures.
+// Shows exactly what each step produces so we can pinpoint the real failure.
+
+using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace HyForce
+{
+    public static class QUICDecryptionDiagnostic
+    {
+        public class DiagResult
+        {
+            public bool Success { get; set; }
+            public string Summary { get; set; } = "";
+            public List<string> Steps  { get; set; } = new();
+            public List<string> Errors { get; set; } = new();
+
+            public string Full => string.Join("\n", Steps.Concat(Errors));
+        }
+
+        /// <summary>
+        /// Diagnose a single raw QUIC packet against all loaded keys.
+        /// Returns a verbose step-by-step report.
+        /// </summary>
+        public static DiagResult DiagnosePacket(byte[] packet)
+        {
+            var r = new DiagResult();
+
+            if (packet == null || packet.Length < 20)
+            {
+                r.Errors.Add($"[DIAG] Packet too short: {packet?.Length ?? 0} bytes (need >= 20)");
+                r.Summary = "Packet too short";
+                return r;
+            }
+
+            byte firstByte = packet[0];
+            bool isLong    = (firstByte & 0x80) != 0;
+            r.Steps.Add($"[DIAG] === QUIC Packet Diagnostic ===");
+            r.Steps.Add($"[DIAG] Length : {packet.Length} bytes");
+            r.Steps.Add($"[DIAG] First  : 0x{firstByte:X2}  ({(isLong ? "Long" : "Short")} header)");
+            r.Steps.Add($"[DIAG] Hex[0..15]: {Hex(packet, 0, Math.Min(16, packet.Length))}");
+
+            if (isLong)
+            {
+                int off = 1;
+                uint version = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(off)); off += 4;
+                r.Steps.Add($"[DIAG] Version : 0x{version:X8}");
+                byte dcidLen = packet[off++];
+                r.Steps.Add($"[DIAG] DCID Len: {dcidLen}");
+                if (dcidLen > 0 && off + dcidLen <= packet.Length)
+                    r.Steps.Add($"[DIAG] DCID    : {Hex(packet, off, dcidLen)}");
+            }
+            else
+            {
+                r.Steps.Add($"[DIAG] Short header — Fixed={((firstByte>>6)&1)} Spin={((firstByte>>5)&1)} KP={(firstByte>>2)&1} PN_len={(firstByte&3)+1}");
+            }
+
+            // Collect all valid keys
+            var keys = PacketDecryptor.DiscoveredKeys.Where(k => k.IsValid).ToList();
+            r.Steps.Add($"[DIAG] Keys available: {keys.Count}");
+
+            if (keys.Count == 0)
+            {
+                r.Errors.Add("[DIAG] No valid keys — load sslkeys_permanent.log first");
+                r.Summary = "No keys";
+                return r;
+            }
+
+            // Show first key's derived values for inspection
+            var k0 = keys.First();
+            r.Steps.Add($"[DIAG] Key[0] type  : {k0.Type}");
+            r.Steps.Add($"[DIAG] Key[0] secret : {Hex(k0.Secret)}");
+            r.Steps.Add($"[DIAG] Key[0] key    : {Hex(k0.Key)}");
+            r.Steps.Add($"[DIAG] Key[0] iv     : {Hex(k0.IV)}");
+            r.Steps.Add($"[DIAG] Key[0] hp     : {Hex(k0.HeaderProtectionKey)}");
+
+            // Try all keys with DCID 0..20
+            bool anySuccess = false;
+            foreach (var key in keys.Take(10))
+            {
+                for (int dcid = 0; dcid <= 20; dcid++)
+                {
+                    var result = DiagnoseOneAttempt(packet, key, dcid, r.Steps);
+                    if (result)
+                    {
+                        r.Success = true;
+                        anySuccess = true;
+                        r.Summary = $"SUCCESS: {key.Type} DCID={dcid}";
+                        r.Steps.Add($"[DIAG] ✓ DECRYPTED with key={key.Type} dcid={dcid}");
+                        return r;
+                    }
+                }
+            }
+
+            if (!anySuccess)
+            {
+                r.Steps.Add("[DIAG] All attempts failed. Likely causes:");
+                r.Steps.Add("[DIAG]   1. Keys from a different TLS session (wrong client_random)");
+                r.Steps.Add("[DIAG]   2. Packet is still handshake-phase (needs different key type)");
+                r.Steps.Add("[DIAG]   3. Netty QUIC using non-standard DCID or HP algorithm");
+                r.Summary = "All attempts failed";
+            }
+
+            return r;
+        }
+
+        private static bool DiagnoseOneAttempt(byte[] packet, PacketDecryptor.EncryptionKey key, int dcidLen, List<string> steps)
+        {
+            try
+            {
+                byte firstByte = packet[0];
+                bool isLong    = (firstByte & 0x80) != 0;
+
+                int pnOffset, sampleOffset;
+                if (isLong)
+                {
+                    int off = 1 + 4; // skip first byte + version
+                    byte dcidLenByte = packet[off++];
+                    off += dcidLenByte; // skip DCID
+                    byte scidLen = packet[off++];
+                    off += scidLen;    // skip SCID
+                    if ((firstByte & 0x30) == 0x00) // Initial packet has token
+                    {
+                        int tokenLen = (int)ReadVarInt(packet, ref off);
+                        off += tokenLen;
+                    }
+                    ReadVarInt(packet, ref off); // length field
+                    pnOffset = off;
+                }
+                else
+                {
+                    pnOffset = 1 + dcidLen;
+                }
+
+                sampleOffset = pnOffset + 4;
+                if (packet.Length < sampleOffset + 16) return false;
+
+                byte[] sample = packet.Skip(sampleOffset).Take(16).ToArray();
+                byte[] mask   = AesEcbEncrypt(key.HeaderProtectionKey, sample);
+
+                byte unprotectedFirst = isLong
+                    ? (byte)(firstByte ^ (mask[0] & 0x0F))
+                    : (byte)((firstByte & 0xE0) | ((firstByte & 0x1F) ^ (mask[0] & 0x1F)));
+
+                int pnLen = (unprotectedFirst & 0x03) + 1;
+                byte[] pn = new byte[pnLen];
+                for (int i = 0; i < pnLen; i++) pn[i] = (byte)(packet[pnOffset + i] ^ mask[i + 1]);
+
+                int payloadOffset = pnOffset + pnLen;
+                int payloadLen    = packet.Length - payloadOffset;
+                if (payloadLen < 16) return false;
+
+                byte[] nonce = (byte[])key.IV.Clone();
+                for (int i = 0; i < pnLen; i++) nonce[11 - i] ^= pn[pnLen - 1 - i];
+
+                byte[] aad = packet.Take(payloadOffset).ToArray();
+                aad[0] = unprotectedFirst;
+                for (int i = 0; i < pnLen; i++) aad[pnOffset + i] = pn[i];
+
+                byte[] ciphertext = packet.Skip(payloadOffset).Take(payloadLen - 16).ToArray();
+                byte[] tag        = packet.Skip(packet.Length - 16).ToArray();
+                byte[] plaintext  = new byte[ciphertext.Length];
+
+                using var aes = new AesGcm(key.Key, 16);
+                aes.Decrypt(nonce, ciphertext, tag, plaintext, aad);
+
+                // Validate: first byte of plaintext should be a QUIC frame type (0x00-0x1F common)
+                bool plausible = plaintext.Length > 0 && plaintext[0] <= 0x40;
+                if (plausible)
+                    steps.Add($"[DIAG] ✓ Plaintext[0..7]: {Hex(plaintext, 0, Math.Min(8, plaintext.Length))}");
+                return plausible;
+            }
+            catch { return false; }
+        }
+
+        private static byte[] AesEcbEncrypt(byte[] key, byte[] data)
+        {
+            using var aes = Aes.Create();
+            aes.Key     = key;
+            aes.Mode    = CipherMode.ECB;
+            aes.Padding = PaddingMode.None;
+            using var enc = aes.CreateEncryptor();
+            byte[] out_ = new byte[16];
+            enc.TransformBlock(data, 0, 16, out_, 0);
+            return out_;
+        }
+
+        private static long ReadVarInt(byte[] data, ref int offset)
+        {
+            if (offset >= data.Length) return 0;
+            byte first = data[offset];
+            int  len   = 1 << (first >> 6);
+            long value = first & 0x3F;
+            for (int i = 1; i < len && offset + i < data.Length; i++)
+                value = (value << 8) | data[offset + i];
+            offset += len;
+            return value;
+        }
+
+        private static string Hex(byte[] b, int offset = 0, int count = -1)
+        {
+            if (b == null) return "(null)";
+            if (count < 0) count = b.Length - offset;
+            count = Math.Min(count, b.Length - offset);
+            return Convert.ToHexString(b, offset, count).ToLower();
+        }
+
+        // ── RFC 9001 Appendix A.1 self-test ────────────────────────────────
+        public static List<string> RunRFC9001SelfTest()
+        {
+            var lines = new List<string>();
+            lines.Add("[SELFTEST] RFC 9001 Appendix A.1 key derivation:");
+
+            // Official test vector from RFC 9001 Appendix A.1
+            // RFC 9001 Appendix A.1: client_initial_secret (32 bytes = 64 hex chars)
+            var secret = Convert.FromHexString(
+                "c00cf151ca5be075ed0ebfb5c80323c4" +
+                "2d0b7bef575472db26359bdd9a4e5070");
+
+            var key = new PacketDecryptor.EncryptionKey
+            {
+                Secret = secret,
+                Type   = PacketDecryptor.EncryptionType.QUIC_Client1RTT,
+                Source = "RFC9001-A1"
+            };
+            PacketDecryptor.DeriveQUICKeys(key);
+
+            bool kOk = key.Key?.SequenceEqual(Convert.FromHexString("1f369613dd76d5467730efcbe3b1a22d")) == true;
+            bool iOk = key.IV?.SequenceEqual(Convert.FromHexString("fa044b2f42a3fd3b46fb255c")) == true;
+            bool hOk = key.HeaderProtectionKey?.SequenceEqual(Convert.FromHexString("9f50449e04a0e810283a1e9933adedd2")) == true;
+
+            lines.Add($"[SELFTEST]   Key : {(key.Key != null ? Hex(key.Key) : "null")}");
+            lines.Add($"[SELFTEST]   Exp : 1f369613dd76d5467730efcbe3b1a22d  → {(kOk ? "✓ PASS" : "✗ FAIL")}");
+            lines.Add($"[SELFTEST]   IV  : {(key.IV != null ? Hex(key.IV) : "null")}");
+            lines.Add($"[SELFTEST]   Exp : fa044b2f42a3fd3b46fb255c           → {(iOk ? "✓ PASS" : "✗ FAIL")}");
+            lines.Add($"[SELFTEST]   HP  : {(key.HeaderProtectionKey != null ? Hex(key.HeaderProtectionKey) : "null")}");
+            lines.Add($"[SELFTEST]   Exp : 9f50449e04a0e810283a1e9933adedd2  → {(hOk ? "✓ PASS" : "✗ FAIL")}");
+            lines.Add(kOk && iOk && hOk
+                ? "[SELFTEST] ✓ HKDF derivation is correct (RFC 8446 with 'tls13 ' prefix)"
+                : "[SELFTEST] ✗ HKDF BROKEN — keys will never decrypt");
+
+            return lines;
+        }
+
+        private static string Hex(byte[]? b) =>
+            b == null ? "(null)" : Convert.ToHexString(b).ToLower();
+
+        // ── Initial Packet Analyzer ────────────────────────────────────────
+        /// <summary>
+        /// Parse a QUIC Initial packet (Long Header, type 0x00) and extract DCID.
+        /// Returns null if packet is not a valid Initial packet.
+        /// </summary>
+        public static InitialPacketInfo? ParseInitialPacket(byte[] packet)
+        {
+            if (packet == null || packet.Length < 7) return null;
+            byte first = packet[0];
+            if ((first & 0x80) == 0) return null; // must be long header
+            int type = (first & 0x30) >> 4;
+            // Initial = 0x00, 0-RTT = 0x01, Handshake = 0x02, Retry = 0x03
+            if (type != 0x00) return null;
+
+            int off = 1;
+            uint version = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(off)); off += 4;
+
+            byte dcidLen = packet[off++];
+            if (off + dcidLen > packet.Length) return null;
+            byte[] dcid = packet.Skip(off).Take(dcidLen).ToArray(); off += dcidLen;
+
+            byte scidLen = packet[off++];
+            if (off + scidLen > packet.Length) return null;
+            byte[] scid = packet.Skip(off).Take(scidLen).ToArray(); off += scidLen;
+
+            return new InitialPacketInfo
+            {
+                Version     = version,
+                DCID        = dcid,
+                SCID        = scid,
+                DCIDHex     = dcid.Length > 0 ? Convert.ToHexString(dcid).ToLower() : "(empty)",
+                SCIDHex     = scid.Length > 0 ? Convert.ToHexString(scid).ToLower() : "(empty)",
+                IsClientSent = dcidLen >= 8, // servers respond with DCID = client's chosen SCID
+            };
+        }
+
+        public class InitialPacketInfo
+        {
+            public uint    Version  { get; set; }
+            public byte[]  DCID     { get; set; }
+            public byte[]  SCID     { get; set; }
+            public string  DCIDHex  { get; set; }
+            public string  SCIDHex  { get; set; }
+            public bool    IsClientSent { get; set; }
+        }
+
+        /// <summary>
+        /// Scan a list of packets for the Initial packet, extract DCID,
+        /// and log a recommendation for which sslkeys entry to try.
+        /// </summary>
+        public static List<string> AnalyzeFirstPackets(IEnumerable<byte[]> packets)
+        {
+            var lines = new List<string>();
+            lines.Add("[SESSIONDIAG] Scanning for QUIC Initial packet...");
+
+            int i = 0;
+            foreach (var pkt in packets.Take(100))
+            {
+                if (pkt == null || pkt.Length < 8) { i++; continue; }
+
+                byte first = pkt[0];
+                bool isLong = (first & 0x80) != 0;
+                int  type   = (first & 0x30) >> 4;
+
+                lines.Add($"[SESSIONDIAG] Pkt#{i}: {pkt.Length}B  {(isLong ? "Long" : "Short")} hdr" +
+                          (isLong ? $" type={type}" : "") +
+                          $"  first=0x{first:X2}");
+
+                if (isLong && type == 0)
+                {
+                    var info = ParseInitialPacket(pkt);
+                    if (info != null)
+                    {
+                        lines.Add($"[SESSIONDIAG] ✓ Initial packet found at pkt#{i}:");
+                        lines.Add($"[SESSIONDIAG]   QUIC version: 0x{info.Version:X8}");
+                        lines.Add($"[SESSIONDIAG]   DCID ({info.DCID.Length}B): {info.DCIDHex}");
+                        lines.Add($"[SESSIONDIAG]   SCID ({info.SCID.Length}B): {info.SCIDHex}");
+                        lines.Add($"[SESSIONDIAG]   After handshake, 1-RTT DCID length = {info.SCID.Length} bytes");
+                        lines.Add($"[SESSIONDIAG]   → Try TryDecryptShortHeader with dcidLen={info.SCID.Length}");
+                        break;
+                    }
+                }
+                i++;
+                if (i >= 20) break;
+            }
+
+            if (!lines.Any(l => l.Contains("Initial packet found")))
+            {
+                lines.Add("[SESSIONDIAG] No Initial packet in first 20 — proxy started after handshake?");
+                lines.Add("[SESSIONDIAG] Cannot determine DCID length from capture.");
+                lines.Add("[SESSIONDIAG] Recommendation: connect WITH HyForce running so Initial is captured.");
+            }
+            return lines;
+        }
+    }
+}
+
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Protocol\QUICDiagnosticTool.cs =====
@@ -10931,168 +11453,559 @@ public class DecryptionStatsWindow : ITab
 using HyForce.Core;
 using ImGuiNET;
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Numerics;
+using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Tasks;
 
 namespace HyForce.Tabs
 {
-    /// <summary>
-    /// SIMPLIFIED DecryptionTab - No freezing, minimal UI
-    /// </summary>
     public class DecryptionTab : ITab
     {
         public string Name => "Decryption";
         private readonly AppState _state;
 
-        private string _testInput = "";
-        private string _testResult = "";
-        private int _selectedDCIDLength = 8;
-        private int _selectedLabelFormat = 0;
-        private string[] _labelFormats = { "RFC9001", "RFC8446", "QUICv2", "Test" };
+        private string _hexInput     = "";
+        private string _testResult   = "";
+        private int    _selectedFmt  = 1; // RFC8446_WithPrefix default
+        private string[] _fmtLabels  = { "RFC9001 (no prefix)", "RFC8446 tls13 ✓", "QUICv2", "TestVec" };
 
-        public DecryptionTab(AppState state) { _state = state; }
+        private bool   _showAdvanced = false;
+        private bool   _showDPAPI    = false;
+        private string _dpapiResult  = "";
+        private string _analyzeHex   = "";
+        private string _analyzeResult= "";
+
+        private static bool _initialized = false;
+
+        public DecryptionTab(AppState state)
+        {
+            _state = state;
+            if (!_initialized)
+            {
+                PacketDecryptor.CurrentLabelFormat = PacketDecryptor.HkdfLabelFormat.RFC8446_WithPrefix;
+                _initialized = true;
+            }
+        }
 
         public void Render()
         {
-            // Status - simple, no complex calculations
-            ImGui.TextColored(new Vector4(0, 1, 1, 1), "=== DECRYPTION ===");
-            ImGui.Separator();
+            var stats   = PacketDecryptor.GetDebugStats();
+            int keys    = (int)stats["TotalKeys"];
+            int success = (int)stats["SuccessfulDecryptions"];
+            int failed  = (int)stats["FailedDecryptions"];
+            bool hasKeys = keys > 0;
 
-            // Get stats once
-            var stats = PacketDecryptor.GetDebugStats();
-            ImGui.Text($"Connections: {stats["Connections"]} | Keys: {stats["TotalKeys"]}");
-            ImGui.Text($"Success: {stats["SuccessfulDecryptions"]} | Failed: {stats["FailedDecryptions"]}");
+            // Status panel
+            var bgCol = hasKeys ? new Vector4(.04f,.14f,.04f,1f) : new Vector4(.18f,.10f,.02f,1f);
+            ImGui.PushStyleColor(ImGuiCol.ChildBg, bgCol);
+            ImGui.BeginChild("##status", new Vector2(-1, 70), ImGuiChildFlags.Borders);
 
-            ImGui.Separator();
+            if (!hasKeys)
+            {
+                ImGui.TextColored(new Vector4(1f,.7f,.1f,1f), "WAITING FOR HYTALE");
+                ImGui.TextColored(new Vector4(.6f,.6f,.6f,1f), "Launch Hytale -- keys will appear here automatically.");
+            }
+            else if (failed > 200 && success == 0)
+            {
+                // 200+ failures = almost certainly session mismatch
+                ImGui.TextColored(new Vector4(1f,.4f,.1f,1f), $"SESSION MISMATCH — {keys} keys loaded but 0 decrypted from {failed} attempts");
+                ImGui.TextColored(new Vector4(1f,.9f,.2f,1f), "FIX: With proxy running, RESTART HYTALE so it connects THROUGH the proxy.");
+                ImGui.TextColored(new Vector4(.5f,.5f,.5f,1f), "Keys log new session on reconnect — they will then match the captured packets.");
+            }
+            else
+            {
+                ImGui.TextColored(new Vector4(.2f,1f,.4f,1f), $"KEYS READY ({keys})  --  label: {_fmtLabels[_selectedFmt]}");
+                ImGui.TextColored(new Vector4(.6f,.6f,.6f,1f), failed == 0
+                    ? "Start capturing to see decryption results"
+                    : $"Decrypting: {success} OK  {failed} failed");
+            }
 
-            // Controls - simple buttons
-            if (ImGui.Button("Load SSL Key Log", new Vector2(130, 25)))
+            if (ImGui.Button("Re-Import Keys")) _state.ForceReImportKeys();
+            ImGui.SameLine();
+            if (ImGui.Button("Open Key Log File")) { try { System.Diagnostics.Process.Start("notepad.exe", _state.PermanentKeyLogPath); } catch { } }
+            ImGui.SameLine();
+            if (ImGui.Button("Export Diagnostics")) ExportDiagnostics();
+            ImGui.SameLine();
+            if (ImGui.Button("Open Live Log"))
             {
                 try
                 {
-                    PacketDecryptor.LoadSSLKeyLog(_state.PermanentKeyLogPath);
-                    _testResult = "Keys loaded!";
+                    if (!string.IsNullOrEmpty(_state.SessionLogPath) && File.Exists(_state.SessionLogPath))
+                        System.Diagnostics.Process.Start("notepad.exe", _state.SessionLogPath);
+                    else
+                        _state.AddInGameLog("[LOG] No session log yet — start a capture first");
                 }
-                catch (Exception ex)
-                {
-                    _testResult = $"Error: {ex.Message}";
-                }
+                catch (Exception ex) { _state.AddInGameLog($"[LOG] Open failed: {ex.Message}"); }
             }
             ImGui.SameLine();
+            if (ImGui.Button("Advanced")) _showAdvanced = !_showAdvanced;
 
-            if (ImGui.Button("Clear Keys", new Vector2(90, 25)))
+            ImGui.EndChild();
+            ImGui.PopStyleColor();
+
+            // Pill badges
+            ImGui.Spacing();
+            Pill($"Keys: {keys}",         hasKeys ? new Vector4(.1f,.7f,.3f,1f) : new Vector4(.4f,.4f,.4f,1f)); ImGui.SameLine();
+            Pill($"Decrypted: {success}",  success > 0 ? new Vector4(.1f,.7f,.3f,1f) : new Vector4(.4f,.4f,.4f,1f)); ImGui.SameLine();
+            Pill($"Failed: {failed}",      failed  > 0 ? new Vector4(.8f,.2f,.2f,1f) : new Vector4(.4f,.4f,.4f,1f));
+            ImGui.Spacing();
+
+            // Key list (left)
+            ImGui.BeginChild("##keys", new Vector2(400, -1), ImGuiChildFlags.Borders);
+            ImGui.TextColored(new Vector4(.4f,.8f,1f,1f), $"Active Keys ({keys})");
+            ImGui.Separator();
+            if (!hasKeys)
             {
-                try
-                {
-                    PacketDecryptor.ClearKeys();
-                    _testResult = "Keys cleared!";
-                }
-                catch (Exception ex)
-                {
-                    _testResult = $"Error: {ex.Message}";
-                }
+                ImGui.TextColored(new Vector4(.5f,.5f,.5f,1f), "No keys yet.\nLaunch Hytale -- they'll appear here automatically.");
             }
-            ImGui.SameLine();
-
-            if (ImGui.Button("Dump Keys", new Vector2(90, 25)))
+            else
             {
-                try
+                foreach (var key in PacketDecryptor.DiscoveredKeys.Take(80))
                 {
-                    _testResult = PacketDecryptor.DumpAllKeys();
+                    string t = key.Type switch
+                    {
+                        PacketDecryptor.EncryptionType.QUIC_Client1RTT      => "[C 1RTT]",
+                        PacketDecryptor.EncryptionType.QUIC_Server1RTT      => "[S 1RTT]",
+                        PacketDecryptor.EncryptionType.QUIC_ClientHandshake => "[C  HS ]",
+                        PacketDecryptor.EncryptionType.QUIC_ServerHandshake => "[S  HS ]",
+                        PacketDecryptor.EncryptionType.QUIC_Client0RTT      => "[C 0RTT]",
+                        _ => "[  ?   ]"
+                    };
+                    var c = key.IsClient ? new Vector4(.3f,.8f,.3f,1f) : new Vector4(.3f,.6f,1f,1f);
+                    string kh = key.Key != null && key.Key.Length > 0 ? Convert.ToHexString(key.Key).Substring(0,16)+"..." : "not derived";
+                    ImGui.TextColored(c, $"{t} {kh}  {key.DiscoveredAt:HH:mm:ss}");
                 }
-                catch (Exception ex)
-                {
-                    _testResult = $"Error: {ex.Message}";
-                }
+                if (keys > 80) ImGui.TextColored(new Vector4(.5f,.5f,.5f,1f), $"... +{keys-80} more");
             }
+            ImGui.EndChild();
+
             ImGui.SameLine();
 
-            if (ImGui.Button("Test Keys", new Vector2(80, 25)))
+            // Right panel
+            ImGui.BeginChild("##right", new Vector2(-1, -1));
+
+            // ── Advanced ──────────────────────────────────────────────────────
+            if (_showAdvanced)
             {
-                try
+                ImGui.TextColored(new Vector4(.8f,.5f,1f,1f), "Advanced Settings");
+                ImGui.Separator();
+
+                if (ImGui.Combo("HKDF Label##fmt", ref _selectedFmt, _fmtLabels, _fmtLabels.Length))
+                    PacketDecryptor.CurrentLabelFormat = (PacketDecryptor.HkdfLabelFormat)_selectedFmt;
+
+                int maxDcid = PacketDecryptor.MaxDCIDLengthToTry;
+                int timeout = PacketDecryptor.DecryptionTimeoutMs;
+                bool autoDecrypt = PacketDecryptor.AutoDecryptEnabled;
+                bool debug = PacketDecryptor.DebugMode;
+                if (ImGui.Checkbox("Auto-Decrypt", ref autoDecrypt)) PacketDecryptor.AutoDecryptEnabled = autoDecrypt;
+                ImGui.SameLine();
+                if (ImGui.Checkbox("Debug Log", ref debug)) PacketDecryptor.DebugMode = debug;
+                ImGui.SliderInt("Max DCID candidates##sl", ref maxDcid, 1, 8);
+                ImGui.SliderInt("Timeout ms##sl", ref timeout, 20, 500);
+                PacketDecryptor.MaxDCIDLengthToTry = maxDcid;
+                PacketDecryptor.DecryptionTimeoutMs = timeout;
+
+                if (ImGui.Button("Dump Keys##adv")) _testResult = PacketDecryptor.DumpAllKeys();
+                ImGui.SameLine();
+                if (ImGui.Button("Clear Keys##adv")) { PacketDecryptor.ClearKeys(); _testResult = "Cleared."; }
+                ImGui.SameLine();
+                if (ImGui.Button("Test RFC Vector")) RunTestVector();
+
+                ImGui.Separator();
+
+                // DPAPI scanner
+                if (ImGui.Button(_showDPAPI ? "Hide DPAPI Scanner" : "Scan .key Files (DPAPI)"))
+                    _showDPAPI = !_showDPAPI;
+
+                if (_showDPAPI)
                 {
-                    _testResult = PacketDecryptor.TestKeyDerivation();
+                    ImGui.TextColored(new Vector4(.9f,.7f,.2f,1f), "Scans Netty/BoringSSL .key session cache files and DPAPI-decrypts them.");
+                    if (ImGui.Button("Scan Now##dp")) _dpapiResult = ScanDPAPI();
+                    if (!string.IsNullOrEmpty(_dpapiResult))
+                        ImGui.InputTextMultiline("##dpres", ref _dpapiResult, 8000, new Vector2(-1, 120), ImGuiInputTextFlags.ReadOnly);
                 }
-                catch (Exception ex)
-                {
-                    _testResult = $"Error: {ex.Message}";
-                }
+
+                ImGui.Separator();
+
+                // Packet analyzer
+                ImGui.TextColored(new Vector4(.4f,.8f,1f,1f), "QUIC Packet Analyzer");
+                ImGui.InputTextMultiline("##pahex", ref _analyzeHex, 4000, new Vector2(-1, 40));
+                ImGui.SameLine();
+                if (ImGui.Button("Analyze##pa")) _analyzeResult = Analyze(_analyzeHex);
+                if (!string.IsNullOrEmpty(_analyzeResult))
+                    ImGui.InputTextMultiline("##pares", ref _analyzeResult, 4000, new Vector2(-1, 120), ImGuiInputTextFlags.ReadOnly);
+
+                ImGui.Separator();
             }
 
-            // Toggles - simple
-            ImGui.Separator();
-            bool debugMode = PacketDecryptor.DebugMode;
-            if (ImGui.Checkbox("Debug Mode", ref debugMode)) PacketDecryptor.DebugMode = debugMode;
+            // ── Test Lab ──────────────────────────────────────────────────────
+            ImGui.TextColored(new Vector4(.4f,.8f,1f,1f), "Test Lab");
+
+            if (ImGui.Button("Deep Diagnose Last Packet"))
+            {
+                Task.Run(() =>
+                {
+                    var packets = _state.PacketLog.GetLast(200);
+                    var quic = packets.Where(p => !p.IsTcp).ToList();
+                    if (quic.Count == 0) { _testResult = "No QUIC packets captured yet."; return; }
+
+                    // First: scan for Initial packet
+                    var initLines = QUICDecryptionDiagnostic.AnalyzeFirstPackets(quic.Select(p => p.RawBytes));
+                    var sb = new System.Text.StringBuilder();
+                    foreach (var l in initLines) sb.AppendLine(l.Replace("[SESSIONDIAG] ",""));
+
+                    // Then: deep diagnose the last S2C packet
+                    var s2c = quic.LastOrDefault(p => p.Direction == Networking.PacketDirection.ServerToClient);
+                    var target = s2c ?? quic.Last();
+                    sb.AppendLine();
+                    sb.AppendLine($"=== Diagnosing packet {target.RawBytes.Length}B ===");
+                    var diag = QUICDecryptionDiagnostic.DiagnosePacket(target.RawBytes);
+                    foreach (var l in diag.Steps.Concat(diag.Errors))
+                        sb.AppendLine(l.Replace("[DIAG] ",""));
+
+                    _testResult = sb.ToString();
+                    _state.AddInGameLog($"[TESTLAB] Deep diag: {diag.Summary}");
+                });
+            }
             ImGui.SameLine();
+            if (ImGui.Button("Verify RFC 9001 Derivation")) RunTestVector();
 
-            bool autoDecrypt = PacketDecryptor.AutoDecryptEnabled;
-            if (ImGui.Checkbox("Auto-Decrypt (WARNING: May cause lag)", ref autoDecrypt))
-                PacketDecryptor.AutoDecryptEnabled = autoDecrypt;
+            ImGui.Text("Manual hex:");
+            ImGui.InputTextMultiline("##hex", ref _hexInput, 20000, new Vector2(-1, 80));
 
-            // Settings - sliders
-            ImGui.Separator();
-            ImGui.Text("Settings (lower = faster):");
-            ImGui.SliderInt("Max DCID", ref PacketDecryptor.MaxDCIDLengthToTry, 1, 5);
-            ImGui.SliderInt("Timeout (ms)", ref PacketDecryptor.DecryptionTimeoutMs, 20, 200);
-
-            ImGui.Combo("Label Format", ref _selectedLabelFormat, _labelFormats, _labelFormats.Length);
-            PacketDecryptor.CurrentLabelFormat = (PacketDecryptor.HkdfLabelFormat)_selectedLabelFormat;
-
-            // Test Lab
-            ImGui.Separator();
-            ImGui.Text("Test Lab:");
-            ImGui.InputTextMultiline("##input", ref _testInput, 10000, new Vector2(-1, 60));
-
-            if (ImGui.Button("Try Decrypt", new Vector2(100, 25))) TryDecryptTest();
+            if (ImGui.Button("Decrypt"))
+            {
+                _testResult = "Decrypting...";
+                Task.Run(() => DoDecrypt());
+            }
             ImGui.SameLine();
-            if (ImGui.Button("Clear", new Vector2(60, 25))) { _testInput = ""; _testResult = ""; }
+            if (ImGui.Button("Paste")) { try { _hexInput = ImGui.GetClipboardText(); } catch { } }
+            ImGui.SameLine();
+            if (ImGui.Button("Clear")) { _hexInput = ""; _testResult = ""; }
 
-            // Result
             ImGui.Separator();
-            ImGui.Text("Result:");
-            ImGui.InputTextMultiline("##result", ref _testResult, 10000, new Vector2(-1, 100), ImGuiInputTextFlags.ReadOnly);
+            if (!string.IsNullOrEmpty(_testResult))
+            {
+                var col = _testResult.Contains("SUCCESS") || _testResult.Contains("PASS")
+                    ? new Vector4(.2f,1f,.4f,1f)
+                    : _testResult.Contains("FAIL") || _testResult.Contains("Error")
+                        ? new Vector4(1f,.3f,.3f,1f)
+                        : new Vector4(.8f,.8f,.8f,1f);
+                ImGui.InputTextMultiline("##res", ref _testResult, 20000, new Vector2(-1, -1), ImGuiInputTextFlags.ReadOnly);
+            }
+
+            ImGui.EndChild();
         }
 
-        private void TryDecryptTest()
+        private void DoDecrypt()
         {
+            if (string.IsNullOrWhiteSpace(_hexInput)) { _testResult = "Paste hex first."; return; }
             try
             {
-                string hex = _testInput.Replace(" ", "").Replace("-", "").Replace(":", "");
-                byte[] data = Convert.FromHexString(hex);
-
+                byte[] data = Convert.FromHexString(_hexInput.Replace(" ","").Replace("-","").Replace(":","").Replace("\n","").Replace("\r",""));
                 var sb = new StringBuilder();
-                sb.AppendLine($"Input: {data.Length} bytes");
-                sb.AppendLine($"Encrypted: {PacketDecryptor.IsLikelyEncrypted(data)}");
+                sb.AppendLine($"Packet: {data.Length} bytes  Keys: {PacketDecryptor.DiscoveredKeys.Count}");
+                sb.AppendLine($"Label: {_fmtLabels[_selectedFmt]}");
+                sb.AppendLine($"First 16: {Convert.ToHexString(data.Take(16).ToArray()).ToLower()}");
+                sb.AppendLine();
 
-                // Run on background thread to prevent UI freeze
-                var task = System.Threading.Tasks.Task.Run(() =>
+                // Try all label formats until one succeeds
+                bool anySuccess = false;
+                foreach (var fmt in new[] {
+                    (PacketDecryptor.HkdfLabelFormat)_selectedFmt,
+                    PacketDecryptor.HkdfLabelFormat.RFC8446_WithPrefix,
+                    PacketDecryptor.HkdfLabelFormat.RFC9001_NoPrefix })
                 {
-                    return PacketDecryptor.TryDecryptManual(data, _selectedDCIDLength, (PacketDecryptor.HkdfLabelFormat)_selectedLabelFormat);
-                });
-
-                if (task.Wait(500)) // 500ms max for UI
-                {
-                    var result = task.Result;
-                    sb.AppendLine($"Success: {result.Success}");
-                    if (result.DecryptedData != null)
-                        sb.AppendLine($"Decrypted: {result.DecryptedData.Length} bytes");
-                    if (!string.IsNullOrEmpty(result.ErrorMessage))
-                        sb.AppendLine($"Error: {result.ErrorMessage}");
+                    var capturedFmt = fmt;
+                    var task = Task.Run(() => PacketDecryptor.TryDecryptManual(data, 8000, capturedFmt));
+                    if (!task.Wait(500)) { sb.AppendLine($"TIMEOUT (500ms) for {fmt}"); continue; }
+                    var r = task.Result;
+                    if (r.Success)
+                    {
+                        sb.AppendLine($"SUCCESS with format={fmt}");
+                        sb.AppendLine($"  {r.DecryptedData.Length} bytes decrypted");
+                        sb.AppendLine($"  Hex: {Convert.ToHexString(r.DecryptedData.Take(64).ToArray()).ToLower()}");
+                        try { sb.AppendLine($"  ASCII: {Encoding.ASCII.GetString(r.DecryptedData.Take(64).ToArray()).Replace("\0",".")}"); } catch { }
+                        anySuccess = true;
+                        break;
+                    }
+                    sb.AppendLine($"FAIL [{fmt}]: {r.ErrorMessage}");
                 }
-                else
-                {
-                    sb.AppendLine("Timeout - operation took too long");
-                }
 
+                if (!anySuccess)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("Possible causes:");
+                    if (PacketDecryptor.DiscoveredKeys.Count == 0)
+                        sb.AppendLine("  No keys loaded - launch Hytale first");
+                    else
+                    {
+                        sb.AppendLine($"  {PacketDecryptor.DiscoveredKeys.Count} keys tried, all failed");
+                        sb.AppendLine("  Most likely: keys from a DIFFERENT TLS session than this packet");
+                        sb.AppendLine("  Fix: restart Hytale WHILE HyForce proxy is running");
+                        sb.AppendLine("  Note: Netty QUIC default DCID = 20 bytes for 1-RTT packets");
+                    }
+                }
                 _testResult = sb.ToString();
             }
-            catch (Exception ex)
+            catch (Exception ex) { _testResult = $"Error: {ex.Message}"; }
+        }
+
+        private void RunTestVector()
+        {
+            Task.Run(() =>
             {
-                _testResult = $"Error: {ex.Message}";
+                try
+                {
+                    // RFC 9001 A.1: derive client_in_secret from DCID 8394c8f03e515708
+                    byte[] salt    = Convert.FromHexString("38762cf7f55934b34d179ae6a4c80cadccbb7f0a");
+                    byte[] dcid    = Convert.FromHexString("8394c8f03e515708");
+                    byte[] initSec = HKDF.Extract(HashAlgorithmName.SHA256, dcid, salt);
+                    byte[] lbl     = Encoding.ASCII.GetBytes("tls13 client in");
+                    byte[] info    = new byte[3 + lbl.Length + 1];
+                    info[1] = 32; info[2] = (byte)lbl.Length;
+                    lbl.CopyTo(info, 3);
+                    byte[] secret = HKDF.Expand(HashAlgorithmName.SHA256, initSec, 32, info);
+
+                    var saved = PacketDecryptor.CurrentLabelFormat;
+                    PacketDecryptor.CurrentLabelFormat = PacketDecryptor.HkdfLabelFormat.RFC8446_WithPrefix;
+                    var k = new PacketDecryptor.EncryptionKey { Secret = secret, Type = PacketDecryptor.EncryptionType.QUIC_Client1RTT, Source = "RFC9001-A.1" };
+                    PacketDecryptor.DeriveQUICKeys(k);
+                    PacketDecryptor.CurrentLabelFormat = saved;
+
+                    bool kOk = k.Key?.SequenceEqual(Convert.FromHexString("1f369613dd76d5467730efcbe3b1a22d")) == true;
+                    bool iOk = k.IV?.SequenceEqual(Convert.FromHexString("fa044b2f42a3fd3b46fb255c")) == true;
+                    bool hOk = k.HeaderProtectionKey?.SequenceEqual(Convert.FromHexString("9f50449e04a0e810283a1e9933adedd2")) == true;
+
+                    string pass = kOk && iOk && hOk ? "✓ ALL PASS" : "✗ FAIL";
+                    var sb = new StringBuilder();
+                    sb.AppendLine($"RFC 9001 Appendix A.1 Test Vector: {pass}");
+                    sb.AppendLine($"Key: {(kOk?"PASS":"FAIL")}  Got: {(k.Key != null ? Convert.ToHexString(k.Key) : "null")}");
+                    sb.AppendLine($"IV:  {(iOk?"PASS":"FAIL")}  Got: {(k.IV != null ? Convert.ToHexString(k.IV) : "null")}");
+                    sb.AppendLine($"HP:  {(hOk?"PASS":"FAIL")}  Got: {(k.HeaderProtectionKey != null ? Convert.ToHexString(k.HeaderProtectionKey) : "null")}");
+                    if (kOk && iOk && hOk)
+                    {
+                        sb.AppendLine();
+                        sb.AppendLine("HKDF is correct. If decryption still fails:");
+                        sb.AppendLine("1. DCID length mismatch - Netty uses 20 bytes by default");
+                        sb.AppendLine("2. Keys from wrong session - restart Hytale to get fresh keys");
+                        sb.AppendLine("3. Packet number counter out of sync");
+                    }
+                    _testResult = sb.ToString();
+                    _state.AddInGameLog($"[TESTLAB] RFC 9001: Key:{(kOk?"PASS":"FAIL")} IV:{(iOk?"PASS":"FAIL")} HP:{(hOk?"PASS":"FAIL")} → {pass}");
+                }
+                catch (Exception ex) { _testResult = $"Test vector error: {ex.Message}"; }
+            });
+        }
+
+        private void ExportDiagnostics()
+        {
+            _state.AddInGameLog("[EXPORT] Starting diagnostics export...");
+            Task.Run(() =>
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("=== HyForce Decryption Diagnostics ===");
+                sb.AppendLine($"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                sb.AppendLine($"Session log: {_state.SessionLogPath}");
+                sb.AppendLine();
+
+                // ── Stats ──
+                try
+                {
+                    sb.AppendLine("--- Decryption Stats ---");
+                    sb.AppendLine($"  Keys:         {PacketDecryptor.DiscoveredKeys.Count}");
+                    sb.AppendLine($"  Successful:   {PacketDecryptor.SuccessfulDecryptions}");
+                    sb.AppendLine($"  Failed:       {PacketDecryptor.FailedDecryptions}");
+                    sb.AppendLine($"  HP-filtered:  {PacketDecryptor.SkippedDecryptions}");
+                    sb.AppendLine($"  Label:        {PacketDecryptor.CurrentLabelFormat}");
+                    sb.AppendLine();
+                    _state.AddInGameLog("[EXPORT] Stats ✓");
+                }
+                catch (Exception ex) { sb.AppendLine($"  [STATS ERROR] {ex.Message}"); _state.AddInGameLog($"[EXPORT] Stats error: {ex.Message}"); }
+
+                // ── RFC 9001 self-test ──
+                try
+                {
+                    sb.AppendLine("--- RFC 9001 Self-Test ---");
+                    var testLines = QUICDecryptionDiagnostic.RunRFC9001SelfTest();
+                    foreach (var l in testLines) sb.AppendLine(l);
+                    sb.AppendLine();
+                    string result = testLines.LastOrDefault() ?? "?";
+                    _state.AddInGameLog($"[EXPORT] RFC9001: {result}");
+                }
+                catch (Exception ex) { sb.AppendLine($"  [RFC9001 ERROR] {ex.Message}"); _state.AddInGameLog($"[EXPORT] RFC9001 error: {ex.Message}"); }
+
+                // ── Keys ──
+                try
+                {
+                    sb.AppendLine("--- Active Keys ---");
+                    foreach (var k in PacketDecryptor.DiscoveredKeys)
+                    {
+                        sb.AppendLine($"  [{k.Type}]  src={k.Source}  added={k.DiscoveredAt:HH:mm:ss}");
+                        sb.AppendLine($"    secret= {Convert.ToHexString(k.Secret ?? Array.Empty<byte>())}");
+                        sb.AppendLine($"    key=    {Convert.ToHexString(k.Key ?? Array.Empty<byte>())}");
+                        sb.AppendLine($"    iv=     {Convert.ToHexString(k.IV ?? Array.Empty<byte>())}");
+                        sb.AppendLine($"    hp=     {Convert.ToHexString(k.HeaderProtectionKey ?? Array.Empty<byte>())}");
+                    }
+                    sb.AppendLine();
+                    _state.AddInGameLog($"[EXPORT] {PacketDecryptor.DiscoveredKeys.Count} keys dumped ✓");
+                }
+                catch (Exception ex) { sb.AppendLine($"  [KEYS ERROR] {ex.Message}"); _state.AddInGameLog($"[EXPORT] Keys error: {ex.Message}"); }
+
+                // ── Last packets ──
+                try
+                {
+                    sb.AppendLine("--- Last 10 QUIC Packets (hex + diagnosis) ---");
+                    var pkts = _state.PacketLog.GetLast(500).Where(p => !p.IsTcp).TakeLast(10).ToList();
+                    _state.AddInGameLog($"[EXPORT] Diagnosing {pkts.Count} packets...");
+                    foreach (var pkt in pkts)
+                    {
+                        sb.AppendLine($"  [{pkt.Direction}] {pkt.RawBytes.Length}B  0x{pkt.RawBytes[0]:X2}");
+                        sb.AppendLine($"  HEX: {Convert.ToHexString(pkt.RawBytes).ToLower()}");
+                        try
+                        {
+                            var diag = QUICDecryptionDiagnostic.DiagnosePacket(pkt.RawBytes);
+                            foreach (var l in diag.Steps.Concat(diag.Errors)) sb.AppendLine($"    {l}");
+                        }
+                        catch (Exception ex2) { sb.AppendLine($"    [DIAG ERR] {ex2.Message}"); }
+                        sb.AppendLine();
+                    }
+                    _state.AddInGameLog("[EXPORT] Packets dumped ✓");
+                }
+                catch (Exception ex) { sb.AppendLine($"  [PACKETS ERROR] {ex.Message}"); _state.AddInGameLog($"[EXPORT] Packets error: {ex.Message}"); }
+
+                // ── In-game log ──
+                try
+                {
+                    sb.AppendLine("--- In-Game Log (last 200) ---");
+                    foreach (var entry in _state.GetRecentLog(200)) sb.AppendLine($"  {entry}");
+                    sb.AppendLine();
+                }
+                catch (Exception ex) { sb.AppendLine($"  [LOG ERROR] {ex.Message}"); }
+
+                sb.AppendLine($"--- Live Session Log ---");
+                sb.AppendLine($"  File: {_state.SessionLogPath}");
+
+                // ── Write ──
+                try
+                {
+                    string outPath = Path.Combine(_state.ExportDirectory,
+                        $"decrypt_diag_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                    Directory.CreateDirectory(_state.ExportDirectory);
+                    File.WriteAllText(outPath, sb.ToString());
+                    _testResult = $"✓ Exported to:{outPath} Live log:{_state.SessionLogPath}";
+
+                    _state.AddInGameLog($"[EXPORT] ✓ {Path.GetFileName(outPath)}");
+                    try { System.Diagnostics.Process.Start("notepad.exe", outPath); } catch { }
+                }
+                catch (Exception ex)
+                {
+                    _testResult = $"File write failed: {ex.Message}Content:{sb.ToString().Substring(0, Math.Min(400, sb.Length))}";
+
+                    _state.AddInGameLog($"[EXPORT] ✗ Write failed: {ex.Message}");
+                }
+            });
+        }
+
+        private static string ScanDPAPI()
+        {
+            var sb = new StringBuilder("=== DPAPI .key Scanner ===\n");
+            var searchDirs = new[]
+            {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Hytale"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HyTide"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Hytale"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)),
+            };
+            int found = 0;
+            foreach (var dir in searchDirs)
+            {
+                if (!Directory.Exists(dir)) continue;
+                try
+                {
+                    foreach (var f in Directory.GetFiles(dir, "*.key", SearchOption.TopDirectoryOnly))
+                    {
+                        found++;
+                        byte[] raw = File.ReadAllBytes(f);
+                        sb.AppendLine($"\n{Path.GetFileName(f)} ({raw.Length}b)");
+                        sb.AppendLine($"  Header: {Convert.ToHexString(raw.Take(8).ToArray())}");
+                        try
+                        {
+                            byte[] dec = System.Security.Cryptography.ProtectedData.Unprotect(
+                                raw, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+                            sb.AppendLine($"  DPAPI: SUCCESS → {dec.Length} bytes");
+                            sb.AppendLine($"  Data: {Convert.ToHexString(dec.Take(32).ToArray())}");
+                        }
+                        catch (CryptographicException) { sb.AppendLine("  DPAPI: Cannot decrypt (different user/machine?)"); }
+                        catch (Exception ex) { sb.AppendLine($"  Error: {ex.Message}"); }
+                    }
+                }
+                catch { }
             }
+            if (found == 0) sb.AppendLine("No .key files found. Provide path manually?");
+            return sb.ToString();
+        }
+
+        private static string Analyze(string hex)
+        {
+            if (string.IsNullOrWhiteSpace(hex)) return "Paste hex packet first.";
+            try
+            {
+                byte[] p = Convert.FromHexString(hex.Replace(" ","").Replace("-","").Replace("\n","").Replace("\r",""));
+                var sb = new StringBuilder();
+                sb.AppendLine($"Size: {p.Length} bytes");
+                sb.AppendLine($"Byte0: 0x{p[0]:X2} = {Convert.ToString(p[0],2).PadLeft(8,'0')}b");
+                bool isLong = (p[0] & 0x80) != 0;
+                bool fixed1 = (p[0] & 0x40) != 0;
+                sb.AppendLine($"Header: {(isLong ? "LONG" : "SHORT (1-RTT)")}  Fixed-bit: {(fixed1?"✓":"✗ may not be QUIC")}");
+
+                if (isLong && p.Length >= 6)
+                {
+                    uint ver = (uint)(p[1]<<24|p[2]<<16|p[3]<<8|p[4]);
+                    string verStr = ver == 1 ? "QUIC v1" : ver == 0x6b3343cf ? "QUIC v2" : $"unknown 0x{ver:X}";
+                    byte[] pktTypes = { (byte)((p[0]>>4)&0x3) };
+                    string[] names = { "Initial","0-RTT","Handshake","Retry" };
+                    sb.AppendLine($"Version: {verStr}  Type: {names[pktTypes[0]]}");
+                    int dcidLen = p[5];
+                    sb.AppendLine($"DCID length: {dcidLen}  DCID: {(p.Length>6+dcidLen?Convert.ToHexString(p.Skip(6).Take(dcidLen).ToArray()):"?")}");
+                }
+                else if (!isLong)
+                {
+                    sb.AppendLine($"Spin: {(p[0]>>5)&1}  KeyPhase: {(p[0]>>2)&1}  PN-len bits: {(p[0]&3)+1}");
+                    sb.AppendLine("DCID guesses (Netty default = 20 bytes):");
+                    foreach (int d in new[]{8,16,20})
+                    {
+                        int so = 1+d+4;
+                        if (p.Length >= so+4)
+                            sb.AppendLine($"  dcid={d}: pn_region={Convert.ToHexString(p.Skip(1+d).Take(4).ToArray())} sample={Convert.ToHexString(p.Skip(so).Take(4).ToArray())}");
+                    }
+                }
+
+                double h = 0; var freq = new int[256]; foreach (var b in p) freq[b]++;
+                foreach (var f in freq) if(f>0){double pp=(double)f/p.Length; h-=pp*Math.Log2(pp);}
+                sb.AppendLine($"Entropy: {h:F2}/8.0  {(h>6.5?"(likely encrypted)":"(may be plaintext)")}");
+                sb.AppendLine($"Keys ready: {PacketDecryptor.DiscoveredKeys.Count}");
+                return sb.ToString();
+            }
+            catch (Exception ex) { return $"Error: {ex.Message}"; }
+        }
+
+        private static void Pill(string text, Vector4 col)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Button, col with { W = .22f });
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, col with { W = .22f });
+            ImGui.PushStyleColor(ImGuiCol.Text, col);
+            ImGui.PushStyleColor(ImGuiCol.Border, col with { W = .55f });
+            ImGui.SmallButton(text);
+            ImGui.PopStyleColor(4);
         }
     }
 }
+
 
 
 ===== FILE: C:\Users\benja\source\repos\HyForce\Tabs\ITab.cs =====

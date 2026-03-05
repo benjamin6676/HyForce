@@ -20,15 +20,19 @@ namespace HyForce
         private static List<DecryptionAttempt> _attemptLog = new();
         private static readonly object _lock = new object();
         
+        // Packet number tracking per key for proper nonce reconstruction (RFC 9000 §A.3)
+        // Key = key secret hash, Value = largest successfully decoded packet number
+        private static readonly Dictionary<string, long> _largestPktNum = new();
+        
         // Safety settings - TUNED FOR NO LAG
-        public static int MaxDCIDLengthToTry { get; set; } = 3; // Very limited to prevent hangs
-        public static int DecryptionTimeoutMs { get; set; } = 50; // Very short timeout
+        public static int MaxDCIDLengthToTry { get; set; } = 20; // Netty QUIC 1-RTT DCID 0-20 bytes
+        public static int DecryptionTimeoutMs { get; set; } = 100; // 100ms per attempt
         public static bool EnableDebugLogging { get; set; } = true;
         
         public static bool DebugMode { get; set; } = true;
         public static bool AutoDecryptEnabled { get; set; } = false; // DISABLED by default to prevent lag
         public static int SkippedDecryptions { get; set; } = 0;
-        public static HkdfLabelFormat CurrentLabelFormat { get; set; } = HkdfLabelFormat.RFC9001_NoPrefix;
+        public static HkdfLabelFormat CurrentLabelFormat { get; set; } = HkdfLabelFormat.RFC8446_WithPrefix; // RFC 9001 §5.1 requires "tls13 " prefix (confirmed by test vector)
         
         public static List<EncryptionKey> DiscoveredKeys => GetAllKeys();
         public static int TotalAttempts => _attemptLog.Count;
@@ -79,7 +83,26 @@ namespace HyForce
             public EncryptionKey ClientKey { get; set; }
             public EncryptionKey ServerKey { get; set; }
             public int SuccessfulDCIDLength { get; set; } = -1;
+            public bool IsCurrentSession { get; set; } = false;  // added after last Start()
+            public DateTime AddedAt { get; set; } = DateTime.Now;
             public bool IsComplete => ClientKey?.IsValid == true && ServerKey?.IsValid == true;
+        }
+
+        // Timestamp of last Start() call — keys added after this are "current session"
+        private static DateTime _sessionStartTime = DateTime.MinValue;
+
+        /// <summary>Call when capture session starts to mark future keys as current-session.</summary>
+        public static void MarkSessionStart()
+        {
+            lock (_lock)
+            {
+                _sessionStartTime = DateTime.Now;
+                // Mark any keys added within the last 30 seconds as current session
+                // (handles keys that loaded just before Start() was clicked)
+                var cutoff = _sessionStartTime.AddSeconds(-30);
+                foreach (var conn in _connectionKeys.Values)
+                    if (conn.AddedAt >= cutoff) conn.IsCurrentSession = true;
+            }
         }
         
         private class DecryptionAttempt
@@ -108,10 +131,18 @@ namespace HyForce
                     _connectionKeys[connId] = new ConnectionKeys { ClientRandom = connId };
                 
                 if (key.IsClient) _connectionKeys[connId].ClientKey = key;
-                else _connectionKeys[connId].ServerKey = key;
-                
-                if (EnableDebugLogging)
-                    Console.WriteLine($"[KEY] Added {(key.IsClient ? "client" : "server")} key");
+
+                // Tag as current-session if added after last Start()
+                if (_sessionStartTime != DateTime.MinValue &&
+                    DateTime.Now >= _sessionStartTime.AddSeconds(-30))
+                {
+                    _connectionKeys[connId].IsCurrentSession = true;
+                    _connectionKeys[connId].AddedAt = DateTime.Now;  // This was line 138
+                }
+                else
+                {
+                    _connectionKeys[connId].ServerKey = key;
+                }
             }
         }
         
@@ -144,26 +175,61 @@ namespace HyForce
         }
         
         /// <summary>
-        /// SAFE TryDecrypt - returns immediately, no blocking
+        /// Non-blocking fire-and-forget decrypt for auto-decrypt pipeline.
+        /// Enqueues packet; background worker processes it and fires OnDecrypted.
+        /// Returns immediately — NEVER blocks the calling thread.
         /// </summary>
         public static DecryptionResult TryDecrypt(byte[] packet)
         {
             if (!AutoDecryptEnabled)
                 return new DecryptionResult { Success = false, Error = "Auto-decrypt disabled" };
-            
-            // Run on background thread with timeout
-            byte[] result = null;
-            var task = Task.Run(() => TryDecryptWithAllKeysInternal(packet));
-            
-            if (task.Wait(DecryptionTimeoutMs))
-                result = task.Result;
-            
-            return new DecryptionResult
+
+            // HP pre-filter: check if ANY (key,dcid) combo could produce a valid short-header
+            // before committing to AES-GCM. This eliminates ~87.5% of bad attempts cheaply.
+            if (packet.Length > 21 && (packet[0] & 0x80) == 0) // short header
             {
-                Success = result != null,
-                DecryptedData = result,
-                Error = result == null ? "Timeout or all attempts failed" : null
-            };
+                bool anyValid = false;
+                lock (_lock)
+                {
+                    var conns = _connectionKeys.Values
+                        .Where(c => c.IsCurrentSession)
+                        .Concat(_connectionKeys.Values.Where(c => !c.IsCurrentSession))
+                        .Take(MaxSessionsToSearch)
+                        .ToList();
+
+                    foreach (var conn in conns)
+                    {
+                        foreach (var key in new[] { conn.ServerKey, conn.ClientKey })
+                        {
+                            if (key?.HeaderProtectionKey == null) continue;
+                            if (conn.SuccessfulDCIDLength >= 0)
+                            {
+                                if (HPFilterPass(packet, key.HeaderProtectionKey, conn.SuccessfulDCIDLength))
+                                { anyValid = true; break; }
+                            }
+                            else
+                            {
+                                for (int d = 0; d <= 20; d++)
+                                    if (HPFilterPass(packet, key.HeaderProtectionKey, d))
+                                    { anyValid = true; break; }
+                            }
+                            if (anyValid) break;
+                        }
+                        if (anyValid) break;
+                    }
+                }
+                if (!anyValid)
+                {
+                    SkippedDecryptions++;
+                    return new DecryptionResult { Success = false, Error = "HP pre-filter: no valid key/DCID found" };
+                }
+            }
+
+            // Enqueue for background worker — does NOT block
+            if (!_decryptQueue.IsAddingCompleted)
+                _decryptQueue.TryAdd(packet);
+
+            return new DecryptionResult { Success = false, Error = "Queued for background decryption" };
         }
         
         public static DecryptionResult TryDecryptManual(byte[] packet, int timeoutMs)
@@ -202,8 +268,70 @@ namespace HyForce
             return new EncryptionResult { Success = true, EncryptedData = plaintext };
         }
         
-        public static void StartAutoDecrypt() { }
-        public static void StopAutoDecrypt() { }
+        // Background decrypt pipeline
+        private static System.Collections.Concurrent.BlockingCollection<byte[]> _decryptQueue
+            = new System.Collections.Concurrent.BlockingCollection<byte[]>(500); // cap at 500 queued
+        private static System.Threading.Thread? _decryptWorker;
+        public static int MaxSessionsToSearch { get; set; } = 5; // only try N most recent sessions
+
+        // Fired when a packet is successfully decrypted
+        public static event Action<byte[], byte[]>? OnDecrypted; // (encrypted, decrypted)
+
+        public static void StartAutoDecrypt()
+        {
+            if (_decryptWorker?.IsAlive == true) return;
+            _decryptWorker = new System.Threading.Thread(DecryptWorkerLoop)
+            {
+                IsBackground = true,
+                Name = "HyForce-DecryptWorker",
+                Priority = System.Threading.ThreadPriority.BelowNormal // never starve UI
+            };
+            _decryptWorker.Start();
+        }
+
+        public static void StopAutoDecrypt()
+        {
+            // Drain queue; worker exits on its own
+            while (_decryptQueue.TryTake(out _)) { }
+        }
+
+        private static void DecryptWorkerLoop()
+        {
+            foreach (var packet in _decryptQueue.GetConsumingEnumerable())
+            {
+                try
+                {
+                    var result = TryDecryptWithAllKeysInternal(packet);
+                    if (result != null)
+                    {
+                        _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = true });
+                        OnDecrypted?.Invoke(packet, result);
+
+                    }
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// HP pre-filter: compute header-protection mask for the given dcidLen
+        /// and check if the unprotected first byte is a valid QUIC short-header byte.
+        /// RFC 9000 §17.3: Fixed bit (0x40) must be 1, Reserved bits (0x18) must be 0.
+        /// Returns true = this (key, dcid) combo is PLAUSIBLE (still needs AES-GCM to confirm).
+        /// Returns false = impossible, skip AES-GCM entirely.
+        /// </summary>
+        private static bool HPFilterPass(byte[] packet, byte[] hpKey, int dcidLen)
+        {
+            try
+            {
+                int sampleOffset = 1 + dcidLen + 4;
+                if (sampleOffset + 16 > packet.Length) return false;
+                var mask = ComputeHPMask(hpKey, packet.Skip(sampleOffset).Take(16).ToArray());
+                byte unprotected = (byte)((packet[0] & 0xE0) | ((packet[0] & 0x1F) ^ (mask[0] & 0x1F)));
+                return (unprotected & 0x40) != 0 && (unprotected & 0x18) == 0;
+            }
+            catch { return false; }
+        }
         
         public static void ClearKeys()
         {
@@ -363,51 +491,88 @@ namespace HyForce
                 return keys;
             }
         }
-        
+
         private static byte[] TryDecryptWithAllKeysInternal(byte[] packet)
         {
             if (packet == null || packet.Length < 20) return null;
-            
+
             lock (_lock)
             {
-                bool isClientPacket = IsClientPacket(packet);
-                var connections = _connectionKeys.Values
-                    .Where(c => isClientPacket ? c.ClientKey?.IsValid == true : c.ServerKey?.IsValid == true)
-                    .Take(5) // Limit connections
+                // Order: current-session connections first (most likely match), then rest
+                // Current-session keys first; cap total sessions to avoid O(n*dcid) explosion
+                var current = _connectionKeys.Values
+                    .Where(c => c.IsCurrentSession)
+                    .OrderByDescending(c => c.AddedAt)
+                    .Take(MaxSessionsToSearch)
                     .ToList();
-                
-                if (connections.Count == 0) return null;
-                
-                foreach (var conn in connections)
+                var others = _connectionKeys.Values
+                    .Where(c => !c.IsCurrentSession)
+                    .OrderByDescending(c => c.AddedAt)
+                    .Take(Math.Max(1, MaxSessionsToSearch - current.Count))
+                    .ToList();
+                var ordered = current.Concat(others).ToList();
+                if (ordered.Count == 0) return null;
+
+                foreach (var conn in ordered)
                 {
-                    var key = isClientPacket ? conn.ClientKey : conn.ServerKey;
-                    
-                    // Very limited DCID lengths to prevent hangs
-                    int[] dcidLengths = conn.SuccessfulDCIDLength >= 0 
-                        ? new[] { conn.SuccessfulDCIDLength } 
-                        : new[] { 0, 8, 16 }.Take(MaxDCIDLengthToTry).ToArray();
-                    
-                    foreach (int dcidLen in dcidLengths)
+                    // Fast path: if we already know the working DCID length, use it
+                    // HP filter already ran above; here we only reach surviving combos
+                    // Try known-good DCID length first, then Netty defaults (20), then scan
+                    // CONFIRMED: Hytale server uses SCID=0 (from Initial packet capture)
+                    // So 1-RTT short-header DCID = 0 bytes. Try 0 FIRST.
+                    int[] dcidLengths = conn.SuccessfulDCIDLength >= 0
+                        ? new[] { conn.SuccessfulDCIDLength }
+                        : new[] { 0, 8, 20, 4, 16, 12, 1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19 };
+
+                    // 1-RTT server key first (S2C ~95% of traffic); skip 0RTT/Handshake for auto-decrypt
+                    var keysToTry = new List<EncryptionKey>();
+                    if (conn.ServerKey?.IsValid == true &&
+                        conn.ServerKey.Type == EncryptionType.QUIC_Server1RTT)
+                        keysToTry.Add(conn.ServerKey);
+                    if (conn.ClientKey?.IsValid == true &&
+                        conn.ClientKey.Type == EncryptionType.QUIC_Client1RTT)
+                        keysToTry.Add(conn.ClientKey);
+                    // Fallback: any valid key if no 1RTT found
+                    if (keysToTry.Count == 0)
                     {
-                        try
-                        {
-                            var result = TryDecryptInternal(packet, key, dcidLen);
-                            if (result != null)
-                            {
-                                conn.SuccessfulDCIDLength = dcidLen;
-                                _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = true });
-                                return result;
-                            }
-                        }
-                        catch { }
+                        if (conn.ServerKey?.IsValid == true) keysToTry.Add(conn.ServerKey);
+                        if (conn.ClientKey?.IsValid == true) keysToTry.Add(conn.ClientKey);
                     }
+
+                    foreach (var key in keysToTry)
+                    {
+                        foreach (int dcidLen in dcidLengths)
+                        {
+                            try
+                            {
+                                var result = TryDecryptInternal(packet, key, dcidLen);
+                                if (result != null)
+                                {
+                                    conn.SuccessfulDCIDLength = dcidLen;
+                                    conn.IsCurrentSession = true; // it works, lock it in
+
+                                    // NEW: Promote this key to working file since it successfully decrypted
+                                    try
+                                    {
+                                        HyForce.Core.AppState.Instance?.PromoteKeyToWorking(key);
+                                    }
+                                    catch { /* Don't fail decryption if promote fails */ }
+
+                                    _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = true });
+                                    return result;
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+
+                    _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = false });
                 }
-                
-                _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = false });
+
                 return null;
             }
         }
-        
+
         private static byte[] TryDecryptInternal(byte[] packet, EncryptionKey key, int dcidLen)
         {
             byte firstByte = packet[0];
@@ -440,7 +605,9 @@ namespace HyForce
                 if (packet.Length < sampleOffset + 16) return null;
                 byte[] sample = packet.Skip(sampleOffset).Take(16).ToArray();
                 byte[] mask = ComputeHPMask(key.HeaderProtectionKey, sample);
-                byte packetNumberLength = (byte)((packet[0] & 0x03) + 1);
+                // RFC 9001 §5.4.1: must remove HP from first byte BEFORE reading PN length
+                byte unprotectedFirstLH = (byte)(packet[0] ^ (mask[0] & 0x0F));
+                byte packetNumberLength = (byte)((unprotectedFirstLH & 0x03) + 1);
                 byte[] decryptedPnBytes = new byte[packetNumberLength];
                 for (int i = 0; i < packetNumberLength; i++) decryptedPnBytes[i] = (byte)(packet[pnOffset + i] ^ mask[i + 1]);
                 int payloadOffset = pnOffset + packetNumberLength, payloadLength = packet.Length - payloadOffset;
@@ -448,8 +615,10 @@ namespace HyForce
                 byte[] nonce = new byte[12];
                 Buffer.BlockCopy(key.IV, 0, nonce, 0, 12);
                 for (int i = 0; i < packetNumberLength; i++) nonce[11 - i] ^= decryptedPnBytes[packetNumberLength - 1 - i];
+                // RFC 9001 §5.3: AAD must contain unprotected header
                 byte[] aad = packet.Take(payloadOffset).ToArray();
-                aad[0] = (byte)(packet[0] ^ (mask[0] & 0x0F));
+                aad[0] = unprotectedFirstLH;
+                for (int i = 0; i < packetNumberLength; i++) aad[pnOffset + i] = decryptedPnBytes[i];
                 byte[] ciphertext = packet.Skip(payloadOffset).ToArray();
                 byte[] plaintext = new byte[ciphertext.Length - 16];
                 byte[] tag = ciphertext.Skip(ciphertext.Length - 16).ToArray();
@@ -474,23 +643,58 @@ namespace HyForce
                 byte unprotectedFirstByte = (byte)((packet[0] & 0xE0) | (protectedBits ^ (mask[0] & 0x1F)));
                 int packetNumberLength = (unprotectedFirstByte & 0x03) + 1;
                 int pnOffset = dcidEnd;
-                byte[] decryptedPnBytes = new byte[packetNumberLength];
-                for (int i = 0; i < packetNumberLength; i++) decryptedPnBytes[i] = (byte)(packet[pnOffset + i] ^ mask[i + 1]);
+                
+                // Decode truncated packet number from wire
+                long truncatedPN = 0;
+                for (int i = 0; i < packetNumberLength; i++)
+                    truncatedPN = (truncatedPN << 8) | (byte)(packet[pnOffset + i] ^ mask[i + 1]);
+                
+                // RFC 9000 §A.3: Reconstruct full 62-bit packet number from truncated value
+                string keyId = BitConverter.ToString(SHA256.HashData(key.Secret).Take(8).ToArray());
+                long largestAcked = _largestPktNum.TryGetValue(keyId, out var lp) ? lp : 0;
+                long fullPN = ReconstructPacketNumber(truncatedPN, packetNumberLength, largestAcked);
+                
                 int payloadOffset = pnOffset + packetNumberLength, payloadLength = packet.Length - payloadOffset;
                 if (payloadLength < 16) return null;
+                
+                // Build nonce: IV XOR full 62-bit packet number (big-endian into last 8 bytes)
                 byte[] nonce = new byte[12];
                 Buffer.BlockCopy(key.IV, 0, nonce, 0, 12);
-                for (int i = 0; i < packetNumberLength; i++) nonce[11 - i] ^= decryptedPnBytes[packetNumberLength - 1 - i];
+                for (int i = 0; i < 8; i++)
+                    nonce[11 - i] ^= (byte)(fullPN >> (i * 8));
+                
+                // RFC 9001 §5.3: AAD must contain unprotected header (first byte + unprotected PN bytes)
                 byte[] aad = packet.Take(payloadOffset).ToArray();
                 aad[0] = unprotectedFirstByte;
+                for (int i = 0; i < packetNumberLength; i++)
+                    aad[pnOffset + i] = (byte)(packet[pnOffset + i] ^ mask[i + 1]);
                 byte[] ciphertext = packet.Skip(payloadOffset).ToArray();
                 byte[] plaintext = new byte[ciphertext.Length - 16];
                 byte[] tag = ciphertext.Skip(ciphertext.Length - 16).ToArray();
                 using var aes = new AesGcm(key.Key, 16);
                 aes.Decrypt(nonce, ciphertext.Take(ciphertext.Length - 16).ToArray(), tag, plaintext, aad);
+                
+                // Success: update largest seen packet number for future reconstruction
+                if (fullPN > largestAcked)
+                    lock (_lock) { _largestPktNum[keyId] = fullPN; }
+                
                 return plaintext;
             }
             catch { return null; }
+        }
+        
+        // RFC 9000 §A.3: decode_packet_number
+        private static long ReconstructPacketNumber(long truncated, int pnLen, long largestAcked)
+        {
+            long pnWin    = 1L << (pnLen * 8);
+            long pnHalf   = pnWin / 2;
+            long pnMask   = pnWin - 1;
+            long candidate = (largestAcked & ~pnMask) | truncated;
+            if (candidate <= largestAcked - pnHalf && candidate + pnWin < (1L << 62))
+                return candidate + pnWin;
+            if (candidate >  largestAcked + pnHalf && candidate >= pnWin)
+                return candidate - pnWin;
+            return candidate;
         }
         
         private static byte[] ComputeHPMask(byte[] hpKey, byte[] sample)

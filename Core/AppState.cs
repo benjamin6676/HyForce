@@ -5,6 +5,8 @@ using HyForce.Protocol;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Security.Cryptography;
+using static HyForce.PacketDecryptor;
 
 namespace HyForce.Core;
 
@@ -45,6 +47,14 @@ public class AppState : IDisposable
     public string ExportDirectory { get; set; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "HyForce", "Exports");
+    // Working keys are sent to this file located in  ( %APPDATA%\HyForce )
+    public string WorkingHytaleKeysPath => Path.Combine(
+    Path.GetDirectoryName(PermanentKeyLogPath)!,
+    "HytaleKeys.log");
+
+    // SessionLogPath: auto-created per-session, dual-write with in-game log
+    public string SessionLogPath { get; private set; } = string.Empty;
+    private readonly object _sessionLogLock = new();
 
     public event PacketReceivedHandler? OnPacketReceived;
     public event Action? OnSecurityEvent;
@@ -53,9 +63,9 @@ public class AppState : IDisposable
 
     private System.Timers.Timer? _autoDecryptTimer;
     private FileSystemWatcher? _sslKeyWatcher;
-    private DateTime _lastKeyLoadTime = DateTime.MinValue;
-    private DateTime _sessionStartTime = DateTime.MinValue;  // used for system key log import window
-    private long _sysKeyLogPosition = 0;                  // file position for incremental reads
+    private DateTime _lastKeyLoadTime     = DateTime.MinValue;
+    private DateTime _sessionStartTime    = DateTime.MinValue;  // used for system key log import window
+    private long     _sysKeyLogPosition   = 0;                  // file position for incremental reads
     private readonly object _keyLoadLock = new();
     private readonly Queue<string> _pendingKeyFiles = new();
     private readonly System.Timers.Timer _retryTimer;
@@ -65,10 +75,10 @@ public class AppState : IDisposable
     private string? _activeKeyLogFile = null;
 
     // ── Permanent key log fields ──────────────────────────────────────────
-    public string PermanentKeyLogPath { get; private set; } = "";
-    private long _permFileReadPos = 0;
-    private bool _permanentLogReady = false;
-    public bool NeedsFirstTimeSetup => !_permanentLogReady;
+    public  string PermanentKeyLogPath { get; private set; } = "";
+    private long   _permFileReadPos    = 0;
+    private bool   _permanentLogReady  = false;
+    public  bool   NeedsFirstTimeSetup => !_permanentLogReady;
 
     public AppState()
     {
@@ -87,8 +97,9 @@ public class AppState : IDisposable
         TcpProxy.OnPacket += _tcpPacketHandlerDelegate;
 
         Directory.CreateDirectory(ExportDirectory);
-
-
+        // Create session log file immediately
+        SessionLogPath = Path.Combine(ExportDirectory,
+            $"hyforce_session_{DateTime.Now:yyyyMMdd_HHmmss}.log");
 
         SetupAutoDecryption();
 
@@ -205,8 +216,6 @@ public class AppState : IDisposable
         var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             Path.Combine(home, "sslkeys.log"),
-            Path.Combine(home, "AppData", "Roaming", "HyForce", "Exports", "sslkeys.log"),
-            Path.Combine(home, "source", "repos", "HyForce", "Exported logs", "sslkeys.log"),
             Path.Combine(ExportDirectory, "sslkeys.log"),
         };
 
@@ -224,7 +233,7 @@ public class AppState : IDisposable
 
             try
             {
-                string? dir = Path.GetDirectoryName(filePath);
+                string? dir  = Path.GetDirectoryName(filePath);
                 string? file = Path.GetFileName(filePath);
                 if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(file)) continue;
                 if (!Directory.Exists(dir)) continue;
@@ -234,14 +243,14 @@ public class AppState : IDisposable
 
                 var watcher = new FileSystemWatcher(dir)
                 {
-                    Filter = file,
-                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size,
+                    Filter              = file,
+                    NotifyFilter        = NotifyFilters.LastWrite | NotifyFilters.Size,
                     EnableRaisingEvents = true
                 };
 
                 // Capture for closure
                 string capturedPath = filePath;
-                long capturedPos = pos;
+                long   capturedPos  = pos;
 
                 watcher.Changed += (_, _e) =>
                 {
@@ -307,8 +316,6 @@ public class AppState : IDisposable
         // 2. Common hardcoded fallback locations
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         candidates.Add(Path.Combine(home, "sslkeys.log"));
-        candidates.Add(Path.Combine(home, "AppData", "Roaming", "HyForce", "Exports", "sslkeys.log"));
-        candidates.Add(Path.Combine(home, "source", "repos", "HyForce", "Exported logs", "sslkeys.log"));
         candidates.Add(Path.Combine(ExportDirectory, "sslkeys.log"));
         candidates.Add(PermanentKeyLogPath);
 
@@ -362,19 +369,67 @@ public class AppState : IDisposable
         catch { return 0; }
     }
 
+    // Call this when you successfully decrypt a packet
+    public void PromoteKeyToWorking(EncryptionKey key)
+    {
+        try
+        {
+            // Check if already in working file
+            if (File.Exists(WorkingHytaleKeysPath))
+            {
+                var existing = File.ReadAllText(WorkingHytaleKeysPath);
+                string keyLine = FormatKeyLine(key);
+                if (existing.Contains(keyLine.Split(' ')[1])) // Check client random
+                    return; // Already there
+            }
+
+            // Append to working keys file
+            File.AppendAllText(WorkingHytaleKeysPath,
+                $"# Promoted at {DateTime.Now:yyyy-MM-dd HH:mm:ss}\r\n" +
+                FormatKeyLine(key) + "\r\n");
+
+            AddInGameLog($"[KEYS] Promoted {key.Type} key to HytaleKeys.log");
+        }
+        catch (Exception ex)
+        {
+            AddInGameLog($"[KEYS] Promote failed: {ex.Message}");
+        }
+    }
+
+    private string FormatKeyLine(EncryptionKey key)
+    {
+        string label = key.Type switch
+        {
+            EncryptionType.QUIC_Client1RTT => "CLIENT_TRAFFIC_SECRET_0",
+            EncryptionType.QUIC_Server1RTT => "SERVER_TRAFFIC_SECRET_0",
+            EncryptionType.QUIC_ClientHandshake => "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            EncryptionType.QUIC_ServerHandshake => "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            _ => "UNKNOWN"
+        };
+
+        // Generate fake client_random from key hash (or store original)
+        string clientRandom = Convert.ToHexString(
+            SHA256.HashData(key.Secret).Take(32).ToArray()).ToLower();
+
+        string secret = Convert.ToHexString(key.Secret).ToLower();
+
+        return $"{label} {clientRandom} {secret}";
+    }
+
+
     private void StartPermanentKeyWatcher()
     {
         try
         {
             _sslKeyWatcher?.Dispose();
 
-            string dir = Path.GetDirectoryName(PermanentKeyLogPath)!;
+            string dir  = Path.GetDirectoryName(PermanentKeyLogPath)!;
             string file = Path.GetFileName(PermanentKeyLogPath)!;
 
             _sslKeyWatcher = new FileSystemWatcher(dir)
             {
-                Filter = file,
-                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size,
+                Filter              = file,
+                NotifyFilter        = NotifyFilters.LastWrite | NotifyFilters.Size,
                 EnableRaisingEvents = true
             };
 
@@ -627,13 +682,30 @@ public class AppState : IDisposable
         }
     }
 
-    public void AddInGameLog(string message)
+    public IEnumerable<string> GetRecentLog(int count = 100)
     {
         lock (InGameLog)
+            return InGameLog.TakeLast(count).ToList();
+    }
+
+    public void AddInGameLog(string message)
+    {
+        var stamped = $"[{DateTime.Now:HH:mm:ss}] {message}";
+        // ── Write to in-game log buffer ──
+        lock (InGameLog)
         {
-            InGameLog.Add($"[{DateTime.Now:HH:mm:ss}] {message}");
+            InGameLog.Add(stamped);
             while (InGameLog.Count > MaxInGameLogLines)
                 InGameLog.RemoveAt(0);
+        }
+        // ── Dual-write to session log file (always-on, never lose logs) ──
+        if (!string.IsNullOrEmpty(SessionLogPath))
+        {
+            lock (_sessionLogLock)
+            {
+                try { File.AppendAllText(SessionLogPath, stamped + "\n"); }
+                catch { /* never crash from log write failure */ }
+            }
         }
     }
 
@@ -644,6 +716,11 @@ public class AppState : IDisposable
 
         _sessionStartTime = DateTime.Now;
         AddInGameLog("[SESSION] === Starting Capture Session ===");
+        AddInGameLog($"[SESSION] Live log: {SessionLogPath}");
+
+        // Tag all recently-loaded keys as current session, prioritize in decryption
+        PacketDecryptor.MarkSessionStart();
+        AddInGameLog($"[SESSION] Current-session keys marked for priority decryption");
 
         // ── KEY PRESERVATION: Do NOT clear keys or overwrite SSLKEYLOGFILE ──
         // Keys loaded from the permanent log are still valid. Hytale writes to
@@ -659,11 +736,15 @@ public class AppState : IDisposable
             await ImportAllKnownKeyFiles();
         });
 
-        // Start proxies
-        int tcpListenPort = ListenPort + 1;
-        TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, TargetPort);
-        Thread.Sleep(50);
+        // Start proxies — Hytale uses QUIC/UDP ONLY (confirmed from protocol docs)
+        // TCP proxy is disabled: adds overhead and can interfere with QUIC connections
+        // int tcpListenPort = ListenPort + 1;
+        // TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, TargetPort);
+        // Thread.Sleep(50);
         UdpProxy.Start("0.0.0.0", ListenPort, TargetHost, TargetPort);
+        // IP isolation: only accept packets from our target server
+        UdpProxy.FilterToServerIp = TargetHost;
+        AddInGameLog($"[SESSION] UDP-only mode | IP filter: {TargetHost}");
 
         StartTime = DateTime.Now;
         _autoDecryptTimer?.Start();
@@ -953,11 +1034,6 @@ public class AppState : IDisposable
                 return null;
             }
 
-            // DEBUG: Log what we found
-            Console.WriteLine($"[KEY-PARSE] Label: {label}");
-            Console.WriteLine($"[KEY-PARSE] ClientRandom: {BitConverter.ToString(clientRandom.Take(8).ToArray())}... ({clientRandom.Length} bytes)");
-            Console.WriteLine($"[KEY-PARSE] Secret: {BitConverter.ToString(secret.Take(8).ToArray())}... ({secret.Length} bytes)");
-
             // Validate lengths
             if (clientRandom.Length != 32)
             {
@@ -998,11 +1074,6 @@ public class AppState : IDisposable
                 Log.Warn("Key derivation failed - empty key produced", "Keys");
                 return null;
             }
-
-            // DEBUG: Log derived keys
-            Console.WriteLine($"[KEY-PARSE] Derived Key: {BitConverter.ToString(key.Key.Take(8).ToArray())}... ({key.Key.Length} bytes)");
-            Console.WriteLine($"[KEY-PARSE] Derived IV: {BitConverter.ToString(key.IV)}");
-            Console.WriteLine($"[KEY-PARSE] Derived HP: {BitConverter.ToString(key.HeaderProtectionKey?.Take(8).ToArray() ?? new byte[0])}...");
 
             Log.Success($"Parsed {label} ({secret.Length * 8} bits) -> {keyType}", "Keys");
             return key;
@@ -1165,6 +1236,32 @@ public class AppState : IDisposable
         return errorCode == 32 || errorCode == 33;
     }
 
+    public void RefreshAllKeys()
+    {
+        AddInGameLog("[KEYS] Refreshing keys...");
+
+        // Get current session file
+        string? currentLog = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Process);
+
+        if (!string.IsNullOrEmpty(currentLog) && File.Exists(currentLog))
+        {
+            ScanSessionKeyFile(currentLog); // Use new method
+        }
+        else
+        {
+            // Fallback: look for any session file
+            var sessionFiles = Directory.GetFiles(ExportDirectory, "sslkeys_session_*.log")
+                .OrderByDescending(f => new FileInfo(f).LastWriteTime)
+                .FirstOrDefault();
+
+            if (sessionFiles != null)
+            {
+                ScanSessionKeyFile(sessionFiles);
+            }
+        }
+
+        OnKeysUpdated?.Invoke();
+    }
 
     // -------------------------------------------------------------------------
     // Import keys from the SYSTEM-WIDE SSLKEYLOGFILE incrementally:
@@ -1194,8 +1291,8 @@ public class AppState : IDisposable
 
         try
         {
-            using var fs = new FileStream(sysFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            long fileLen = fs.Length;
+            using var fs     = new FileStream(sysFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            long fileLen     = fs.Length;
 
             // If session just started, read from the current end (only future entries)
             // If _sysKeyLogPosition == 0 this is first call - start from beginning
@@ -1259,8 +1356,6 @@ public class AppState : IDisposable
 
 
 
-
-
     public void Stop()
     {
         UdpProxy.Stop();
@@ -1300,7 +1395,7 @@ public class AppState : IDisposable
             });
         }
 
-        if (packet.Opcode > 0x1000 && packet.Direction == PacketDirection.ClientToServer)
+        if (packet.Opcode > 0x1000 && packet.Direction == Networking.PacketDirection.ClientToServer)
         {
             LogSecurityEvent("Anomaly", "Suspicious C2S opcode", new Dictionary<string, object>
             {
@@ -1341,8 +1436,6 @@ public class AppState : IDisposable
         Log.Info("[HyForce] All data cleared", "System");
         AddInGameLog("All data cleared");
     }
-
-
 
     public string GenerateDiagnostics()
     {
@@ -1428,7 +1521,7 @@ public class AppState : IDisposable
         var topOpcodes = PacketLog.GetOpcodeCounts().OrderByDescending(x => x.Value).Take(20);
         foreach (var kv in topOpcodes)
         {
-            var name = Protocol.OpcodeRegistry.Label(kv.Key, PacketDirection.ServerToClient);
+            var name = Protocol.OpcodeRegistry.Label(kv.Key, Networking.PacketDirection.ServerToClient);
             var pct = TotalPackets > 0 ? (kv.Value / (double)TotalPackets * 100) : 0;
             sb.AppendLine($"  0x{kv.Key:X4} ({name,-20}): {kv.Value,6} packets ({pct:F1}%)");
         }
@@ -1663,99 +1756,6 @@ public class AppState : IDisposable
 
         GC.SuppressFinalize(this);
     }
-
-    /// <summary>
-    /// Aggressively scan ALL possible SSL key log locations
-    /// </summary>
-    public void ScanAllPossibleKeyLocations()
-    {
-        AddInGameLog("[KEY-SCAN] Searching for SSL keys in all possible locations...");
-        Console.WriteLine("[KEY-SCAN] ========================================");
-
-        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        // 1. All environment variable scopes
-        foreach (var scope in new[] { EnvironmentVariableTarget.Machine, EnvironmentVariableTarget.User, EnvironmentVariableTarget.Process })
-        {
-            string? v = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", scope);
-            if (!string.IsNullOrEmpty(v))
-            {
-                candidates.Add(v);
-                Console.WriteLine($"[KEY-SCAN] From env var [{scope}]: {v}");
-            }
-        }
-
-        // 2. Common hardcoded fallback locations
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string[] commonPaths = new[]
-        {
-        Path.Combine(home, "sslkeys.log"),
-        Path.Combine(home, ".ssl", "sslkeys.log"),
-        Path.Combine(home, "AppData", "Roaming", "HyForce", "Exports", "sslkeys.log"),
-        Path.Combine(home, "source", "repos", "HyForce", "Exported logs", "sslkeys.log"),
-        Path.Combine(ExportDirectory, "sslkeys.log"),
-        PermanentKeyLogPath,
-        Path.Combine(home, "AppData", "Local", "Hytale", "sslkeys.log"),
-        Path.Combine(home, "AppData", "Roaming", "Hytale", "sslkeys.log"),
-        @"C:\ProgramData\sslkeys.log",
-        Path.Combine(Path.GetTempPath(), "sslkeys.log"),
-    };
-
-        foreach (var path in commonPaths)
-        {
-            if (!string.IsNullOrEmpty(path))
-            {
-                candidates.Add(path);
-            }
-        }
-
-        Console.WriteLine($"[KEY-SCAN] Total candidates to check: {candidates.Count}");
-
-        int totalKeys = 0;
-        foreach (var path in candidates.Where(File.Exists))
-        {
-            try
-            {
-                var fi = new FileInfo(path);
-                Console.WriteLine($"[KEY-SCAN] Checking: {path} ({fi.Length} bytes, modified {fi.LastWriteTime:HH:mm:ss})");
-
-                var lines = File.ReadAllLines(path);
-                int keyLines = lines.Count(l => !string.IsNullOrWhiteSpace(l) && !l.Trim().StartsWith("#") && l.Contains("SECRET"));
-                Console.WriteLine($"[KEY-SCAN]   -> {keyLines} potential key lines");
-
-                if (keyLines > 0)
-                {
-                    _permFileReadPos = 0;
-                    int added = ImportKeyFileOnce(path);
-                    if (added > 0)
-                    {
-                        totalKeys += added;
-                        AddInGameLog($"[KEY-SCAN] Found {added} keys in: {Path.GetFileName(path)}");
-                        Console.WriteLine($"[KEY-SCAN]   -> IMPORTED {added} keys!");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[KEY-SCAN] Error reading {path}: {ex.Message}");
-            }
-        }
-
-        Console.WriteLine($"[KEY-SCAN] ========================================");
-        Console.WriteLine($"[KEY-SCAN] Total keys imported: {totalKeys}");
-
-        if (totalKeys == 0)
-        {
-            AddInGameLog("[KEY-SCAN] No keys found anywhere!");
-            AddInGameLog("[KEY-SCAN] Make sure:");
-            AddInGameLog("  1. Hytale is running");
-            AddInGameLog("  2. You connected to a server (triggers TLS handshake)");
-            AddInGameLog("  3. Hytale was started AFTER HyForce (env var must be set first)");
-        }
-
-        OnKeysUpdated?.Invoke();
-    }
-
 }
 
 // In AppState.cs, update the KeyStatus class:

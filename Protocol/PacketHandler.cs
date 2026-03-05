@@ -3,59 +3,70 @@ using HyForce.Data;
 using HyForce.Networking;
 using System;
 using System.Collections.Generic;
+using System.IO;
 
 namespace HyForce.Protocol
 {
     /// <summary>
-    /// SIMPLIFIED PacketHandler - No blocking, no lag
+    /// PacketHandler v16 — fully non-blocking.
+    /// Auto-decrypt is processed on a dedicated background worker (never the UI thread).
     /// </summary>
     public class PacketHandler
     {
         private readonly AppState _state;
-        private readonly HashSet<ushort> _interestingOpcodes = new();
+        private volatile int _decryptSuccesses;
+        private volatile int _decryptFailures;
+
+        public int DecryptSuccesses => _decryptSuccesses;
+        public int DecryptFailures  => _decryptFailures;
 
         public PacketHandler(AppState state)
         {
             _state = state;
+
+            // Wire up the background decrypt result event
+            PacketDecryptor.OnDecrypted -= HandleDecrypted; // safety: remove first
+            PacketDecryptor.OnDecrypted += HandleDecrypted;
         }
 
         /// <summary>
-        /// Process packet - FAST, no blocking
+        /// Called from the OnDecrypted background event — NOT on UI thread.
+        /// </summary>
+        private void HandleDecrypted(byte[] encrypted, byte[] decrypted)
+        {
+            System.Threading.Interlocked.Increment(ref _decryptSuccesses);
+            _state.AddInGameLog($"[DECRYPT] ✓ {decrypted.Length}B decrypted");
+
+            // Future: parse Hytale frames from decrypted bytes here
+        }
+
+        /// <summary>
+        /// Process packet — ALWAYS returns immediately, zero blocking.
         /// </summary>
         public void ProcessPacket(CapturedPacket packet)
         {
             try
             {
-                // Quick log - no complex operations
-                if (PacketDecryptor.DebugMode)
-                {
-                    Console.WriteLine($"[PACKET] {packet.SequenceId} - {packet.RawBytes.Length}b - 0x{packet.Opcode:X4}");
-                }
+                if (packet?.RawBytes == null || packet.RawBytes.Length < 20) return;
 
-                // Only attempt decryption if auto-decrypt is enabled AND we have keys
+                // Short header 1-RTT = post-handshake gameplay packets
+                bool isShortHeader = (packet.RawBytes[0] & 0x80) == 0;
+                if (!isShortHeader) return; // skip long-header (handshake etc.)
+
                 if (PacketDecryptor.AutoDecryptEnabled && PacketDecryptor.DiscoveredKeys.Count > 0)
                 {
-                    // Quick check if encrypted
-                    if (packet.RawBytes.Length > 20 && (packet.RawBytes[0] & 0x80) == 0)
+                    // Enqueue for background worker — never blocks here
+                    var result = PacketDecryptor.TryDecrypt(packet.RawBytes);
+                    if (!result.Success &&
+                        result.Error != null &&
+                        !result.Error.StartsWith("Queued") &&
+                        !result.Error.StartsWith("Auto-decrypt disabled"))
                     {
-                        // Try decrypt - this is async and has timeout
-                        var result = PacketDecryptor.TryDecrypt(packet.RawBytes);
-
-                        if (result?.Success == true && result.DecryptedData != null)
-                        {
-                            _state.AddInGameLog($"[DECRYPT] {packet.Opcode:X4} OK ({result.DecryptedData.Length}b)");
-                        }
-                        else if (PacketDecryptor.DebugMode)
-                        {
-                            Console.WriteLine($"[DECRYPT] {packet.Opcode:X4} FAIL");
-                        }
+                        System.Threading.Interlocked.Increment(ref _decryptFailures);
                     }
                 }
             }
-            catch
-            {
-                // Silently fail - don't crash the game
-            }
+            catch { }
         }
     }
 }

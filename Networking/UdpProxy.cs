@@ -261,10 +261,14 @@ public class UdpProxy : IDisposable
         _log.Info("[UDP] Client->Server loop ended", "UDP");
     }
 
+    // Public: set to only process packets from this IP (empty = all)
+    public string FilterToServerIp { get; set; } = string.Empty;
+
     private async Task ServerToClientLoop(CancellationToken ct)
     {
         _log.Info("[UDP] Server->Client loop started", "UDP");
         var buffer = new byte[65536];
+        var expectedServerIp = _serverEp.Address.ToString();
 
         while (!ct.IsCancellationRequested && IsRunning)  // FIX: Check IsRunning
         {
@@ -287,6 +291,16 @@ public class UdpProxy : IDisposable
                 int received = socketResult.ReceivedBytes;
 
                 if (received == 0) continue;
+
+                // IP ISOLATION: Only process packets from our target server
+                // This prevents noise from other UDP sources flooding the decrypt queue
+                var actualSenderEp = socketResult.RemoteEndPoint as IPEndPoint;
+                if (actualSenderEp != null && !string.IsNullOrEmpty(expectedServerIp) &&
+                    actualSenderEp.Address.ToString() != expectedServerIp)
+                {
+                    // Not from our server — silently drop, don't forward or log
+                    continue;
+                }
 
                 // Copy data immediately
                 var serverData = new byte[received];
