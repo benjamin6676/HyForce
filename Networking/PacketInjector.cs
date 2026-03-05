@@ -157,7 +157,7 @@ public class PacketInjector
             byte[] wire = BuildWireFrame(payload, overridePacketId);
 
             // Re-encrypt
-            var reEncResult = PacketDecryptor.TryEncrypt(wire, dir);
+            var reEncResult = PacketDecryptor.TryEncrypt(wire, (PacketDecryptor.PacketDirection)dir);
             if (!reEncResult.Success || reEncResult.EncryptedData == null)
                 return InjectionResult.Fail($"Re-encryption failed: {reEncResult.ErrorMessage}");
 
