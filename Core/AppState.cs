@@ -544,7 +544,7 @@ public class AppState : IDisposable
     {
         if (packet?.RawBytes == null || packet.RawBytes.Length < 20) return;
         PacketLog.Add(packet);
-        _packetHandler?.ProcessPacket(packet);
+        _packetHandlerDelegate?.Invoke(packet);  
     }
 
     // Public: UI "Clear Log" button -- wipes file and memory keys

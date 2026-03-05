@@ -143,11 +143,7 @@ namespace HyForce.Networking
                     // Enqueue for decryption (skip HP filter - DLL confirmed these are QUIC)
                     if (PacketDecryptor.AutoDecryptEnabled)
                     {
-                        var result = PacketDecryptor.TryDecryptDirect(data, direction);
-                        if (result != null)
-                        {
-                            _state.AddInGameLog($"[PIPE] ✓ Decrypted {result.Length}B ({direction})");
-                        }
+                        var result = PacketDecryptor.TryDecryptDirect(data, (PacketDecryptor.PacketDirection)direction);
                     }
 
                     OnPacketReceived?.Invoke(data, direction);
