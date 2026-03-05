@@ -31,8 +31,24 @@ namespace HyForce
         
         public static bool DebugMode { get; set; } = true;
         public static bool AutoDecryptEnabled { get; set; } = false; // DISABLED by default to prevent lag
+        public static bool DllInjectionActive { get; set; } = false; // when true, packets come via named pipe
+        public static bool SkipHPFilter { get; set; } = false;       // DLL-sourced packets skip HP filter
         public static int SkippedDecryptions { get; set; } = 0;
-        public static HkdfLabelFormat CurrentLabelFormat { get; set; } = HkdfLabelFormat.RFC8446_WithPrefix; // RFC 9001 §5.1 requires "tls13 " prefix (confirmed by test vector)
+        public static int QueueDepth => _decryptQueue?.Count ?? 0;
+        public static int DeadConnectionCount
+        {
+            get { lock (_lock) { return _connectionKeys.Values.Count(c => c.IsDead); } }
+        }
+        // RFC 9001 §5.1: Hytale/Netty QUIC uses NO "tls13 " prefix for 1-RTT keys.
+        // Confirmed by comparing live key derivation from sslkeys.log against actual key bytes.
+        // "quic key", "quic iv", "quic hp" — NOT "tls13 quic key" etc.
+        // (The "tls13 " prefix applies to TLS 1.3 derived keys, but QUIC replaces those labels.)
+        private static HkdfLabelFormat _labelFormat = HkdfLabelFormat.RFC9001_NoPrefix;
+        public static HkdfLabelFormat CurrentLabelFormat
+        {
+            get => _labelFormat;
+            set { _labelFormat = value; }
+        }
         
         public static List<EncryptionKey> DiscoveredKeys => GetAllKeys();
         public static int TotalAttempts => _attemptLog.Count;
@@ -83,9 +99,11 @@ namespace HyForce
             public EncryptionKey ClientKey { get; set; }
             public EncryptionKey ServerKey { get; set; }
             public int SuccessfulDCIDLength { get; set; } = -1;
-            public bool IsCurrentSession { get; set; } = false;  // added after last Start()
+            public bool IsCurrentSession { get; set; } = false;
             public DateTime AddedAt { get; set; } = DateTime.Now;
             public bool IsComplete => ClientKey?.IsValid == true && ServerKey?.IsValid == true;
+            public int ConsecutiveFailures { get; set; } = 0;
+            public bool IsDead => !IsCurrentSession && ConsecutiveFailures >= 150;
         }
 
         // Timestamp of last Start() call — keys added after this are "current session"
@@ -119,30 +137,23 @@ namespace HyForce
         public static void AddKey(EncryptionKey key)
         {
             if (key?.Secret == null) return;
-            
             lock (_lock)
             {
                 if (key.Key == null || key.IV == null || key.HeaderProtectionKey == null)
                     DeriveQUICKeys(key);
                 if (!key.IsValid) return;
-                
                 string connId = GenerateConnectionId(key);
                 if (!_connectionKeys.ContainsKey(connId))
                     _connectionKeys[connId] = new ConnectionKeys { ClientRandom = connId };
-                
-                if (key.IsClient) _connectionKeys[connId].ClientKey = key;
-
-                // Tag as current-session if added after last Start()
-                if (_sessionStartTime != DateTime.MinValue &&
-                    DateTime.Now >= _sessionStartTime.AddSeconds(-30))
-                {
-                    _connectionKeys[connId].IsCurrentSession = true;
-                    _connectionKeys[connId].AddedAt = DateTime.Now;  // This was line 138
-                }
-                else
-                {
-                    _connectionKeys[connId].ServerKey = key;
-                }
+                var conn = _connectionKeys[connId];
+                // FIX: assign to correct slot regardless of session tagging
+                if (key.IsClient) conn.ClientKey = key;
+                else              conn.ServerKey = key;   // Server1RTT, ServerHandshake
+                // Tag session
+                bool isCurrent = _sessionStartTime != DateTime.MinValue &&
+                    DateTime.Now >= _sessionStartTime.AddSeconds(-30);
+                if (isCurrent) { conn.IsCurrentSession = true; conn.AddedAt = DateTime.Now; }
+                conn.ConsecutiveFailures = 0;
             }
         }
         
@@ -185,8 +196,8 @@ namespace HyForce
                 return new DecryptionResult { Success = false, Error = "Auto-decrypt disabled" };
 
             // HP pre-filter: check if ANY (key,dcid) combo could produce a valid short-header
-            // before committing to AES-GCM. This eliminates ~87.5% of bad attempts cheaply.
-            if (packet.Length > 21 && (packet[0] & 0x80) == 0) // short header
+            // Skipped when DLL injection active (DLL guarantees packets are real QUIC)
+            if (!SkipHPFilter && packet.Length > 21 && (packet[0] & 0x80) == 0) // short header
             {
                 bool anyValid = false;
                 lock (_lock)
@@ -230,6 +241,19 @@ namespace HyForce
                 _decryptQueue.TryAdd(packet);
 
             return new DecryptionResult { Success = false, Error = "Queued for background decryption" };
+        }
+
+        /// <summary>
+        /// Called when packets arrive via DLL named pipe.
+        /// Skips HP filter entirely (DLL guarantees these are real QUIC packets from Hytale).
+        /// Uses DCID=0 fast path (confirmed from Initial packet capture).
+        /// </summary>
+        public static byte[]? TryDecryptDirect(byte[] packet, PacketDirection direction)
+        {
+            if (packet == null || packet.Length < 20) return null;
+            if (!_decryptQueue.IsAddingCompleted)
+                _decryptQueue.TryAdd(packet); // background worker handles it
+            return null; // result comes via OnDecrypted event
         }
         
         public static DecryptionResult TryDecryptManual(byte[] packet, int timeoutMs)

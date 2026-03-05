@@ -68,6 +68,7 @@ public class HyForceApp
         _tabs.Add(new MemoryAnalysisTab(_state));
         _tabs.Add(new ActionCorrelatorTab(_state));
         _tabs.Add(new DecryptionTab(_state));
+        _tabs.Add(new InjectionTab(_state));   // DLL injection capture (no proxy needed)
         _tabs.Add(new SettingsTab(_state));
         _tabs.Add(new PacketAnalyticsTab(_state));
         _tabs.Add(inspector);

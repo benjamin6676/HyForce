@@ -22,6 +22,7 @@ public class AppState : IDisposable
     public TcpProxy TcpProxy { get; }
 
     public PacketLog PacketLog { get; }
+    public Networking.DllPipeServer DllPipeServer { get; }
     public TestLog Log { get; }
     public PlayerItemDatabase Database { get; }
 
@@ -82,6 +83,7 @@ public class AppState : IDisposable
 
     public AppState()
     {
+        DllPipeServer = new Networking.DllPipeServer(this);
         Log = new TestLog();
         UdpProxy = new UdpProxy(Log);
         // FIX 2: Initialize TcpProxy
@@ -532,6 +534,17 @@ public class AppState : IDisposable
         _permFileReadPos = 0;
         PacketDecryptor.ClearKeys();
         ImportPermanentKeyLogFull("manual re-import");
+    }
+
+    /// <summary>
+    /// Called by PipeCaptureServer when HyForceHook.dll forwards a captured packet.
+    /// Bypasses the UDP proxy entirely — packets come directly from inside the JVM.
+    /// </summary>
+    public void OnHookPacket(CapturedPacket packet)
+    {
+        if (packet?.RawBytes == null || packet.RawBytes.Length < 20) return;
+        PacketLog.Add(packet);
+        _packetHandler?.ProcessPacket(packet);
     }
 
     // Public: UI "Clear Log" button -- wipes file and memory keys

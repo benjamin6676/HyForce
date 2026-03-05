@@ -220,7 +220,7 @@ namespace HyForce
             // RFC 9001 Appendix A.1: client_initial_secret (32 bytes = 64 hex chars)
             var secret = Convert.FromHexString(
                 "c00cf151ca5be075ed0ebfb5c80323c4" +
-                "2d0b7bef575472db26359bdd9a4e5070");
+                "2d6b7db67881289af4008f1f6c357aea");// CORRECT per full RFC 9001 A.1 derivation);
 
             var key = new PacketDecryptor.EncryptionKey
             {
