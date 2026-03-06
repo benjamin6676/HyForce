@@ -69,6 +69,10 @@ namespace HyForce.Tabs
         static extern bool SetEnvironmentVariable(string lpName, string lpValue);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool IsWow64Process(IntPtr h, out bool wow64);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint dwFreeType);
+
+        const uint MEM_RELEASE = 0x8000;
 
         // NEW: For DLL ejection
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -113,26 +117,43 @@ namespace HyForce.Tabs
             {
                 if (!_injected || _injectedPid < 0) return;
 
-                try
+                // Fire and forget - don't block timer thread
+                Task.Run(async () =>
                 {
-                    using var proc = Process.GetProcessById(_injectedPid);
-                    if (proc.HasExited)
+                    try
                     {
-                        _state.AddInGameLog($"[EJECT] Target process {_injectedPid} died, cleaning up");
-                        ResetInjectionState();
-                    }
-                }
-                catch (ArgumentException)
-                {
-                    ResetInjectionState();
-                }
+                        bool shouldReset = false;
+                        try
+                        {
+                            using var proc = Process.GetProcessById(_injectedPid);
+                            shouldReset = proc.HasExited;
+                        }
+                        catch (ArgumentException)
+                        {
+                            shouldReset = true;
+                        }
+                        catch
+                        {
+                            return; // Don't reset on other errors
+                        }
 
-                if (_autoEjectOnDisconnect && _injected && !_pipe.DllConnected &&
-                    (DateTime.Now - _pipe.LastPacket).TotalSeconds > 10)
-                {
-                    _state.AddInGameLog("[EJECT] DLL connection lost, triggering auto-eject");
-                    ForceEjectDll();
-                }
+                        if (shouldReset)
+                        {
+                            _state.AddInGameLog($"[EJECT] Target process {_injectedPid} died, cleaning up");
+                            ResetInjectionState();
+                            return;
+                        }
+
+                        // Check for disconnect only if not already resetting
+                        if (_autoEjectOnDisconnect && !_pipe.DllConnected &&
+                            (DateTime.Now - _pipe.LastPacket).TotalSeconds > 10)
+                        {
+                            _state.AddInGameLog("[EJECT] DLL connection lost, triggering auto-eject");
+                            await ForceEjectDllAsync();
+                        }
+                    }
+                    catch { /* ignore errors in watchdog */ }
+                });
             };
             _ejectWatchdog.AutoReset = true;
             _ejectWatchdog.Start();
@@ -245,7 +266,6 @@ namespace HyForce.Tabs
             ImGui.Spacing();
             ImGui.Separator();
             ImGui.Spacing();
-
             // ── Step 3: Inject ───────────────────────────────────────
             ImGui.TextColored(new Vector4(0.9f, 0.8f, 0.3f, 1f), "Step 3 — Inject");
 
@@ -254,9 +274,17 @@ namespace HyForce.Tabs
                       && _dllPaths.Length > 0 && _selDll < _dllPaths.Length;
 
             if (!ready) ImGui.BeginDisabled();
+
+            // CRITICAL FIX: Use _ = to explicitly discard the Task, fire-and-forget
+            if (ImGui.Button("  Inject DLL  ", new Vector2(140, 32)))
+            {
+                _ = DoInjectAsync(); // Fire and forget - NEVER await or block
+            }
+
+            if (!ready) ImGui.EndDisabled();
             // NEW - async, doesn't block:
             if (ImGui.Button("  Inject DLL  ", new Vector2(140, 32)))
-                DoInject();
+                DoInjectAsync();
             if (!ready) ImGui.EndDisabled();
 
             if (_injected)
@@ -359,7 +387,7 @@ namespace HyForce.Tabs
                 ImGui.SameLine();
                 if (ImGui.Button("💀 FORCE EJECT", new Vector2(120, 28)))
                 {
-                    Task.Run(() => ForceEjectDll());
+                    Task.Run(() => ForceEjectDllAsync());
                 }
 
                 if (ImGui.IsItemHovered())
@@ -395,7 +423,7 @@ namespace HyForce.Tabs
             }
         }
 
-        private async void DoInject()
+        private async Task DoInjectAsync()
         {
             if (_selProc < 0 || _selProc >= _procs.Count) return;
             if (_selDll < 0 || _selDll >= _dllPaths.Length) return;
@@ -414,64 +442,95 @@ namespace HyForce.Tabs
 
             try
             {
-                IntPtr hProc = OpenProcess(PROCESS_ALL, false, pid);
-                if (hProc == IntPtr.Zero)
-                    throw new Exception($"OpenProcess failed (err {Marshal.GetLastWin32Error()}). Try running HyForce as Administrator.");
-
-                byte[] pathBytes = System.Text.Encoding.Unicode.GetBytes(dllPath + "\0");
-                IntPtr mem = VirtualAllocEx(hProc, IntPtr.Zero,
-                    (uint)pathBytes.Length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                if (mem == IntPtr.Zero)
-                    throw new Exception($"VirtualAllocEx failed (err {Marshal.GetLastWin32Error()})");
-
-                if (!WriteProcessMemory(hProc, mem, pathBytes, (uint)pathBytes.Length, out _))
-                    throw new Exception($"WriteProcessMemory failed (err {Marshal.GetLastWin32Error()})");
-
-                IntPtr k32 = GetModuleHandleW("kernel32.dll");
-                IntPtr loadLib = GetProcAddress(k32, "LoadLibraryW");
-                if (loadLib == IntPtr.Zero)
-                    throw new Exception("LoadLibraryW not found in kernel32");
-
-                uint tid;
-                IntPtr hThread = CreateRemoteThread(hProc, IntPtr.Zero, 0, loadLib, mem, 0, out tid);
-                if (hThread == IntPtr.Zero)
-                    throw new Exception($"CreateRemoteThread failed (err {Marshal.GetLastWin32Error()})");
-
-                // CRITICAL FIX: Don't block UI thread - wait asynchronously
-                SetStatus("Waiting for DLL to initialize...", 0.9f, 0.7f, 0.2f);
-
-                uint waitRes = await Task.Run(() => WaitForSingleObject(hThread, 5000));
-
-                CloseHandle(hThread);
-                CloseHandle(hProc);
-
-                if (waitRes == 0x102) // WAIT_TIMEOUT
+                // Use explicit class/tuple to avoid anonymous type inference issues
+                var result = await Task.Run(() =>
                 {
-                    // Timeout isn't fatal - DLL might still be connecting
+                    IntPtr hProc = OpenProcess(PROCESS_ALL, false, pid);
+                    if (hProc == IntPtr.Zero)
+                        return new InjectResult { Success = false, Warning = false, Error = $"OpenProcess failed (err {Marshal.GetLastWin32Error()}). Try running HyForce as Administrator." };
+
+                    try
+                    {
+                        byte[] pathBytes = System.Text.Encoding.Unicode.GetBytes(dllPath + "\0");
+                        IntPtr mem = VirtualAllocEx(hProc, IntPtr.Zero,
+                            (uint)pathBytes.Length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                        if (mem == IntPtr.Zero)
+                            return new InjectResult { Success = false, Warning = false, Error = $"VirtualAllocEx failed (err {Marshal.GetLastWin32Error()})" };
+
+                        if (!WriteProcessMemory(hProc, mem, pathBytes, (uint)pathBytes.Length, out _))
+                        {
+                            VirtualFreeEx(hProc, mem, 0, MEM_RELEASE);
+                            return new InjectResult { Success = false, Warning = false, Error = $"WriteProcessMemory failed (err {Marshal.GetLastWin32Error()})" };
+                        }
+
+                        IntPtr k32 = GetModuleHandleW("kernel32.dll");
+                        IntPtr loadLib = GetProcAddress(k32, "LoadLibraryW");
+                        if (loadLib == IntPtr.Zero)
+                            return new InjectResult { Success = false, Warning = false, Error = "LoadLibraryW not found in kernel32" };
+
+                        uint tid;
+                        IntPtr hThread = CreateRemoteThread(hProc, IntPtr.Zero, 0, loadLib, mem, 0, out tid);
+                        if (hThread == IntPtr.Zero)
+                            return new InjectResult { Success = false, Warning = false, Error = $"CreateRemoteThread failed (err {Marshal.GetLastWin32Error()})" };
+
+                        // Wait with timeout - this is on background thread so it's OK
+                        uint waitRes = WaitForSingleObject(hThread, 5000);
+
+                        // Cleanup thread handle
+                        CloseHandle(hThread);
+
+                        // Free the allocated memory (DLL is now loaded, don't need the string anymore)
+                        VirtualFreeEx(hProc, mem, 0, MEM_RELEASE);
+
+                        if (waitRes == 0x102) // WAIT_TIMEOUT
+                            return new InjectResult { Success = true, Warning = true, Error = "Timeout - DLL may still be initializing" };
+                        else if (waitRes == 0) // WAIT_OBJECT_0
+                            return new InjectResult { Success = true, Warning = false, Error = null };
+                        else
+                            return new InjectResult { Success = false, Warning = false, Error = $"Wait failed (result {waitRes})" };
+                    }
+                    finally
+                    {
+                        CloseHandle(hProc);
+                    }
+                });
+
+                // Update UI state on main thread
+                if (result.Success)
+                {
                     _injected = true;
                     _injectedPid = pid;
-                    SetStatus($"DLL injected (timeout - may still be connecting)", 0.9f, 0.6f, 0.2f);
-                    _state.AddInGameLog($"[INJECT] ⚠ Timeout - DLL may still initialize");
-                }
-                else if (waitRes == 0) // WAIT_OBJECT_0
-                {
-                    _injected = true;
-                    _injectedPid = pid;
-                    SetStatus($"✓ Injected into {pname} ({pid})", 0.2f, 1f, 0.4f);
-                    _state.AddInGameLog($"[INJECT] ✓ Success — {pname} ({pid})");
+                    if (result.Warning)
+                    {
+                        SetStatus($"DLL injected (timeout - may still be connecting)", 0.9f, 0.6f, 0.2f);
+                        _state.AddInGameLog($"[INJECT] ⚠ Timeout - DLL may still initialize");
+                    }
+                    else
+                    {
+                        SetStatus($"✓ Injected into {pname} ({pid})", 0.2f, 1f, 0.4f);
+                        _state.AddInGameLog($"[INJECT] ✓ Success — {pname} ({pid})");
+                    }
+                    _state.AddInGameLog("[INJECT] Watch the pipe banner - turns green when DLL connects");
                 }
                 else
                 {
-                    throw new Exception($"Wait failed (result {waitRes})");
+                    SetStatus($"✗ {result.Error}", 1f, 0.2f, 0.2f);
+                    _state.AddInGameLog($"[INJECT] FAIL: {result.Error}");
                 }
-
-                _state.AddInGameLog("[INJECT] Watch the pipe banner - turns green when DLL connects");
             }
             catch (Exception ex)
             {
                 SetStatus($"✗ {ex.Message}", 1f, 0.2f, 0.2f);
                 _state.AddInGameLog($"[INJECT] FAIL: {ex.Message}");
             }
+        }
+
+        // Helper class for result - add this inside InjectionTab class
+        private class InjectResult
+        {
+            public bool Success { get; set; }
+            public bool Warning { get; set; }
+            public string Error { get; set; }
         }
 
         private void RefreshProcs()
@@ -481,15 +540,29 @@ namespace HyForce.Tabs
 
             foreach (var p in Process.GetProcesses())
             {
+                IntPtr hProc = IntPtr.Zero; // Track handle for cleanup
                 try
                 {
                     bool is64 = true;
                     try
                     {
-                        IsWow64Process(OpenProcess(0x1000, false, p.Id), out bool wow64);
-                        if (wow64) is64 = false;
+                        // Open with minimal rights for IsWow64Process
+                        hProc = OpenProcess(0x1000, false, p.Id); // PROCESS_QUERY_LIMITED_INFORMATION
+                        if (hProc != IntPtr.Zero)
+                        {
+                            if (IsWow64Process(hProc, out bool wow64))
+                            {
+                                if (wow64) is64 = false;
+                            }
+                        }
                     }
-                    catch { }
+                    catch { /* ignore - assume 64-bit */ }
+                    finally
+                    {
+                        // ALWAYS close handle
+                        if (hProc != IntPtr.Zero)
+                            CloseHandle(hProc);
+                    }
 
                     string pname = p.ProcessName.ToLowerInvariant();
                     bool isHytaleJava = (pname.Contains("java") || pname.Contains("javaw"))
@@ -497,8 +570,12 @@ namespace HyForce.Tabs
 
                     list.Add((p.Id, p.ProcessName, is64));
                 }
-                catch { }
-                finally { p.Dispose(); }
+                catch { /* ignore processes we can't access */ }
+                finally
+                {
+                    // ALWAYS dispose Process object
+                    p.Dispose();
+                }
             }
 
             _procs = list
@@ -582,7 +659,7 @@ namespace HyForce.Tabs
                     TerminateThread(hThread, 1);
                     CloseHandle(hThread);
                     CloseHandle(hProc);
-                    ForceEjectDll();
+                    ForceEjectDllAsync();
                     return;
                 }
 
@@ -612,39 +689,19 @@ namespace HyForce.Tabs
             }
         }
 
-        private void ForceEjectDll()
+        private async Task ForceEjectDllAsync()
         {
-            if (!_injected || _injectedPid < 0)
+            await Task.Run(() =>
             {
-                SetStatus("No DLL to force eject", 1f, 0.3f, 0.3f);
-                return;
-            }
+                try
+                {
+                    _pipe.SendCommand("STOP");
+                    Thread.Sleep(200);
+                }
+                catch { }
+            });
 
-            SetStatus($"Force ejecting from PID {_injectedPid}...", 0.9f, 0.4f, 0.2f);
-            _state.AddInGameLog($"[EJECT] Force eject from PID {_injectedPid}");
-
-            bool success = false;
-
-            try
-            {
-                _pipe.SendCommand("STOP");
-                Thread.Sleep(200);
-                success = true;
-            }
-            catch (Exception ex)
-            {
-                _state.AddInGameLog($"[EJECT] Force eject error: {ex.Message}");
-            }
-
-            if (success)
-            {
-                SetStatus("✓ Force eject completed - state cleaned", 0.2f, 1f, 0.4f);
-            }
-            else
-            {
-                SetStatus("Force eject had issues, but state cleaned", 1f, 0.5f, 0.2f);
-            }
-
+            // Update UI state on main thread
             ResetInjectionState();
         }
 
@@ -679,8 +736,9 @@ namespace HyForce.Tabs
         {
             if (_forceEjectOnClose && _injected)
             {
-                _state.AddInGameLog("[EJECT] Application closing - auto-ejecting DLL");
-                EjectDll();
+                _state.AddInGameLog("[EJECT] Application closing - auto-ejecting");
+                // Fire and forget - don't block
+                _ = ForceEjectDllAsync();
             }
 
             _ejectWatchdog?.Stop();
