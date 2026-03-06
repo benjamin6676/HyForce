@@ -39,9 +39,8 @@
 #define MSG_TIMING      0x04
 #define MSG_SEQ_ANOMALY 0x05
 #define MSG_MEMSCAN     0x06
-#define MAX_PKT         65535
- /* ── DLL Ejection Support ────────────────────────────────── */
 #define MSG_EJECTED     0x08  // New message type for ejection confirmation
+#define MAX_PKT         65535
 
  /* ── Hytale server ports ─────────────────────────────────── */
 #define HYTALE_PORT_MIN 5520
@@ -122,55 +121,6 @@ static void jmp_write(void* tgt, void* hook)
     FlushInstructionCache(GetCurrentProcess(), tgt, 14);
 }
 
-static DWORD WINAPI injector_monitor_th(LPVOID _)
-{
-    (void)_;
-    if (g_injector_pid == 0) return 0;
-
-    HANDLE hInjector = OpenProcess(SYNCHRONIZE, FALSE, g_injector_pid);
-    if (!hInjector) {
-        // Injector already gone, eject ourselves
-        pipe_log("[MONITOR] Injector process not found, auto-ejecting");
-        HyForceEject();
-        FreeLibraryAndExitThread(GetModuleHandleW(L"HyForceHook.dll"), 0);
-        return 0;
-    }
-
-    // Wait for injector to exit or signal
-    while (g_active) {
-        DWORD wait = WaitForSingleObject(hInjector, 1000);
-        if (wait == WAIT_OBJECT_0) {
-            // Injector exited, eject ourselves
-            pipe_log("[MONITOR] Injector process exited, auto-ejecting");
-            CloseHandle(hInjector);
-            HyForceEject();
-            FreeLibraryAndExitThread(GetModuleHandleW(L"HyForceHook.dll"), 0);
-            return 0;
-        }
-
-        // Also check if pipe is still alive
-        if (g_out == INVALID_HANDLE_VALUE) {
-            // Try to reconnect for 5 seconds
-            Sleep(5000);
-            if (g_out == INVALID_HANDLE_VALUE && g_active) {
-                pipe_log("[MONITOR] Pipe connection lost, auto-ejecting");
-                CloseHandle(hInjector);
-                HyForceEject();
-                FreeLibraryAndExitThread(GetModuleHandleW(L"HyForceHook.dll"), 0);
-                return 0;
-            }
-        }
-    }
-
-    CloseHandle(hInjector);
-    return 0;
-}
-
-// Add to DllMain DLL_PROCESS_ATTACH:
-// After creating other threads, start monitor if injector PID provided
-// if (g_injector_pid) g_injector_monitor = CreateThread(NULL, 0, injector_monitor_th, NULL, 0, NULL);
-
-
 static void jmp_restore(void* tgt, BYTE* saved)
 {
     if (!tgt) return;
@@ -213,104 +163,16 @@ static void pipe_send(uint8_t type, const void* pay, uint32_t len)
     ReleaseMutex(g_mutex);
 }
 
-static void pipe_log(const char* fmt, ...)
-{
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    pipe_send(MSG_LOG, buf, (uint32_t)strlen(buf) + 1);
-}
-// Exported function for graceful ejection
-__declspec(dllexport) void __cdecl HyForceEject(void)
-{
-    // Signal ejection to injector
-    pipe_send(MSG_EJECTED, "EJECTING", 9);
+/* ── pipe logging (FORWARD DECLARATION ONLY) ─────────────── */
+static void pipe_log(const char* fmt, ...);
 
-    // Small delay to ensure message is sent
-    Sleep(50);
+/* ── pcap functions (FORWARD DECLARATION) ────────────────── */
+static void pcap_write(const uint8_t* data, uint32_t len);
+static void pcap_open(const char* path);
+static void pcap_close(void);
 
-    // Stop all activity
-    g_active = FALSE;
-
-    // Close handles
-    if (g_out != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_out);
-        g_out = INVALID_HANDLE_VALUE;
-    }
-    if (g_cmdin != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_cmdin);
-        g_cmdin = INVALID_HANDLE_VALUE;
-    }
-
-    pcap_close();
-
-    // Restore hooks before ejecting
-    if (orig_WSASendTo)   jmp_restore(orig_WSASendTo, sv_wsa_send);
-    if (orig_WSARecvFrom) jmp_restore(orig_WSARecvFrom, sv_wsa_recv);
-    if (orig_sendto)      jmp_restore(orig_sendto, sv_send);
-    if (orig_recvfrom)    jmp_restore(orig_recvfrom, sv_recv);
-
-    // Flush instruction cache
-    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
-}
-
-/* ── pcap write ──────────────────────────────────────────── */
-static void pcap_write(const uint8_t* data, uint32_t len)
-{
-    if (g_pcap == INVALID_HANDLE_VALUE || len == 0 || len > MAX_PKT) return;
-
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    uint64_t ft64 = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-    uint64_t us = (ft64 - 116444736000000000ULL) / 10;
-
-    uint32_t ph[4] = {
-        (uint32_t)(us / 1000000),
-        (uint32_t)(us % 1000000),
-        len,
-        len
-    };
-
-    WaitForSingleObject(g_pcap_mutex, 100);
-    DWORD w;
-    WriteFile(g_pcap, ph, 16, &w, NULL);
-    WriteFile(g_pcap, data, len, &w, NULL);
-    ReleaseMutex(g_pcap_mutex);
-}
-
-static void pcap_open(const char* path)
-{
-    WaitForSingleObject(g_pcap_mutex, 500);
-    if (g_pcap != INVALID_HANDLE_VALUE) CloseHandle(g_pcap);
-
-    g_pcap = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-
-    if (g_pcap != INVALID_HANDLE_VALUE) {
-        /* pcap global header: magic, v2.4, GMT, 0, 65535, LINKTYPE_RAW(101) */
-        uint32_t gh[6] = { 0xa1b2c3d4,0x00040002,0,0,65535,101 };
-        DWORD w;
-        WriteFile(g_pcap, gh, 24, &w, NULL);
-        pipe_log("[PCAP] Opened: %s", path);
-    }
-    else {
-        pipe_log("[PCAP] Failed to open: %s (err=%lu)", path, GetLastError());
-    }
-    ReleaseMutex(g_pcap_mutex);
-}
-
-static void pcap_close(void)
-{
-    WaitForSingleObject(g_pcap_mutex, 500);
-    if (g_pcap != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_pcap);
-        g_pcap = INVALID_HANDLE_VALUE;
-        pipe_log("[PCAP] Closed.");
-    }
-    ReleaseMutex(g_pcap_mutex);
-}
+/* ── ejection function (FORWARD DECLARATION) ─────────────── */
+static void HyForceEject(void);
 
 /* ── timing ──────────────────────────────────────────────── */
 static uint64_t now_us(void)
@@ -788,6 +650,154 @@ static DWORD WINAPI hb_thread(LPVOID _)
         pipe_log("[STATS] WSASendTo:%ld sendto:%ld WSARecvFrom:%ld recvfrom:%ld pkts:%ld",
             g_fires_wsa_send, g_fires_send, g_fires_wsa_recv, g_fires_recv, g_pkts_captured);
     }
+    return 0;
+}
+
+/* ── pcap write ──────────────────────────────────────────── */
+static void pcap_write(const uint8_t* data, uint32_t len)
+{
+    if (g_pcap == INVALID_HANDLE_VALUE || len == 0 || len > MAX_PKT) return;
+
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t ft64 = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    uint64_t us = (ft64 - 116444736000000000ULL) / 10;
+
+    uint32_t ph[4] = {
+        (uint32_t)(us / 1000000),
+        (uint32_t)(us % 1000000),
+        len,
+        len
+    };
+
+    WaitForSingleObject(g_pcap_mutex, 100);
+    DWORD w;
+    WriteFile(g_pcap, ph, 16, &w, NULL);
+    WriteFile(g_pcap, data, len, &w, NULL);
+    ReleaseMutex(g_pcap_mutex);
+}
+
+/* ── pcap open ───────────────────────────────────────────── */
+static void pcap_open(const char* path)
+{
+    WaitForSingleObject(g_pcap_mutex, 500);
+    if (g_pcap != INVALID_HANDLE_VALUE) CloseHandle(g_pcap);
+
+    g_pcap = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (g_pcap != INVALID_HANDLE_VALUE) {
+        /* pcap global header: magic, v2.4, GMT, 0, 65535, LINKTYPE_RAW(101) */
+        uint32_t gh[6] = { 0xa1b2c3d4,0x00040002,0,0,65535,101 };
+        DWORD w;
+        WriteFile(g_pcap, gh, 24, &w, NULL);
+        pipe_log("[PCAP] Opened: %s", path);
+    }
+    else {
+        pipe_log("[PCAP] Failed to open: %s (err=%lu)", path, GetLastError());
+    }
+    ReleaseMutex(g_pcap_mutex);
+}
+
+/* ── pcap close ──────────────────────────────────────────── */
+static void pcap_close(void)
+{
+    WaitForSingleObject(g_pcap_mutex, 500);
+    if (g_pcap != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_pcap);
+        g_pcap = INVALID_HANDLE_VALUE;
+        pipe_log("[PCAP] Closed.");
+    }
+    ReleaseMutex(g_pcap_mutex);
+}
+
+/* ── pipe logging (ACTUAL DEFINITION) ────────────────────── */
+static void pipe_log(const char* fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    pipe_send(MSG_LOG, buf, (uint32_t)strlen(buf) + 1);
+}
+
+/* ── ejection function (ACTUAL DEFINITION) ──────────────── */
+static void HyForceEject(void)
+{
+    // Signal ejection to injector
+    pipe_send(MSG_EJECTED, "EJECTING", 9);
+
+    // Small delay to ensure message is sent
+    Sleep(50);
+
+    // Stop all activity
+    g_active = FALSE;
+
+    // Close handles
+    if (g_out != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_out);
+        g_out = INVALID_HANDLE_VALUE;
+    }
+    if (g_cmdin != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_cmdin);
+        g_cmdin = INVALID_HANDLE_VALUE;
+    }
+
+    pcap_close();
+
+    // Restore hooks before ejecting
+    if (orig_WSASendTo)   jmp_restore(orig_WSASendTo, sv_wsa_send);
+    if (orig_WSARecvFrom) jmp_restore(orig_WSARecvFrom, sv_wsa_recv);
+    if (orig_sendto)      jmp_restore(orig_sendto, sv_send);
+    if (orig_recvfrom)    jmp_restore(orig_recvfrom, sv_recv);
+
+    // Flush instruction cache
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+}
+
+/* ── injector monitor thread ─────────────────────────────── */
+static DWORD WINAPI injector_monitor_th(LPVOID _)
+{
+    (void)_;
+    if (g_injector_pid == 0) return 0;
+
+    HANDLE hInjector = OpenProcess(SYNCHRONIZE, FALSE, g_injector_pid);
+    if (!hInjector) {
+        // Injector already gone, eject ourselves
+        pipe_log("[MONITOR] Injector process not found, auto-ejecting");
+        HyForceEject();
+        FreeLibraryAndExitThread(GetModuleHandleW(L"HyForceHook.dll"), 0);
+        return 0;
+    }
+
+    // Wait for injector to exit or signal
+    while (g_active) {
+        DWORD wait = WaitForSingleObject(hInjector, 1000);
+        if (wait == WAIT_OBJECT_0) {
+            // Injector exited, eject ourselves
+            pipe_log("[MONITOR] Injector process exited, auto-ejecting");
+            CloseHandle(hInjector);
+            HyForceEject();
+            FreeLibraryAndExitThread(GetModuleHandleW(L"HyForceHook.dll"), 0);
+            return 0;
+        }
+
+        // Also check if pipe is still alive
+        if (g_out == INVALID_HANDLE_VALUE) {
+            // Try to reconnect for 5 seconds
+            Sleep(5000);
+            if (g_out == INVALID_HANDLE_VALUE && g_active) {
+                pipe_log("[MONITOR] Pipe connection lost, auto-ejecting");
+                CloseHandle(hInjector);
+                HyForceEject();
+                FreeLibraryAndExitThread(GetModuleHandleW(L"HyForceHook.dll"), 0);
+                return 0;
+            }
+        }
+    }
+
+    CloseHandle(hInjector);
     return 0;
 }
 

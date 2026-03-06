@@ -254,8 +254,9 @@ namespace HyForce.Tabs
                       && _dllPaths.Length > 0 && _selDll < _dllPaths.Length;
 
             if (!ready) ImGui.BeginDisabled();
+            // NEW - async, doesn't block:
             if (ImGui.Button("  Inject DLL  ", new Vector2(140, 32)))
-                Task.Run(DoInject);
+                DoInject();
             if (!ready) ImGui.EndDisabled();
 
             if (_injected)
@@ -394,7 +395,7 @@ namespace HyForce.Tabs
             }
         }
 
-        private void DoInject()
+        private async void DoInject()
         {
             if (_selProc < 0 || _selProc >= _procs.Count) return;
             if (_selDll < 0 || _selDll >= _dllPaths.Length) return;
@@ -403,7 +404,10 @@ namespace HyForce.Tabs
             string dllPath = Path.GetFullPath(_dllPaths[_selDll]);
 
             if (!File.Exists(dllPath))
-            { SetStatus($"DLL not found: {dllPath}", 1f, 0.3f, 0.3f); return; }
+            {
+                SetStatus($"DLL not found: {dllPath}", 1f, 0.3f, 0.3f);
+                return;
+            }
 
             SetStatus($"Injecting into {pname} (PID {pid})…", 0.9f, 0.7f, 0.2f);
             _state.AddInGameLog($"[INJECT] → {pname} ({pid})  |  {Path.GetFileName(dllPath)}");
@@ -433,18 +437,35 @@ namespace HyForce.Tabs
                 if (hThread == IntPtr.Zero)
                     throw new Exception($"CreateRemoteThread failed (err {Marshal.GetLastWin32Error()})");
 
-                uint waitRes = WaitForSingleObject(hThread, 6000);
+                // CRITICAL FIX: Don't block UI thread - wait asynchronously
+                SetStatus("Waiting for DLL to initialize...", 0.9f, 0.7f, 0.2f);
+
+                uint waitRes = await Task.Run(() => WaitForSingleObject(hThread, 5000));
+
                 CloseHandle(hThread);
                 CloseHandle(hProc);
 
-                if (waitRes == 0x102)
-                    throw new Exception("Remote thread timed out — DLL may have crashed on load");
+                if (waitRes == 0x102) // WAIT_TIMEOUT
+                {
+                    // Timeout isn't fatal - DLL might still be connecting
+                    _injected = true;
+                    _injectedPid = pid;
+                    SetStatus($"DLL injected (timeout - may still be connecting)", 0.9f, 0.6f, 0.2f);
+                    _state.AddInGameLog($"[INJECT] ⚠ Timeout - DLL may still initialize");
+                }
+                else if (waitRes == 0) // WAIT_OBJECT_0
+                {
+                    _injected = true;
+                    _injectedPid = pid;
+                    SetStatus($"✓ Injected into {pname} ({pid})", 0.2f, 1f, 0.4f);
+                    _state.AddInGameLog($"[INJECT] ✓ Success — {pname} ({pid})");
+                }
+                else
+                {
+                    throw new Exception($"Wait failed (result {waitRes})");
+                }
 
-                _injected = true;
-                _injectedPid = pid;
-                SetStatus($"✓ Injected into {pname} ({pid}) — pipe should connect within 1-2 seconds.", 0.2f, 1f, 0.4f);
-                _state.AddInGameLog($"[INJECT] ✓ Success — {pname} ({pid})");
-                _state.AddInGameLog("[INJECT] Watch the pipe banner above — it turns green when the DLL connects.");
+                _state.AddInGameLog("[INJECT] Watch the pipe banner - turns green when DLL connects");
             }
             catch (Exception ex)
             {
