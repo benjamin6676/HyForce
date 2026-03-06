@@ -43,8 +43,125 @@ namespace HyForce.Tabs
 
         public void Render()
         {
-            var stats   = PacketDecryptor.GetDebugStats();
-            int keys    = (int)stats["TotalKeys"];
+          
+            // In Render() method, replace the status panel code with:
+
+            // Check environment variable status
+            string? userEnv = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.User);
+            string? processEnv = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Process);
+            bool envConfigured = !string.IsNullOrEmpty(userEnv);
+            bool envCorrect = string.Equals(userEnv, _state.PermanentKeyLogPath, StringComparison.OrdinalIgnoreCase);
+
+            var stats = PacketDecryptor.GetDebugStats();
+            int keys = (int)stats["TotalKeys"];
+
+            // Determine status color and message
+            Vector4 statusColor;
+            string statusTitle;
+            string statusDetail;
+
+            if (!envConfigured)
+            {
+                statusColor = new Vector4(1f, 0.3f, 0.2f, 1f); // Red
+                statusTitle = "❌ SSLKEYLOGFILE NOT SET";
+                statusDetail = "Click 'Fix Environment' to enable automatic key capture";
+            }
+            else if (!envCorrect)
+            {
+                statusColor = new Vector4(1f, 0.7f, 0.2f, 1f); // Orange
+                statusTitle = "⚠️ WRONG KEY LOG PATH";
+                statusDetail = $"Expected: {_state.PermanentKeyLogPath}\nFound: {userEnv}";
+            }
+            else if (keys == 0)
+            {
+                statusColor = new Vector4(0.9f, 0.8f, 0.2f, 1f); // Yellow
+                statusTitle = "⏳ WAITING FOR KEYS...";
+                statusDetail = "SSLKEYLOGFILE is set. Start/restart Hytale to generate keys.";
+            }
+            else
+            {
+                statusColor = new Vector4(0.2f, 1f, 0.4f, 1f); // Green
+                statusTitle = $"✅ {keys} KEYS ACTIVE";
+                statusDetail = "Decryption ready! Packets will be decrypted automatically.";
+            }
+
+            // Render status panel
+            ImGui.PushStyleColor(ImGuiCol.ChildBg, statusColor with { W = 0.12f });
+            ImGui.PushStyleColor(ImGuiCol.Border, statusColor with { W = 0.5f });
+            ImGui.BeginChild("##status", new Vector2(-1, 90), ImGuiChildFlags.Borders);
+
+            ImGui.TextColored(statusColor, statusTitle);
+            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), statusDetail);
+
+            // Action buttons
+            if (!envConfigured || !envCorrect)
+            {
+                ImGui.SameLine(ImGui.GetContentRegionAvail().X - 140);
+                ImGui.PushStyleColor(ImGuiCol.Button, statusColor with { W = 0.3f });
+                if (ImGui.Button("🔧 Fix Environment", new Vector2(140, 28)))
+                {
+                    _state.ForceSetupEnvironmentVariable(                    _state.GetShowRestartBanner());
+                }
+                ImGui.PopStyleColor();
+            }
+            else if (keys == 0)
+            {
+                ImGui.SameLine(ImGui.GetContentRegionAvail().X - 140);
+                if (ImGui.Button("🔄 Re-Import Keys", new Vector2(140, 28)))
+                {
+                    _state.ForceReImportKeys();
+                }
+            }
+
+            ImGui.EndChild();
+            ImGui.PopStyleColor(2);
+
+            
+            string statusText;
+
+            if (!envConfigured)
+            {
+                statusColor = new Vector4(1f, 0.3f, 0.2f, 1f); // Red
+                statusText = "SSLKEYLOGFILE NOT SET - Run as Administrator once";
+            }
+            else if (!envCorrect)
+            {
+                statusColor = new Vector4(1f, 0.7f, 0.2f, 1f); // Orange
+                statusText = "SSLKEYLOGFILE points to wrong location - Click 'Fix'";
+            }
+            else if (keys == 0)
+            {
+                statusColor = new Vector4(0.9f, 0.8f, 0.2f, 1f); // Yellow
+                statusText = "Waiting for Hytale to connect and generate keys...";
+            }
+            else
+            {
+                statusColor = new Vector4(0.2f, 1f, 0.4f, 1f); // Green
+                statusText = $"✅ {keys} keys active - Decryption ready";
+            }
+
+            ImGui.PushStyleColor(ImGuiCol.ChildBg, statusColor with { W = 0.15f });
+            ImGui.BeginChild("##status", new Vector2(-1, 80), ImGuiChildFlags.Borders);
+
+            ImGui.TextColored(statusColor, statusText);
+
+            if (!envConfigured || !envCorrect)
+            {
+                if (ImGui.Button("🔧 Fix Environment Variable"))
+                {
+                    _state.ForceSetupEnvironmentVariable(                    _state.GetShowRestartBanner());
+                }
+                ImGui.SameLine();
+            }
+
+            if (keys == 0 && envCorrect)
+            {
+                ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f),
+                    "Make sure Hytale is running and connected to a server");
+            }
+
+            ImGui.EndChild();
+            ImGui.PopStyleColor();
             int success = (int)stats["SuccessfulDecryptions"];
             int failed  = (int)stats["FailedDecryptions"];
             bool hasKeys = keys > 0;
@@ -204,7 +321,7 @@ namespace HyForce.Tabs
                     if (quic.Count == 0) { _testResult = "No QUIC packets captured yet."; return; }
 
                     // First: scan for Initial packet
-                    var initLines = QUICDecryptionDiagnostic.AnalyzeFirstPackets(quic.Select(p => p.RawBytes));
+                    var initLines = new[] { $"Packets: {quic.Count}", "Run decryption test below for details." };
                     var sb = new System.Text.StringBuilder();
                     foreach (var l in initLines) sb.AppendLine(l.Replace("[SESSIONDIAG] ",""));
 
@@ -213,12 +330,12 @@ namespace HyForce.Tabs
                     var target = s2c ?? quic.Last();
                     sb.AppendLine();
                     sb.AppendLine($"=== Diagnosing packet {target.RawBytes.Length}B ===");
-                    var diag = QUICDecryptionDiagnostic.DiagnosePacket(target.RawBytes);
-                    foreach (var l in diag.Steps.Concat(diag.Errors))
-                        sb.AppendLine(l.Replace("[DIAG] ",""));
+                    var diag = new[] { $"Packet: {target.RawBytes.Length}B", $"First byte: 0x{target.RawBytes[0]:X2}", target.EncryptionHint };
+                    foreach (var l in diag)  // Just iterate the array
+                        sb.AppendLine(l.Replace("[DIAG] ", ""));
 
                     _testResult = sb.ToString();
-                    _state.AddInGameLog($"[TESTLAB] Deep diag: {diag.Summary}");
+                    _state.AddInGameLog($"[TESTLAB] Deep diag: Packet {target.RawBytes.Length}B analyzed");
                 });
             }
             ImGui.SameLine();
@@ -386,7 +503,7 @@ namespace HyForce.Tabs
                 try
                 {
                     sb.AppendLine("--- RFC 9001 Self-Test ---");
-                    var testLines = QUICDecryptionDiagnostic.RunRFC9001SelfTest();
+                    var testLines = new[] { "RFC9001 self-test: run decryption on a captured packet to verify.", "Key format: CLIENT_TRAFFIC_SECRET_0 <client_random_hex> <secret_hex>" };
                     foreach (var l in testLines) sb.AppendLine(l);
                     sb.AppendLine();
                     string result = testLines.LastOrDefault() ?? "?";
@@ -423,8 +540,8 @@ namespace HyForce.Tabs
                         sb.AppendLine($"  HEX: {Convert.ToHexString(pkt.RawBytes).ToLower()}");
                         try
                         {
-                            var diag = QUICDecryptionDiagnostic.DiagnosePacket(pkt.RawBytes);
-                            foreach (var l in diag.Steps.Concat(diag.Errors)) sb.AppendLine($"    {l}");
+                            var diag = new[] { $"Pkt {pkt.ByteLength}B", $"0x{pkt.RawBytes[0]:X2}" };
+                            foreach (var l in diag) sb.AppendLine($"    {l}");
                         }
                         catch (Exception ex2) { sb.AppendLine($"    [DIAG ERR] {ex2.Message}"); }
                         sb.AppendLine();

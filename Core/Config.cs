@@ -78,7 +78,6 @@ public class Config
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HyForce", "Exports");
     public int MaxPacketLogSize { get; set; } = 10000;
     public bool ShowTimestamps { get; set; } = true;
-    public bool LogSecurityEvents { get; set; } = true;
 
     // New properties
     public List<ServerPreset> CustomPresets { get; set; } = new();

@@ -1,93 +1,112 @@
-﻿# ExportCode.ps1 - Export all .cs files to a single text file
-# Run from PowerShell: .\ExportCode.ps1
-# Or right-click → Run with PowerShell
+﻿# Export all .cs files to TXT and PDF
+# Usage: .\Export-CsFiles.ps1 -OutputFile "output"
+# Creates: output.txt and output.pdf (if Word is available)
 
 param(
-    [string]$OutputFile = "ProjectExport.txt",
-    [string]$ProjectPath = $PSScriptRoot
+    [string]$OutputFile = "cs_files_export",
+    [string]$RootPath = ".",
+    [switch]$IncludeLineNumbers,
+    [switch]$OnlyTxt,
+    [switch]$OnlyPdf
 )
 
-# Change to project directory
-Set-Location $ProjectPath
+# Ensure output name has no extension (we'll add them)
+$baseName = $OutputFile -replace '\.(txt|pdf)$', ''
+$txtFile = "$baseName.txt"
+$pdfFile = "$baseName.pdf"
 
-Write-Host "HyForce Project Exporter" -ForegroundColor Cyan
-Write-Host "Project: $ProjectPath" -ForegroundColor Gray
-Write-Host ""
-
-# Remove old export if exists
-if (Test-Path $OutputFile) {
-    Remove-Item $OutputFile -Force
-    Write-Host "Removed old export file" -ForegroundColor Yellow
-}
-
-# Get all .cs files (excluding build folders)
-$files = Get-ChildItem -Path . -Recurse -Filter "*.cs" -File | 
+# Get all .cs files recursively, excluding common non-source directories
+$excludeDirs = @('bin', 'obj', 'node_modules', '.git', '.vs', 'packages', 'TestResults', 'publish')
+$csFiles = Get-ChildItem -Path $RootPath -Recurse -Filter "*.cs" | 
     Where-Object { 
-        $_.FullName -notmatch "\\(bin|obj|\.vs|packages|\.git|Exported logs)\\" -and
-        $_.Name -ne $OutputFile
+        $fullPath = $_.FullName
+        -not ($excludeDirs | Where-Object { $fullPath -like "*\$_\*" -or $fullPath -like "*/$_/*" })
     } |
     Sort-Object FullName
 
-Write-Host "Found $($files.Count) .cs files to export" -ForegroundColor Cyan
+$totalFiles = $csFiles.Count
+Write-Host "Found $totalFiles .cs files to export..."
 
-if ($files.Count -eq 0) {
-    Write-Host "ERROR: No .cs files found!" -ForegroundColor Red
-    Write-Host "Make sure you run this from the project root folder" -ForegroundColor Yellow
-    Read-Host "Press Enter to exit"
-    exit
-}
+# Build content
+$contentLines = @()
+$contentLines += "C# Source Code Export"
+$contentLines += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$contentLines += "Total Files: $totalFiles"
+$contentLines += "Root Path: $(Resolve-Path $RootPath)"
+$contentLines += "=" * 80
+$contentLines += ""
 
-# Export each file
-$exportedCount = 0
-foreach ($file in $files) {
+$currentFile = 0
+foreach ($file in $csFiles) {
+    $currentFile++
+    $relativePath = Resolve-Path -Relative -Path $file.FullName
+    
+    Write-Host "[$currentFile/$totalFiles] Processing: $relativePath"
+    
+    $contentLines += "// " + "=" * 60
+    $contentLines += "// File: $relativePath"
+    $contentLines += "// " + "=" * 60
+    $contentLines += ""
+    
     try {
-        $relativePath = $file.FullName.Substring((Get-Location).Path.Length + 1)
+        $fileContent = Get-Content -Path $file.FullName -Encoding UTF8
         
-        # Write header
-        Add-Content $OutputFile "===== FILE: $($file.FullName) ====="
-        Add-Content $OutputFile ""
+        if ($IncludeLineNumbers) {
+            $lineNum = 1
+            foreach ($line in $fileContent) {
+                $contentLines += ("{0,4}: {1}" -f $lineNum, $line)
+                $lineNum++
+            }
+        } else {
+            $contentLines += $fileContent
+        }
         
-        # Write content
-        $content = Get-Content $file.FullName -Raw -ErrorAction Stop
-        Add-Content $OutputFile $content
-        
-        # Write footer spacing
-        Add-Content $OutputFile ""
-        Add-Content $OutputFile ""
-        
-        $exportedCount++
-        Write-Host "  Exported: $relativePath" -ForegroundColor Green
+        $contentLines += ""
+        $contentLines += ""
     }
     catch {
-        Write-Host "  ERROR: $($file.Name) - $($_.Exception.Message)" -ForegroundColor Red
+        $contentLines += "// ERROR reading file: $_"
     }
 }
 
-# Summary
-Write-Host ""
-Write-Host "Export Complete!" -ForegroundColor Green
-Write-Host "Files exported: $exportedCount / $($files.Count)" -ForegroundColor White
+$fullContent = $contentLines -join "`r`n"
 
-if (Test-Path $OutputFile) {
-    $fileInfo = Get-Item $OutputFile
-    $sizeKB = [math]::Round($fileInfo.Length / 1KB, 2)
-    Write-Host "Output: $($fileInfo.FullName)" -ForegroundColor Cyan
-    Write-Host "Size: $sizeKB KB" -ForegroundColor Cyan
-    
-    # Copy to clipboard option
-    Write-Host ""
-    $copy = Read-Host "Copy to clipboard? (y/n)"
-    if ($copy -eq 'y' -or $copy -eq 'Y') {
-        try {
-            $content = Get-Content $OutputFile -Raw
-            Set-Clipboard $content
-            Write-Host "Copied to clipboard!" -ForegroundColor Green
-        }
-        catch {
-            Write-Host "Failed to copy: $($_.Exception.Message)" -ForegroundColor Red
-        }
+# Export TXT
+if (-not $OnlyPdf) {
+    $fullContent | Set-Content -Path $txtFile -Encoding UTF8 -NoNewline
+    Write-Host "`n✓ TXT created: $(Resolve-Path $txtFile)" -ForegroundColor Green
+}
+
+# Export PDF (requires Microsoft Word)
+if (-not $OnlyTxt) {
+    try {
+        $word = New-Object -ComObject Word.Application -ErrorAction Stop
+        $word.Visible = $false
+        
+        $doc = $word.Documents.Add()
+        
+        # Add content
+        $selection = $word.Selection
+        $selection.Font.Name = "Consolas"
+        $selection.Font.Size = 9
+        $selection.TypeText($fullContent)
+        
+        # Save as PDF (17 = wdFormatPDF)
+        $doc.SaveAs([ref]$pdfFile, [ref]17)
+        $doc.Close([ref]$false)
+        $word.Quit()
+        
+        # Cleanup COM objects
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($selection) | Out-Null
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($doc) | Out-Null
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($word) | Out-Null
+        
+        Write-Host "✓ PDF created: $(Resolve-Path $pdfFile)" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Could not create PDF (Microsoft Word required): $_"
+        Write-Host "   You can manually 'Print to PDF' from the .txt file" -ForegroundColor Yellow
     }
 }
 
-Write-Host ""
-Read-Host "Press Enter to exit"
+Write-Host "`nDone! Exported $totalFiles files." -ForegroundColor Cyan

@@ -144,67 +144,7 @@ public class PacketInspector
         analysis.Fields["Compressed"] = "Yes (Zstd)";
     }
 
-    public static List<PacketPattern> DetectPatterns(List<PacketLogEntry> packets)
-    {
-        var patterns = new List<PacketPattern>();
 
-        // Group by opcode
-        var grouped = packets.GroupBy(p => p.OpcodeDecimal);
-
-        foreach (var group in grouped)
-        {
-            var list = group.ToList();
-            if (list.Count < 5) continue; // Need at least 5 packets for pattern
-
-            var pattern = new PacketPattern
-            {
-                Opcode = group.Key,
-                PacketName = list[0].OpcodeName,
-                Count = list.Count,
-                AvgSize = (int)list.Average(p => p.ByteLength),
-                Direction = list[0].Direction
-            };
-
-            // Detect periodic patterns
-            if (list.Count >= 10)
-            {
-                var intervals = new List<double>();
-                for (int i = 1; i < list.Count; i++)
-                {
-                    intervals.Add((list[i].Timestamp - list[i - 1].Timestamp).TotalMilliseconds);
-                }
-
-                var avgInterval = intervals.Average();
-                var variance = intervals.Select(i => Math.Abs(i - avgInterval)).Average();
-
-                if (variance < avgInterval * 0.1) // Less than 10% variance
-                {
-                    pattern.IsPeriodic = true;
-                    pattern.PeriodMs = avgInterval;
-                }
-            }
-
-            // Detect burst patterns
-            var timeSpan = list.Last().Timestamp - list.First().Timestamp;
-            if (timeSpan.TotalSeconds > 0)
-            {
-                var rate = list.Count / timeSpan.TotalSeconds;
-                if (rate > 50) // More than 50 packets per second
-                {
-                    pattern.IsBurst = true;
-                    pattern.RatePerSecond = rate;
-                }
-            }
-
-            patterns.Add(pattern);
-        }
-
-        return patterns.OrderByDescending(p => p.Count).ToList();
-    }
-}
-
-public class PacketAnalysis
-{
     public ushort Opcode { get; set; }
     public string OpcodeHex { get; set; } = "";
     public string PacketName { get; set; } = "Unknown";
@@ -216,21 +156,8 @@ public class PacketAnalysis
     public Dictionary<string, string> Fields { get; set; } = new();
     public double Entropy { get; set; }
     public bool EncryptionLikely { get; set; }
-    public bool IsRegistrySync { get; set; }
     public string CompressionHint { get; set; } = "";
     public string QuicHeaderType { get; set; } = "";
     public string QuicVersion { get; set; } = "";
 }
 
-public class PacketPattern
-{
-    public ushort Opcode { get; set; }
-    public string PacketName { get; set; } = "";
-    public int Count { get; set; }
-    public int AvgSize { get; set; }
-    public PacketDirection Direction { get; set; }
-    public bool IsPeriodic { get; set; }
-    public double PeriodMs { get; set; }
-    public bool IsBurst { get; set; }
-    public double RatePerSecond { get; set; }
-}

@@ -2,173 +2,289 @@ using HyForce.Core;
 using HyForce.Data;
 using HyForce.Networking;
 using System;
+using System.Collections.Generic;
 using System.IO.Pipes;
 using System.Net;
-using System.Net.Sockets;
 using System.Threading;
-using System.Threading.Tasks;
 
 namespace HyForce.Networking
 {
     /// <summary>
-    /// Listens on \\.\pipe\HyForcePipe for packets forwarded by HyForceHook.dll
-    /// injected into the Hytale JVM process.
-    ///
-    /// Pipe message format (each message):
-    ///   [1B  direction : 0 = Client→Server, 1 = Server→Client]
-    ///   [4B  data_len  : uint32 LE]
-    ///   [NB  raw QUIC packet bytes]
-    ///   [4B  remote_ip  : IPv4 network order]
-    ///   [2B  remote_port: uint16 network order]
+    /// Bidirectional named pipe server.
+    ///   HyForcePipe    — C# SERVER reads, DLL writes (packets + events)
+    ///   HyForceCmdPipe — C# SERVER writes, DLL reads (commands)
     /// </summary>
     public class PipeCaptureServer : IDisposable
     {
-        public const string PIPE_NAME = "HyForcePipe";
+        public const string PIPE_DATA = "HyForcePipe";
+        public const string PIPE_CMD  = "HyForceCmdPipe";
 
-        private readonly AppState      _state;
+        private readonly AppState _state;
         private CancellationTokenSource? _cts;
-        private Thread?                 _serverThread;
-        private volatile bool           _running;
-        private int                     _packetsReceived;
-        private DateTime                _startTime = DateTime.MinValue;
+        private Thread? _dataThread, _cmdThread;
+        private NamedPipeServerStream? _cmdPipe;
 
-        public bool  IsRunning       => _running;
-        public int   PacketsReceived => _packetsReceived;
+        private volatile bool _running;
+        private volatile bool _dllConnected;
+        private int   _packetCount;
+        private string _dllStatus  = "Not connected";
+        private DateTime _lastPkt  = DateTime.MinValue;
 
-        // Raised on the background thread — subscribe to forward packets into PacketLog
+        // ── Memory scan results ────────────────────────────────────
+        public readonly List<MemScanHit> MemHits = new();
+        private readonly object _memLock = new();
+
+        // ── Timing ring ───────────────────────────────────────────
+        public readonly List<TimingEntry> TimingLog = new();
+        private readonly object _timingLock = new();
+        public const int MAX_TIMING = 2000;
+
+        // ── Seq anomalies ─────────────────────────────────────────
+        public readonly List<string> SeqAnomalies = new();
+        private readonly object _seqLock = new();
+
+        // ── Rate-limit results ────────────────────────────────────
+        public int LastRateLimitSent;
+        public int LastRateLimitIntervalMs;
+
+        public bool     IsRunning    => _running;
+        public bool     DllConnected => _dllConnected;
+        public int      PacketCount  => _packetCount;
+        public string   DllStatus    => _dllStatus;
+        public DateTime LastPacket   => _lastPkt;
+
         public event Action<CapturedPacket>? OnPacketReceived;
 
         public PipeCaptureServer(AppState state) { _state = state; }
 
-        // ─── Start ────────────────────────────────────────────────────
         public void Start()
         {
             if (_running) return;
-            _cts        = new CancellationTokenSource();
-            _running    = true;
-            _startTime  = DateTime.Now;
-            _packetsReceived = 0;
-            _serverThread = new Thread(ServerLoop)
-            {
-                IsBackground = true,
-                Name         = "HyForce-PipeServer"
-            };
-            _serverThread.Start();
-            _state.AddInGameLog("[PIPE] Listening on \\\\.\\pipe\\" + PIPE_NAME);
+            _cts = new CancellationTokenSource();
+            _running = true;
+            _packetCount = 0;
+            _dllConnected = false;
+            _dataThread = new Thread(DataLoop) { IsBackground=true, Name="HyForce-PipeData" };
+            _dataThread.Start();
+            _cmdThread  = new Thread(CmdLoop)  { IsBackground=true, Name="HyForce-PipeCmd"  };
+            _cmdThread.Start();
+            _state.AddInGameLog("[PIPE] Servers started — waiting for DLL to inject");
         }
 
-        // ─── Stop ─────────────────────────────────────────────────────
         public void Stop()
         {
             if (!_running) return;
-            _running = false;
-            _cts?.Cancel();
-            _state.AddInGameLog($"[PIPE] Stopped — {_packetsReceived} packets received.");
+            _running = false; _cts?.Cancel(); _dllConnected = false;
+            try { _cmdPipe?.Close(); } catch { }
+            _state.AddInGameLog($"[PIPE] Stopped. {_packetCount} packets captured.");
         }
 
-        public void Dispose() { Stop(); }
+        public void Dispose() => Stop();
 
-        // ─── Server loop (accepts one client at a time, loops on reconnect) ──
-        private void ServerLoop()
+        // ─── Send a text command to the DLL ───────────────────────
+        public void SendCommand(string cmd)
+        {
+            try {
+                if (_cmdPipe?.IsConnected == true) {
+                    byte[] b = System.Text.Encoding.ASCII.GetBytes(cmd+"\n");
+                    _cmdPipe.Write(b,0,b.Length); _cmdPipe.Flush();
+                }
+            } catch { }
+        }
+
+        // ── Convenience command wrappers ──────────────────────────
+        public void Fuzz(int bits)              => SendCommand($"FUZZ {bits}");
+        public void Replay()                    => SendCommand("REPLAY");
+        public void ReplayHex(string hex)       => SendCommand($"REPLAY {hex}");
+        public void RateLimit(int count, int ms)=> SendCommand($"RATELIMIT {count} {ms}");
+        public void StartPcap(string path)      => SendCommand($"PCAP_START {path}");
+        public void StopPcap()                  => SendCommand("PCAP_STOP");
+        public void MemScan()                   => SendCommand("MEMSCAN");
+        public void SeqReset()                  => SendCommand("SEQRESET");
+        public void Ping()                      => SendCommand("PING");
+
+        // ─── Data pipe loop ───────────────────────────────────────
+        private void DataLoop()
         {
             var token = _cts!.Token;
             while (_running && !token.IsCancellationRequested)
             {
                 try
                 {
-                    using var pipe = new NamedPipeServerStream(
-                        PIPE_NAME,
-                        PipeDirection.In,
-                        1,
-                        PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous,
-                        0, 65536 + 11);  // inBuf = 0, outBuf = max packet + header
-
-                    _state.AddInGameLog("[PIPE] Waiting for HyForceHook.dll to connect…");
-
-                    // Wait for DLL to connect (with cancellation)
-                    var connectTask = pipe.WaitForConnectionAsync(token);
-                    connectTask.GetAwaiter().GetResult();
-
-                    _state.AddInGameLog("[PIPE] HyForceHook.dll connected — live capture active.");
-
-                    ReadPackets(pipe, token);
-
-                    _state.AddInGameLog("[PIPE] Client disconnected — waiting for reconnect…");
+                    using var pipe = new NamedPipeServerStream(PIPE_DATA,
+                        PipeDirection.In, 1, PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous, 0, 131072);
+                    pipe.WaitForConnectionAsync(token).GetAwaiter().GetResult();
+                    _dllConnected = true;
+                    _state.AddInGameLog("[PIPE] DLL connected — capture live");
+                    ReadMessages(pipe, token);
+                    _dllConnected = false;
+                    _state.AddInGameLog("[PIPE] DLL disconnected");
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex) when (!token.IsCancellationRequested)
-                {
-                    _state.AddInGameLog($"[PIPE] Error: {ex.Message} — retrying in 1s");
-                    Thread.Sleep(1000);
-                }
+                { _state.AddInGameLog($"[PIPE] {ex.Message}"); Thread.Sleep(1000); }
             }
         }
 
-        // ─── Read messages from a connected pipe ──────────────────────
-        private void ReadPackets(NamedPipeServerStream pipe, CancellationToken token)
+        // ─── Cmd pipe loop ────────────────────────────────────────
+        private void CmdLoop()
         {
-            byte[] header = new byte[5]; // direction(1) + len(4)
+            var token = _cts!.Token;
+            while (_running && !token.IsCancellationRequested)
+            {
+                try
+                {
+                    var pipe = new NamedPipeServerStream(PIPE_CMD,
+                        PipeDirection.Out, 1, PipeTransmissionMode.Byte,
+                        PipeOptions.None, 131072, 0);
+                    pipe.WaitForConnectionAsync(token).GetAwaiter().GetResult();
+                    _cmdPipe = pipe;
+                    while (_running && pipe.IsConnected && !token.IsCancellationRequested)
+                        Thread.Sleep(100);
+                    _cmdPipe = null;
+                    try { pipe.Close(); } catch { }
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex) when (!token.IsCancellationRequested)
+                { _state.AddInGameLog($"[PIPE/CMD] {ex.Message}"); Thread.Sleep(1000); }
+            }
+        }
 
+        // ─── Message dispatcher ───────────────────────────────────
+        private void ReadMessages(NamedPipeServerStream pipe, CancellationToken token)
+        {
+            byte[] hdr = new byte[5];
             while (_running && !token.IsCancellationRequested && pipe.IsConnected)
             {
-                // Read header
-                if (!ReadExact(pipe, header, 5)) return;
+                if (!ReadExact(pipe, hdr, 5)) return;
+                byte   type = hdr[0];
+                uint   len  = BitConverter.ToUInt32(hdr, 1);
+                if (len > 131072) return;
+                byte[] pay  = len > 0 ? new byte[len] : Array.Empty<byte>();
+                if (len > 0 && !ReadExact(pipe, pay, (int)len)) return;
 
-                byte direction   = header[0];
-                int  dataLen     = (int)BitConverter.ToUInt32(header, 1);
-
-                if (dataLen <= 0 || dataLen > 65535)
+                switch (type)
                 {
-                    _state.AddInGameLog($"[PIPE] Bad packet length {dataLen} — dropping");
-                    return;
+                    case 0x01: HandlePacket(pay); break;
+                    case 0x02:
+                        _dllStatus = System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0');
+                        _state.AddInGameLog($"[PIPE] {_dllStatus}");
+                        break;
+                    case 0x03:
+                        _state.AddInGameLog($"[DLL] {System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0')}");
+                        break;
+                    case 0x04: HandleTiming(pay); break;
+                    case 0x05: HandleSeqAnomaly(pay); break;
+                    case 0x06: HandleMemScan(pay); break;
+                    case 0x07: HandleRateLimit(pay); break;
                 }
-
-                byte[] payload = new byte[dataLen];
-                if (!ReadExact(pipe, payload, dataLen)) return;
-
-                byte[] tail = new byte[6]; // ip(4) + port(2)
-                if (!ReadExact(pipe, tail, 6)) return;
-
-                uint   ipRaw  = BitConverter.ToUInt32(tail, 0);
-                ushort portRaw= BitConverter.ToUInt16(tail, 4);
-
-                // Build CapturedPacket
-                string remoteIp   = new IPAddress(ipRaw).ToString();
-                int    remotePort = IPAddress.NetworkToHostOrder((short)portRaw);
-
-                var dir = (direction == 0)
-                    ? PacketDirection.ClientToServer
-                    : PacketDirection.ServerToClient;
-
-                var pkt = new CapturedPacket
-                {
-                    RawBytes        = payload,
-                    Direction       = dir,
-                    EncryptionHint  = "encrypted",
-                    Timestamp       = DateTime.Now,
-                    SourceAddress   = direction == 0 ? "127.0.0.1" : remoteIp,
-                    DestAddress     = direction == 0 ? remoteIp    : "127.0.0.1",
-                    SourcePort      = direction == 0 ? 0           : remotePort,
-                    DestPort        = direction == 0 ? remotePort  : 0,
-                };
-
-                Interlocked.Increment(ref _packetsReceived);
-                OnPacketReceived?.Invoke(pkt);
             }
         }
 
-        // ─── Read exactly N bytes, return false on disconnect ─────────
-        private static bool ReadExact(NamedPipeServerStream pipe, byte[] buf, int count)
+        private void HandlePacket(byte[] pay)
         {
-            int read = 0;
-            while (read < count)
-            {
-                int n = pipe.Read(buf, read, count - read);
-                if (n <= 0) return false;
-                read += n;
+            if (pay.Length < 8) return;
+            byte   dir      = pay[0];
+            uint   ipRaw    = BitConverter.ToUInt32(pay, 1);
+            ushort portRaw  = BitConverter.ToUInt16(pay, 5);
+            int    dataLen  = pay.Length - 7;
+            if (dataLen <= 0) return;
+            byte[] data = new byte[dataLen];
+            Buffer.BlockCopy(pay, 7, data, 0, dataLen);
+            string ip    = new IPAddress(ipRaw).ToString();
+            int    port  = IPAddress.NetworkToHostOrder((short)portRaw) & 0xFFFF;
+            var pkt = new CapturedPacket {
+                RawBytes       = data,
+                Direction      = dir==0 ? PacketDirection.ClientToServer : PacketDirection.ServerToClient,
+                EncryptionHint = "encrypted",
+                Timestamp      = DateTime.Now,
+                SourceAddress  = dir==0 ? "127.0.0.1" : ip,
+                DestAddress    = dir==0 ? ip           : "127.0.0.1",
+                SourcePort     = dir==0 ? 0            : port,
+                DestPort       = dir==0 ? port         : 0,
+            };
+            Interlocked.Increment(ref _packetCount);
+            _lastPkt = DateTime.Now;
+            OnPacketReceived?.Invoke(pkt);
+        }
+
+        private void HandleTiming(byte[] pay)
+        {
+            if (pay.Length < 13) return;
+            var e = new TimingEntry {
+                TimestampUs = BitConverter.ToUInt64(pay, 0),
+                Length      = BitConverter.ToUInt32(pay, 8),
+                Dir         = pay[12],
+            };
+            lock (_timingLock) {
+                TimingLog.Add(e);
+                if (TimingLog.Count > MAX_TIMING)
+                    TimingLog.RemoveAt(0);
             }
+        }
+
+        private void HandleSeqAnomaly(byte[] pay)
+        {
+            if (pay.Length < 17) return;
+            ulong expected = BitConverter.ToUInt64(pay, 0);
+            ulong got      = BitConverter.ToUInt64(pay, 8);
+            byte  dir      = pay[16];
+            string msg = $"SEQ ANOMALY dir={dir} expected>{expected} got={got}";
+            lock (_seqLock) { SeqAnomalies.Add($"{DateTime.Now:HH:mm:ss.fff}  {msg}"); }
+            _state.AddInGameLog($"[SEQ] {msg}");
+        }
+
+        private void HandleMemScan(byte[] pay)
+        {
+            if (pay.Length < 12) return;
+            ulong addr = BitConverter.ToUInt64(pay, 0);
+            uint  sz   = BitConverter.ToUInt32(pay, 8);
+            byte[] data = new byte[pay.Length - 12];
+            if (data.Length > 0) Buffer.BlockCopy(pay, 12, data, 0, data.Length);
+            var hit = new MemScanHit { Address=addr, StructBytes=data };
+            if (data.Length >= 32) {
+                hit.Health    = BitConverter.ToSingle(data, 0);
+                hit.MaxHealth = BitConverter.ToSingle(data, 4);
+                hit.X = BitConverter.ToDouble(data, 8);
+                hit.Y = BitConverter.ToDouble(data, 16);
+                hit.Z = BitConverter.ToDouble(data, 24);
+            }
+            lock (_memLock) { MemHits.Add(hit); }
+        }
+
+        private void HandleRateLimit(byte[] pay)
+        {
+            if (pay.Length < 8) return;
+            LastRateLimitSent       = (int)BitConverter.ToUInt32(pay, 0);
+            LastRateLimitIntervalMs = (int)BitConverter.ToUInt32(pay, 4);
+        }
+
+        private static bool ReadExact(System.IO.Stream s, byte[] buf, int count)
+        {
+            int read=0;
+            while (read<count) { int n=s.Read(buf,read,count-read); if(n<=0)return false; read+=n; }
             return true;
         }
+    }
+
+    // ── Data structures ───────────────────────────────────────────
+    public class TimingEntry
+    {
+        public ulong TimestampUs { get; set; }
+        public uint  Length      { get; set; }
+        public byte  Dir         { get; set; }
+    }
+
+    public class MemScanHit
+    {
+        public ulong  Address    { get; set; }
+        public float  Health     { get; set; }
+        public float  MaxHealth  { get; set; }
+        public double X          { get; set; }
+        public double Y          { get; set; }
+        public double Z          { get; set; }
+        public byte[] StructBytes{ get; set; } = Array.Empty<byte>();
+        public DateTime FoundAt  { get; set; } = DateTime.Now;
     }
 }

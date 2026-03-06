@@ -18,7 +18,6 @@ public class SettingsTab : ITab
     private bool _captureUdp;
     private bool _autoAnalyzeRegistry;
     private bool _enableAnomalyDetection;
-    private bool _logSecurityEvents;
     private bool _autoExportOnStop;
     private int _maxPacketLogSize;
     private int _connectionTimeoutMs;
@@ -41,7 +40,6 @@ public class SettingsTab : ITab
         _captureUdp = config.CaptureUdp;
         _autoAnalyzeRegistry = config.AutoAnalyzeRegistry;
         _enableAnomalyDetection = config.EnableAnomalyDetection;
-        _logSecurityEvents = config.LogSecurityEvents;
         _autoExportOnStop = config.AutoExportOnStop;
         _maxPacketLogSize = config.MaxPacketLogSize;
         _connectionTimeoutMs = config.ConnectionTimeoutMs;
@@ -59,7 +57,6 @@ public class SettingsTab : ITab
         config.CaptureUdp = _captureUdp;
         config.AutoAnalyzeRegistry = _autoAnalyzeRegistry;
         config.EnableAnomalyDetection = _enableAnomalyDetection;
-        config.LogSecurityEvents = _logSecurityEvents;
         config.AutoExportOnStop = _autoExportOnStop;
         config.MaxPacketLogSize = _maxPacketLogSize;
         config.ConnectionTimeoutMs = _connectionTimeoutMs;
@@ -135,7 +132,6 @@ public class SettingsTab : ITab
     {
         ImGui.Checkbox("Auto-analyze Registry", ref _autoAnalyzeRegistry);
         ImGui.Checkbox("Detect Anomalies", ref _enableAnomalyDetection);
-        ImGui.Checkbox("Log Security Events", ref _logSecurityEvents);
 
         ImGui.Spacing();
         ImGui.InputInt("Anomaly Threshold (bytes)", ref _anomalyThresholdSize);

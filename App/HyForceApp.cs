@@ -1,630 +1,324 @@
-// FILE: App/HyForceApp.cs -- UI Overhaul: diag bar, theme switcher, improved tab bar
 using HyForce.Core;
 using HyForce.Tabs;
 using HyForce.UI;
-using HyForce.Protocol;
 using HyForce.Utils;
 using ImGuiNET;
 using Veldrid;
 using Veldrid.Sdl2;
 using System.Numerics;
+using System;
+using System.Collections.Generic;
+using System.Linq;  // For .OfType<InjectionTab>()
 
-namespace HyForce.App;
-
-public class HyForceApp
+namespace HyForce.App
 {
-    private readonly Sdl2Window      _window;
-    private readonly GraphicsDevice  _graphicsDevice;
-    private readonly ImGuiController _imguiController;
-    private readonly CommandList     _commandList;
-
-    private readonly AppState               _state;
-    private readonly Protocol.PacketHandler _packetHandler;
-    private readonly List<ITab>             _tabs    = new();
-    private readonly Theme                  _theme;
-    private readonly GlobalHotkeys          _hotkeys;
-    private int  _selectedTab    = 0;
-    private bool _showThemePopup = false;
-
-    public HyForceApp(Sdl2Window window, GraphicsDevice graphicsDevice)
+    public class HyForceApp : IDisposable
     {
-        _window         = window;
-        _graphicsDevice = graphicsDevice;
+        // ── Veldrid / ImGui ───────────────────────────────────────
+        private readonly Sdl2Window         _window;
+        private readonly GraphicsDevice     _graphicsDevice;
+        private readonly ImGuiController    _imguiController;
+        private readonly CommandList        _commandList;
 
-        _imguiController = new ImGuiController(
-            graphicsDevice,
-            graphicsDevice.MainSwapchain.Framebuffer.OutputDescription,
-            window.Width,
-            window.Height);
+        // ── Core state ────────────────────────────────────────────
+        private readonly AppState           _state;
+        private readonly Theme              _theme;
+        private readonly GlobalHotkeys _hotkeys;
+        private readonly Protocol.PacketHandler _packetHandler;
+        private bool _showRestartBanner = false;
 
-        _commandList = graphicsDevice.ResourceFactory.CreateCommandList();
+        // ── Capture ───────────────────────────────────────────────
+        private HyForce.Networking.PipeCaptureServer _pipeServer;
+        private HyForce.Networking.WinDivertCapture? _winDivert;
+        private DateTime _winDivertCheckAt = DateTime.MinValue;
 
-        _state   = AppState.Instance;
-        _theme   = new Theme();
-        _hotkeys = new GlobalHotkeys();
+        // ── Tabs (7 total) ────────────────────────────────────────
+        private readonly List<ITab> _tabs = new();
+        private int _activeTab;
 
-        _packetHandler = new Protocol.PacketHandler(_state);
-        _state.UdpProxy.OnPacket += _packetHandler.ProcessPacket;
+        // ── Frame state ───────────────────────────────────────────
+        private float _dt;
+        private float _fpsSmooth = 60f;
+        private bool _showAbout;
 
-        InitializeTabs();
-        SetupImGuiStyle();
-
-        var correlator = _tabs.OfType<ActionCorrelatorTab>().FirstOrDefault();
-        if (correlator != null)
-            _hotkeys.OnCorrelatorCapture += correlator.TriggerCapture;
-    }
-
-    private void InitializeTabs()
-    {
-        var inspector = new PacketInspectorTab(_state);
-        var feed      = new PacketFeedTab(_state, inspector);
-
-        _tabs.Add(new ConnectTab(_state));
-        _tabs.Add(new ItemsTab(_state));
-        _tabs.Add(feed);
-        _tabs.Add(new OpcodeManager(_state));
-        _tabs.Add(new SecurityAuditTab(_state));
-        _tabs.Add(new LogTab(_state));
-        _tabs.Add(new MemoryAnalysisTab(_state));
-        _tabs.Add(new ActionCorrelatorTab(_state));
-        _tabs.Add(new DecryptionTab(_state));
-        _tabs.Add(new InjectionTab(_state));   // DLL injection capture (no proxy needed)
-        _tabs.Add(new SettingsTab(_state));
-        _tabs.Add(new PacketAnalyticsTab(_state));
-        _tabs.Add(inspector);
-        _tabs.Add(new RegistryTab(_state));
-        _tabs.Add(new DecryptionStatsWindow(_state));
-    }
-
-    private void SetupImGuiStyle()
-    {
-        var io = ImGui.GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard;
-
-        // ── Global style — makes the whole UI look more polished and readable ──
-        var style = ImGui.GetStyle();
-
-        // Geometry
-        style.WindowRounding    = 6f;
-        style.FrameRounding     = 4f;
-        style.GrabRounding      = 4f;
-        style.PopupRounding     = 4f;
-        style.ScrollbarRounding = 4f;
-        style.TabRounding       = 4f;
-        style.ChildRounding     = 4f;
-
-        // Spacing — generous padding so everything breathes
-        style.WindowPadding     = new Vector2(10f, 8f);
-        style.FramePadding      = new Vector2(8f,  5f);
-        style.ItemSpacing       = new Vector2(8f,  5f);
-        style.ItemInnerSpacing  = new Vector2(6f,  4f);
-        style.CellPadding       = new Vector2(6f,  4f);
-        style.IndentSpacing     = 16f;
-
-        // Sizes
-        style.ScrollbarSize     = 10f;
-        style.GrabMinSize       = 8f;
-        style.WindowBorderSize  = 1f;
-        style.ChildBorderSize   = 1f;
-        style.PopupBorderSize   = 1f;
-        style.FrameBorderSize   = 0f;
-        style.TabBorderSize     = 0f;
-
-        // Separators
-        style.SeparatorTextBorderSize = 2f;
-
-        _theme.Apply();
-    }
-
-    // -------------------------------------------------------------------------
-    public void Run()
-    {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        double prev = 0;
-
-        while (_window.Exists)
+        public HyForceApp(Sdl2Window window, GraphicsDevice graphicsDevice)
         {
-            double cur = sw.Elapsed.TotalSeconds;
-            double dt  = cur - prev;
-            prev = cur;
+            _window = window;
+            _graphicsDevice = graphicsDevice;
 
-            var snap = _window.PumpEvents();
-            if (!_window.Exists) break;
+            _imguiController = new ImGuiController(
+                graphicsDevice,
+                graphicsDevice.MainSwapchain.Framebuffer.OutputDescription,
+                window.Width, window.Height);
 
-            _hotkeys.Poll();
-            _imguiController.Update((float)dt, snap);
-            RenderFrame();
+            _commandList = graphicsDevice.ResourceFactory.CreateCommandList();
 
+            _state = AppState.Instance;
+            _theme = new Theme();
+            // dll crashes can happen, so we set up handlers to ensure we eject cleanly and don't leave the game in a bad state
+            SetupCrashHandlers();
+
+            _hotkeys = new GlobalHotkeys();
+            _packetHandler = new Protocol.PacketHandler(_state);
+
+            // Pipe server (DLL injection capture)
+            _pipeServer = new HyForce.Networking.PipeCaptureServer(_state);
+            _pipeServer.OnPacketReceived += pkt => _state.OnHookPacket(pkt);
+            _pipeServer.Start();
+
+            // WinDivert auto-start check: if DLL shows 0 packets after 30s
+            _winDivertCheckAt = DateTime.Now.AddSeconds(30);
+
+            // ── Register the 7 tabs ───────────────────────────────
+            _tabs.Add(new PacketFeedTab(_state));
+            _tabs.Add(new DecryptionTab(_state));
+            _tabs.Add(new MemoryResearchTab(_state, _pipeServer));
+            _tabs.Add(new ProtocolLabTab(_state, _pipeServer));
+            _tabs.Add(new InjectionTab(_state, _pipeServer));
+            _tabs.Add(new LogTab(_state));
+            _tabs.Add(new SettingsTab(_state));
+
+
+        }
+
+        // ─── Main update/render loop ──────────────────────────────
+        public void Update(float deltaSeconds)
+        {
+            _dt = deltaSeconds;
+            _fpsSmooth = _fpsSmooth * 0.95f + (1f / Math.Max(deltaSeconds, 0.0001f)) * 0.05f;
+
+            // WinDivert auto-fallback
+            if (_winDivert == null && DateTime.Now > _winDivertCheckAt &&
+                _pipeServer.IsRunning && _pipeServer.PacketCount == 0 &&
+                HyForce.Networking.WinDivertCapture.IsAvailable)
+            {
+                _winDivert = new HyForce.Networking.WinDivertCapture(_state);
+                _winDivert.OnPacket += pkt => _state.OnHookPacket(pkt);
+                bool ok = _winDivert.Start();
+                _state.AddInGameLog(ok
+                    ? "[WINDIVERT] Auto-started (DLL hooks: 0 packets after 30s)"
+                    : "[WINDIVERT] Auto-start failed — run as Administrator");
+                _winDivertCheckAt = DateTime.Now.AddSeconds(300);
+            }
+
+            _state.CheckForNewKeys();
+
+        }
+
+
+        // ─── Render ───────────────────────────────────────────────
+        public void Render(float deltaSeconds, InputSnapshot snapshot)
+        {
+            _imguiController.Update(deltaSeconds, snapshot);
+            _theme.Apply();
+
+            if (_state.ShowRestartBanner)
+            {
+                RenderRestartBanner();
+            }
+
+            var vp = ImGui.GetMainViewport();
+            ImGui.SetNextWindowPos(vp.WorkPos);
+            ImGui.SetNextWindowSize(vp.WorkSize);
+            ImGui.SetNextWindowViewport(vp.ID);
+
+            ImGui.Begin("##root",
+                ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove |
+                ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoSavedSettings |
+                ImGuiWindowFlags.NoBringToFrontOnFocus);
+
+            RenderTitleBar();
+            RenderTabBar();
+
+            ImGui.End();
+
+            if (_showAbout) RenderAbout();
+
+            // Render to GPU
             _commandList.Begin();
             _commandList.SetFramebuffer(_graphicsDevice.MainSwapchain.Framebuffer);
-            _commandList.ClearColorTarget(0, new RgbaFloat(
-                Theme.Current?.WindowBg.X ?? 0.08f,
-                Theme.Current?.WindowBg.Y ?? 0.08f,
-                Theme.Current?.WindowBg.Z ?? 0.10f, 1f));
+            _commandList.ClearColorTarget(0, new RgbaFloat(0.05f, 0.05f, 0.06f, 1f));
             _imguiController.Render(_graphicsDevice, _commandList);
             _commandList.End();
-
             _graphicsDevice.SubmitCommands(_commandList);
             _graphicsDevice.SwapBuffers(_graphicsDevice.MainSwapchain);
-        }
 
-        _state.Dispose();
-    }
-
-    // -------------------------------------------------------------------------
-    private void RenderFrame()
-    {
-        var vp = ImGui.GetMainViewport();
-        ImGui.SetNextWindowPos(vp.WorkPos);
-        ImGui.SetNextWindowSize(vp.WorkSize);
-        ImGui.SetNextWindowViewport(vp.ID);
-
-        var flags =
-            ImGuiWindowFlags.MenuBar              |
-            ImGuiWindowFlags.NoTitleBar            |
-            ImGuiWindowFlags.NoCollapse            |
-            ImGuiWindowFlags.NoResize              |
-            ImGuiWindowFlags.NoMove                |
-            ImGuiWindowFlags.NoBringToFrontOnFocus |
-            ImGuiWindowFlags.NoNavFocus            |
-            ImGuiWindowFlags.NoBackground;
-
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding,   0f);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f);
-        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding,    new Vector2(0, 0));
-        ImGui.Begin("##main", flags);
-        ImGui.PopStyleVar(3);
-
-        RenderMenuBar();
-        RenderDiagBar();
-        RenderTabBar();
-
-        float contentH = ImGui.GetContentRegionAvail().Y;
-        ImGui.BeginChild("##content", new Vector2(0, contentH), ImGuiChildFlags.None);
-        try
-        {
-            _tabs[_selectedTab].Render();
-        }
-        catch (Exception ex)
-        {
-            ImGui.TextColored(Theme.ColDanger, $"TAB ERROR: {ex.Message}");
-            _state.AddInGameLog($"[TAB ERROR] {_tabs[_selectedTab].Name}: {ex.Message}");
-        }
-        ImGui.EndChild();
-
-        ImGui.End();
-
-        _hotkeys.RenderOverlay();
-        if (_state.ShowAboutWindow) RenderAboutWindow();
-        if (_showThemePopup)        RenderThemePopup();
-    }
-
-    // -- Menu bar -------------------------------------------------------------
-    private void RenderMenuBar()
-    {
-        if (!ImGui.BeginMenuBar()) return;
-
-        ImGui.PushStyleColor(ImGuiCol.Text, Theme.ColAccent);
-        ImGui.Text("HYFORCE");
-        ImGui.PopStyleColor();
-        ImGui.SameLine();
-        ImGui.TextColored(Theme.ColTextMuted, "v23");
-        ImGui.SameLine(0, 16);
-
-        if (ImGui.BeginMenu("File"))
-        {
-            if (ImGui.MenuItem("Export Diagnostics", "Ctrl+E")) ExportDiagnostics();
-            if (ImGui.MenuItem("Export Packet Log", "Ctrl+P")) ExportPacketLog();
-            if (ImGui.MenuItem("Export All Logs", "Ctrl+Shift+E")) ExportAllLogs();
-            ImGui.Separator();
-            if (ImGui.MenuItem("Open Export Folder"))
-                try { System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory); } catch { }
-            ImGui.Separator();
-            if (ImGui.MenuItem("Exit", "Alt+F4")) _window.Close();
-            ImGui.EndMenu();
-        }
-
-        if (ImGui.BeginMenu("View"))
-        {
-            bool ts = _state.Config.ShowTimestamps;
-            if (ImGui.MenuItem("Show Timestamps", "", ts)) _state.Config.ShowTimestamps = !ts;
-            bool asl = _state.Config.AutoScrollLogs;
-            if (ImGui.MenuItem("Auto-scroll Logs", "", asl)) _state.Config.AutoScrollLogs = !asl;
-            ImGui.Separator();
-            if (ImGui.MenuItem("Change Theme...")) _showThemePopup = !_showThemePopup;
-            ImGui.EndMenu();
-        }
-
-        // === ENCRYPTION MENU ===
-        if (ImGui.BeginMenu("Encryption"))
-        {
-            bool autoDecrypt = PacketDecryptor.AutoDecryptEnabled;
-            if (ImGui.MenuItem("Auto-Decrypt Packets", "", autoDecrypt))
+            if (_showRestartBanner && AppState.Instance.NeedsFirstTimeSetup)
             {
-                PacketDecryptor.AutoDecryptEnabled = !autoDecrypt;
-                _state.AddInGameLog(autoDecrypt ? "[CRYPTO] Auto-decrypt disabled" : "[CRYPTO] Auto-decrypt enabled");
-            }
+                ImGui.SetNextWindowPos(ImGui.GetMainViewport().GetCenter(), ImGuiCond.Always, new Vector2(0.5f, 0.5f));
+                ImGui.SetNextWindowSize(new Vector2(500, 200), ImGuiCond.Always);
 
-            ImGui.Separator();
-
-            if (ImGui.MenuItem("Clear All Keys", "Ctrl+K"))
-            {
-                PacketDecryptor.ClearKeys();
-                _state.AddInGameLog("[CRYPTO] All encryption keys cleared");
-            }
-
-            if (ImGui.MenuItem("Clear Key Log File", "Ctrl+L"))
-            {
-                _state.ClearKeyLogFile();
-            }
-
-            if (ImGui.MenuItem("Prepare Fresh Key Log", "Ctrl+F"))
-            {
-                // Call the AppState version which handles everything properly
-                _state.ClearKeyLogFile();
-                // Create new session file
-                string sessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                string keyLogPath = Path.Combine(_state.ExportDirectory, $"sslkeys_session_{sessionId}.log");
-                Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.Process);
-                File.WriteAllText(keyLogPath, "# Fresh session key log - prepared by HyForce\r\n");
-                _state.AddInGameLog($"[KEYLOG] Fresh key log ready: {Path.GetFileName(keyLogPath)}");
-                _state.AddInGameLog("[KEYLOG] >>> NOW START HYTALE <<<");
-            }
-
-            ImGui.Separator();
-
-            if (ImGui.MenuItem("Open Key Log Folder"))
-            {
-                try
+                if (ImGui.Begin("Restart Required##restart", ref _showRestartBanner,
+                    ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoResize))
                 {
-                    System.Diagnostics.Process.Start("explorer.exe", _state.ExportDirectory);
+                    ImGui.TextColored(new Vector4(1f, 0.3f, 0.2f, 1f), "⚠️ HYTALE RESTART REQUIRED");
+                    ImGui.Separator();
+                    ImGui.TextWrapped(
+                        "SSLKEYLOGFILE has been configured for automatic key capture, " +
+                        "but Hytale was already running.\n\n" +
+                        "1. Close Hytale completely (check system tray)\n" +
+                        "2. Restart Hytale\n" +
+                        "3. Keys will appear automatically in the Decryption tab");
+
+                    if (ImGui.Button("I've Restarted Hytale", new Vector2(200, 40)))
+                    {
+                        _showRestartBanner = false;
+                        AppState.Instance.ForceReImportKeys();
+                    }
+
+                    ImGui.SameLine();
+                    if (ImGui.Button("Dismiss", new Vector2(100, 40)))
+                    {
+                        _showRestartBanner = false;
+                    }
                 }
-                catch { }
+                ImGui.End();
             }
+        }
 
-            // Show current key status
-            var keyStatus = _state.GetKeyStatus();
+        private void RenderTitleBar()
+        {
+            var live    = _pipeServer.DllConnected;
+            var dllCol  = live ? new Vector4(0.1f,1f,0.4f,1f) : new Vector4(0.5f,0.5f,0.5f,1f);
+            var pktCol  = _pipeServer.PacketCount > 0 ? new Vector4(0.2f,0.8f,1f,1f) : new Vector4(0.5f,0.5f,0.5f,1f);
+            var decCol  = AppState.Instance.PacketLog.TotalDecrypted > 0
+                ? new Vector4(0.9f,0.6f,0.1f,1f) : new Vector4(0.5f,0.5f,0.5f,1f);
+
+            ImGui.TextColored(new Vector4(0.4f,0.8f,1f,1f), "HyForce");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.4f,0.4f,0.4f,1f), "v23");
+            ImGui.SameLine(0, 24);
+            ImGui.TextColored(dllCol, live ? "● DLL" : "○ DLL");
+            ImGui.SameLine(0, 12);
+            ImGui.TextColored(pktCol, $"▲ {_pipeServer.PacketCount:N0}");
+            ImGui.SameLine(0, 12);
+            ImGui.TextColored(decCol, $"🔓 {AppState.Instance.PacketLog.TotalDecrypted:N0}");
+            ImGui.SameLine(0, 12);
+            ImGui.TextColored(new Vector4(0.5f,0.5f,0.5f,1f), $"{_fpsSmooth:F0}fps");
+            ImGui.SameLine(ImGui.GetContentRegionAvail().X - 48);
+            if (ImGui.SmallButton("About")) _showAbout = !_showAbout;
             ImGui.Separator();
-            ImGui.TextColored(Theme.ColTextMuted, $"Keys: {keyStatus.TotalKeys} | Success: {keyStatus.SuccessfulDecryptions} | Failed: {keyStatus.FailedDecryptions}");
-
-            ImGui.EndMenu();
         }
 
-        if (ImGui.BeginMenu("Tools"))
+        private void RenderTabBar()
         {
-            if (ImGui.MenuItem("Clear All Data")) _state.ClearAll();
-            if (ImGui.MenuItem("Generate Diagnostics Report"))
-            { _state.GenerateDiagnostics(); _state.AddInGameLog("Diagnostics generated"); }
-            ImGui.Separator();
-            if (ImGui.MenuItem("Memory Scanner", "Ctrl+M")) SwitchToTab<MemoryAnalysisTab>();
-            if (ImGui.MenuItem("Quick Memory Scan", "Ctrl+Shift+M")) _state.TriggerMemoryScan();
-            ImGui.EndMenu();
-        }
-
-        if (ImGui.BeginMenu("Help"))
-        {
-            if (ImGui.MenuItem("About HyForce")) _state.ShowAboutWindow = true;
-            ImGui.EndMenu();
-        }
-
-        ImGui.EndMenuBar();
-    }
-
-    // -- Diagnostic bar -------------------------------------------------------
-    private void RenderDiagBar()
-    {
-        // Bright glowing bottom border on the diag bar
-        var diagBg = Theme.Current?.ChildBg ?? Theme.ColBg3;
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, diagBg);
-        ImGui.BeginChild("##diagbar", new Vector2(0, 24), ImGuiChildFlags.None);
-
-        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + 2); // vertical center
-
-        bool udpOk = _state.UdpProxy.IsRunning;
-        bool tcpOk = _state.TcpProxy.IsRunning;
-        Pill("UDP", udpOk); ImGui.SameLine(0, 6);
-        Pill("TCP", tcpOk);
-
-        DiagSep();
-
-        // Packet counts
-        DiagVal("C>S", $"{_state.PacketLog.PacketsCs:N0}", Theme.ColSuccess);
-        ImGui.SameLine(0, 6);
-        DiagVal("S>C", $"{_state.PacketLog.PacketsSc:N0}", Theme.ColAccent);
-
-        DiagSep();
-
-        // Key/decryption status
-        int keys = PacketDecryptor.DiscoveredKeys.Count;
-        DiagVal("Keys", $"{keys}", keys > 0 ? Theme.ColSuccess : Theme.ColDanger);
-        ImGui.SameLine(0, 6);
-        DiagVal("Dec",  $"{PacketDecryptor.SuccessfulDecryptions:N0}", Theme.ColSuccess);
-        if (PacketDecryptor.FailedDecryptions > 0)
-        {
-            ImGui.SameLine(0, 6);
-            DiagVal("Fail", $"{PacketDecryptor.FailedDecryptions:N0}", Theme.ColWarn);
-        }
-
-        DiagSep();
-
-        int items = Protocol.RegistrySyncParser.NumericIdToName.Count;
-        DiagVal("Items", $"{items:N0}", items > 0 ? Theme.ColAccent : Theme.ColTextMuted);
-
-        DiagSep();
-        ImGui.TextColored(Theme.ColTextMuted, "F8:Cap");
-
-        // Right-aligned: session timer + theme button
-        // Use SameLine with a fixed offset from window right so it never overlaps left content
-        string sessionStr = _state.StartTime.HasValue
-            ? FormatDuration(DateTime.Now - _state.StartTime.Value)
-            : "idle";
-
-        // Reserve 160px on the right for timer + theme button
-        const float RIGHT_RESERVE = 160f;
-        float rX = ImGui.GetWindowWidth() - RIGHT_RESERVE;
-        float curX = ImGui.GetCursorPosX();
-        if (rX > curX + 20) ImGui.SetCursorPosX(rX);
-
-        // Session timer (just text, compact)
-        ImGui.TextColored(Theme.ColTextMuted, sessionStr);
-        ImGui.SameLine(0, 8);
-
-        // Theme button — fixed 90px width so it never wraps
-        var ac = Theme.ColAccent;
-        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(ac.X*.18f, ac.Y*.18f, ac.Z*.18f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(ac.X*.30f, ac.Y*.30f, ac.Z*.30f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.Text,          ac);
-        ImGui.PushStyleColor(ImGuiCol.Border,        ac with { W = .70f });
-        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8f);
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding,  new Vector2(5f, 1f));
-        if (ImGui.Button("[T]##theme", new Vector2(32, 0)))
-            _showThemePopup = !_showThemePopup;
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip($"Theme: {Theme.CurrentThemeName}");
-        ImGui.PopStyleVar(2);
-        ImGui.PopStyleColor(4);
-
-        ImGui.EndChild();
-        ImGui.PopStyleColor();
-
-        // Accent separator line under diag bar
-        var drawList = ImGui.GetWindowDrawList();
-        var p0 = ImGui.GetCursorScreenPos();
-        drawList.AddLine(p0, new System.Numerics.Vector2(p0.X + ImGui.GetWindowWidth(), p0.Y),
-            ImGui.ColorConvertFloat4ToU32(Theme.ColAccent with { W = .25f }), 1f);
-        ImGui.Separator();
-    }
-
-    private static void DiagVal(string label, string val, System.Numerics.Vector4 valCol)
-    {
-        ImGui.TextColored(Theme.ColTextMuted, label);
-        ImGui.SameLine(0, 3);
-        ImGui.TextColored(valCol, val);
-    }
-
-    private static void Pill(string label, bool ok)
-    {
-        var col   = ok ? Theme.ColSuccess : Theme.ColDanger;
-        var bgCol = new Vector4(col.X*.25f, col.Y*.25f, col.Z*.25f, 1f);
-        ImGui.PushStyleColor(ImGuiCol.Button,        bgCol);
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, bgCol);
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  bgCol);
-        ImGui.PushStyleColor(ImGuiCol.Text,          col);
-        ImGui.PushStyleColor(ImGuiCol.Border,        col with { W = .6f });
-        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8f);
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding,  new Vector2(6f, 1f));
-        ImGui.SmallButton(ok ? $"{label} ON" : $"{label} OFF");
-        ImGui.PopStyleVar(2);
-        ImGui.PopStyleColor(5);
-    }
-    private static void DiagSep()
-    {
-        ImGui.SameLine(0, 8);
-        ImGui.TextColored(new Vector4(.28f,.28f,.28f,1f), "|");
-        ImGui.SameLine(0, 8);
-    }
-
-    // -- Tab bar: fixed compact padding, horizontal scroll if needed ----------
-    private void RenderTabBar()
-    {
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, Theme.Current?.ChildBg ?? Theme.ColBg3);
-        // Tall enough to look good, narrow enough to not eat content space
-        ImGui.BeginChild("##tabbar", new Vector2(0, 28),
-            ImGuiChildFlags.None, ImGuiWindowFlags.HorizontalScrollbar);
-
-        // Compact fixed padding: 10px horizontal, 4px vertical — tabs never truncate
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing,  new Vector2(1, 0));
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(10, 4));
-
-        var dl = ImGui.GetWindowDrawList();
-
-        for (int i = 0; i < _tabs.Count; i++)
-        {
-            bool sel = _selectedTab == i;
-
-            if (sel)
+            if (!ImGui.BeginTabBar("##main")) return;
+            for (int i = 0; i < _tabs.Count; i++)
             {
-                var ac = Theme.ColAccent;
-                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(ac.X*.14f, ac.Y*.14f, ac.Z*.14f, 1f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(ac.X*.22f, ac.Y*.22f, ac.Z*.22f, 1f));
+                bool open = ImGui.BeginTabItem(_tabs[i].Name + $"##t{i}");
+                if (open)
+                {
+                    _activeTab = i;
+                    _tabs[i].Render();
+                    ImGui.EndTabItem();
+                }
             }
-            else
-            {
-                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0,0,0,0));
-                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(.06f,.06f,.08f,.8f));
-            }
-            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0,0,0,0));
-            ImGui.PushStyleColor(ImGuiCol.Text,   sel ? Theme.ColAccent : Theme.ColTextMuted);
-            ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(0,0,0,0)); // no per-button border
-
-            if (ImGui.Button(_tabs[i].Name)) _selectedTab = i;
-            ImGui.PopStyleColor(5);
-
-            // Scroll to active tab on first frame / when tab changes
-            if (sel && ImGui.IsItemVisible())
-                ImGui.SetScrollHereX(0.5f);
-
-            // Glowing underline
-            if (sel)
-            {
-                var mn = ImGui.GetItemRectMin();
-                var mx = ImGui.GetItemRectMax();
-                var ac = Theme.ColAccent;
-                dl.AddLine(new Vector2(mn.X+2, mx.Y-1), new Vector2(mx.X-2, mx.Y-1),
-                    ImGui.ColorConvertFloat4ToU32(ac with { W = .25f }), 3f);
-                dl.AddLine(new Vector2(mn.X+2, mx.Y-1), new Vector2(mx.X-2, mx.Y-1),
-                    ImGui.ColorConvertFloat4ToU32(ac), 1.5f);
-            }
-
-            if (i < _tabs.Count - 1) ImGui.SameLine();
+            ImGui.EndTabBar();
         }
 
-        ImGui.PopStyleVar(2);
-        ImGui.EndChild();
-        ImGui.PopStyleColor();
-
-        var p0 = ImGui.GetCursorScreenPos();
-        ImGui.GetWindowDrawList().AddLine(p0, new Vector2(p0.X + ImGui.GetWindowWidth(), p0.Y),
-            ImGui.ColorConvertFloat4ToU32(Theme.ColAccent with { W = .15f }), 1f);
-        ImGui.Separator();
-    }
-
-    // -- Theme popup ----------------------------------------------------------
-    private void RenderThemePopup()
-    {
-        var io = ImGui.GetIO();
-        ImGui.SetNextWindowPos(new Vector2(io.DisplaySize.X - 290, 50), ImGuiCond.Always);
-        ImGui.SetNextWindowSize(new Vector2(280, 0), ImGuiCond.Always);
-
-        ImGui.Begin("##themepopup", ref _showThemePopup,
-            ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize |
-            ImGuiWindowFlags.NoMove     | ImGuiWindowFlags.NoScrollbar);
-
-        ImGui.TextColored(Theme.ColAccent, "THEME SELECTOR");
-        ImGui.Separator();
-
-        foreach (var group in Theme.AllThemes.Values.Select(t => t.Group).Distinct())
+        private void RenderAbout()
         {
-            ImGui.TextColored(Theme.ColTextMuted, group.ToUpper());
-            ImGui.Separator();
-            foreach (var (key, def) in Theme.AllThemes.Where(kv => kv.Value.Group == group))
+            ImGui.SetNextWindowSize(new Vector2(380, 220), ImGuiCond.Always);
+            ImGui.SetNextWindowPos(ImGui.GetMainViewport().GetCenter(), ImGuiCond.Always, new Vector2(0.5f, 0.5f));
+            if (ImGui.Begin("About HyForce##about", ref _showAbout))
             {
-                bool active = Theme.CurrentThemeName == key;
-                ImGui.PushStyleColor(ImGuiCol.Button,        active ? def.Accent : def.AccentDim);
-                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, def.AccentMid);
-                if (ImGui.Button($"[#]##{key}", new Vector2(20, 20)))
-                { Theme.SwitchTo(key); _showThemePopup = false; }
-                ImGui.PopStyleColor(2);
+                ImGui.TextColored(new Vector4(0.4f, 0.8f, 1f, 1f), "HyForce v23");
+                ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Hytale Security Research Tool");
+                ImGui.Separator();
+                ImGui.Spacing();
+                ImGui.Text("Tabs: Packets · Decryption · Memory");
+                ImGui.Text("      Protocol Lab · Injection · Log · Settings");
+                ImGui.Spacing();
+                ImGui.Text("DLL capture: WSASendTo + sendto + WSARecvFrom + recvfrom");
+                ImGui.Text("Fallback:    WinDivert kernel-level capture");
+                ImGui.Text("Decryption:  QUIC/TLS HKDF RFC9001_NoPrefix");
+            }
+            ImGui.End();
+        }
+        private void RenderRestartBanner()
+        {
+            var center = ImGui.GetMainViewport().GetCenter();
+            ImGui.SetNextWindowPos(center, ImGuiCond.Always, new Vector2(0.5f, 0.5f));
+            ImGui.SetNextWindowSize(new Vector2(500, 200), ImGuiCond.Always);
+            bool show = _state.ShowRestartBanner;
+            if (ImGui.Begin("Restart Required##restart", ref show,
+                ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.Modal))
+            {
+                ImGui.TextColored(new Vector4(1f, 0.3f, 0.2f, 1f), "HYTALE RESTART REQUIRED");
+                ImGui.Separator();
+                ImGui.TextWrapped("SSLKEYLOGFILE configured. Close Hytale completely (system tray!), then restart it.");
+                if (ImGui.Button("I've Restarted Hytale", new Vector2(180, 40)))
+                {
+                    show = false;
+                    _state.ForceReImportKeys();
+                }
                 ImGui.SameLine();
-                if (active) ImGui.PushStyleColor(ImGuiCol.Text, def.Accent);
-                if (ImGui.Selectable(def.Name, active))
-                { Theme.SwitchTo(key); _showThemePopup = false; }
-                if (active) ImGui.PopStyleColor();
+                if (ImGui.Button("Dismiss", new Vector2(100, 40))) show = false;
             }
-            ImGui.Spacing();
+            ImGui.End();
+            _state.ShowRestartBanner = show;
         }
 
-        ImGui.Separator();
-        if (ImGui.Button("Close", new Vector2(-1, 22))) _showThemePopup = false;
-        ImGui.End();
-    }
-
-    // -- About ----------------------------------------------------------------
-    private void RenderAboutWindow()
-    {
-        ImGui.SetNextWindowSize(new Vector2(460, 420), ImGuiCond.FirstUseEver);
-        ImGui.SetNextWindowPos(ImGui.GetIO().DisplaySize * 0.5f, ImGuiCond.FirstUseEver, new Vector2(0.5f, 0.5f));
-        bool show = _state.ShowAboutWindow;
-        if (ImGui.Begin("About HyForce", ref show, ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoResize))
+        private void SetupCrashHandlers()
         {
-            _state.ShowAboutWindow = show;
-            float w = ImGui.GetWindowWidth();
-            ImGui.Spacing();
-            CenterText(Constants.BuildName,    Theme.ColAccent);
-            ImGui.Spacing();
-            CenterText(Constants.AppSubtitle,  Theme.ColTextMuted);
-            ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing();
-            ImGui.Text($"Version:    {Constants.BuildVersion}");
-            ImGui.Text($"Build Date: {Constants.BuildDate}");
-            ImGui.Text($"Theme:      {Theme.CurrentThemeName}");
-            ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing();
-            ImGui.TextWrapped("HyForce is a network security analysis tool for Hytale. " +
-                "Captures and analyses QUIC/UDP gameplay and TCP registry traffic.");
-            ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing();
-            var st = _state.GetKeyStatus();
-            ImGui.TextColored(Theme.ColAccent, "Decryption Status");
-            ImGui.Text($"Keys:      {st.TotalKeys}");
-            ImGui.Text($"Decrypted: {st.SuccessfulDecryptions}");
-            ImGui.Text($"Failed:    {st.FailedDecryptions}");
-            if (st.LastKeyAdded.HasValue)
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
             {
-                var ago = DateTime.Now - st.LastKeyAdded.Value;
-                ImGui.TextColored(Theme.ColTextMuted,
-                    $"Last key:  {(ago.TotalMinutes < 1 ? "just now" : $"{ago.TotalMinutes:F0}m ago")}");
+                _state.AddInGameLog("[CRASH] Unhandled exception - forcing DLL eject");
+
+                // Find InjectionTab and call ejection
+                var injectTab = _tabs.OfType<InjectionTab>().FirstOrDefault();
+                injectTab?.OnApplicationClosing();
+
+                // Give it a moment to eject
+                Thread.Sleep(500);
+            };
+
+            TaskScheduler.UnobservedTaskException += (s, e) =>
+            {
+                _state.AddInGameLog("[CRASH] Unobserved task exception - forcing DLL eject");
+
+                var injectTab = _tabs.OfType<InjectionTab>().FirstOrDefault();
+                injectTab?.OnApplicationClosing();
+
+                e.SetObserved();
+            };
+        }
+
+        public void Run()
+        {
+            while (_window.Exists)
+            {
+                var snapshot = _window.PumpEvents();  // Use PumpEvents(), not GetSnapshot()
+
+                if (!_window.Exists)
+                    break;
+
+                float deltaSeconds = 1f / 60f;
+
+                Update(deltaSeconds);
+                Render(deltaSeconds, snapshot);  // Pass snapshot to Render
             }
-            ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing();
-            ImGui.SetCursorPosX((w - 100f) * .5f);
-            if (ImGui.Button("Close", new Vector2(100f, 28))) _state.ShowAboutWindow = false;
         }
-        ImGui.End();
-        _hotkeys.RenderOverlay();
-        _state.ShowAboutWindow = show;
-    }
 
-    // -- Helpers --------------------------------------------------------------
-    private void SwitchToTab<T>() where T : ITab
-    {
-        for (int i = 0; i < _tabs.Count; i++)
-            if (_tabs[i] is T) { _selectedTab = i; return; }
-    }
-    private static void CenterText(string t, Vector4 c)
-    {
-        ImGui.SetCursorPosX((ImGui.GetWindowWidth() - ImGui.CalcTextSize(t).X) * .5f);
-        ImGui.TextColored(c, t);
-    }
-    private static string FormatDuration(TimeSpan t)
-    {
-        if (t.TotalHours >= 1) return $"{(int)t.TotalHours}h {t.Minutes:D2}m";
-        if (t.TotalMinutes >= 1) return $"{t.Minutes}m {t.Seconds:D2}s";
-        return $"{t.Seconds}s";
-    }
+        // FILE: .\App\HyForceApp.cs
+        // REPLACE the existing Dispose() method with this:
 
-    
+        public void Dispose()
+        {
+            // NEW: Eject DLL before closing if injected
+            // Must do this BEFORE stopping pipe server
+            var injectTab = _tabs.OfType<InjectionTab>().FirstOrDefault();
+            injectTab?.OnApplicationClosing();
 
-    // -- Exports --------------------------------------------------------------
-    private void ExportDiagnostics()
-    {
-        try
-        {
-            string p = Path.Combine(_state.ExportDirectory, $"hyforce_diagnostics_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-            File.WriteAllText(p, _state.GenerateDiagnostics());
-            _state.AddInGameLog($"[OK] Diagnostics -> {Path.GetFileName(p)}");
+            // Small delay to allow ejection to complete
+            Thread.Sleep(200);
+
+            _pipeServer.Stop();
+            _winDivert?.Stop();
+            _hotkeys.Dispose();
+            _imguiController.Dispose();
+            _commandList.Dispose();
+            _graphicsDevice.Dispose();
         }
-        catch (Exception ex) { _state.AddInGameLog($"[ERR] {ex.Message}"); }
-    }
-    private void ExportPacketLog()
-    {
-        try
-        {
-            string p = Path.Combine(_state.ExportDirectory, $"hyforce_packets_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-            File.WriteAllText(p, _state.ExportPacketLog());
-            _state.AddInGameLog($"[OK] Packets -> {Path.GetFileName(p)}");
-        }
-        catch (Exception ex) { _state.AddInGameLog($"[ERR] {ex.Message}"); }
-    }
-    private void ExportAllLogs()
-    {
-        try
-        {
-            string ts    = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            string base_ = Path.Combine(_state.ExportDirectory, $"hyforce_export_{ts}");
-            Directory.CreateDirectory(base_);
-            File.WriteAllText(Path.Combine(base_, "diagnostics.txt"), _state.GenerateDiagnostics());
-            File.WriteAllText(Path.Combine(base_, "packets.txt"),      _state.ExportPacketLog());
-            File.WriteAllLines(Path.Combine(base_, "ingame_log.txt"),  _state.InGameLog.ToArray());
-            _state.AddInGameLog($"[OK] Full export -> {base_}");
-            try { System.Diagnostics.Process.Start("explorer.exe", base_); } catch { }
-        }
-        catch (Exception ex) { _state.AddInGameLog($"[ERR] ExportAll: {ex.Message}"); }
     }
 }

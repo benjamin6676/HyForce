@@ -21,7 +21,6 @@ public class PacketFeedTab : ITab
 
     // -- Core state ------------------------------------------------------------
     private readonly AppState         _state;
-    private PacketInspectorTab?       _inspector;
     private PacketLogEntry?           _selectedPacket;
 
     // Filter flags
@@ -57,10 +56,9 @@ public class PacketFeedTab : ITab
         ["Movement"]   = new[] { (ushort)0x6C },
     };
 
-    public PacketFeedTab(AppState state, PacketInspectorTab? inspector = null)
+    public PacketFeedTab(AppState state)
     {
         _state     = state;
-        _inspector = inspector;
         if (_excludeHandshake) _excluded.Add(0x0000);
     }
 
@@ -136,7 +134,11 @@ public class PacketFeedTab : ITab
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Proxy running status");
         ImGui.SameLine(0, 10);
 
-        ImGui.TextColored(Theme.ColTextMuted, $"{_state.PacketLog.TotalPackets:N0} pkts");
+        long total = _state.PacketLog.TotalPackets;
+        ImGui.TextColored(total > 0 ? new System.Numerics.Vector4(0.2f,1f,0.4f,1f) : Theme.ColTextMuted,
+            $"{total:N0} pkts");
+        ImGui.SameLine();
+        ImGui.TextColored(Theme.ColTextMuted, $"| UDP:{_state.PacketLog.PacketsUdp:N0} TCP:{_state.PacketLog.PacketsTcp:N0}");
         ImGui.SameLine(0, 10);
 
         var acBg = new Vector4(Theme.ColAccent.X*.28f, Theme.ColAccent.Y*.28f, Theme.ColAccent.Z*.28f, 1f);
@@ -257,8 +259,6 @@ public class PacketFeedTab : ITab
                 new Vector2(0, 17)))
             {
                 _selectedPacket = pkt;
-                _inspector?.SelectPacket(pkt);
-                // Auto-open inspector popup when clicking a packet
                 if (!_showInspector) _showInspector = true;
             }
 

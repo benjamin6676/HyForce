@@ -25,10 +25,12 @@ public class PacketLog
     private long _bytesScTotal, _bytesCsTotal, _countSc, _countCs;
     private long _bytesTcpTotal, _countTcp;
     private long _bytesUdpTotal, _countUdp;
+    private long _countDecrypted;
 
     public PacketLog(int maxSize = 5000) { _maxSize = maxSize; }
 
     public long TotalPackets  => _countSc + _countCs;
+    public long TotalDecrypted => _countDecrypted;
     public long PacketsSc     => _countSc;
     public long PacketsCs     => _countCs;
     public long BytesSc       => _bytesScTotal;
@@ -115,6 +117,7 @@ public class PacketLog
             Interlocked.Add(ref _bytesUdpTotal, raw.Length);
             Interlocked.Increment(ref _countUdp);
         }
+        if (pkt.IsDecrypted) Interlocked.Increment(ref _countDecrypted);
     }
 
     // FIX: Copy only the needed tail -- minimise time holding the lock

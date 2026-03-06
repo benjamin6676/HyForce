@@ -1,10 +1,7 @@
 // FILE: Core/AppState.cs - FIXED: Removed duplicate TryAutoDecryptPackets
 using HyForce.Data;
 using HyForce.Networking;
-using HyForce.Protocol;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.IO;
+using Serilog;
 using System.Security.Cryptography;
 using static HyForce.PacketDecryptor;
 
@@ -16,29 +13,21 @@ public class AppState : IDisposable
     public static AppState Instance => _instance.Value;
 
     public Config Config { get; } = new();
-    public UdpProxy UdpProxy { get; }
 
-    // FIX 2: Add TcpProxy property
-    public TcpProxy TcpProxy { get; }
 
     public PacketLog PacketLog { get; }
-    public Networking.DllPipeServer DllPipeServer { get; }
-    public TestLog Log { get; }
-    public PlayerItemDatabase Database { get; }
 
     public string TargetHost { get; set; } = "127.0.0.1";
     public int TargetPort { get; set; } = 5520;
     public int ListenPort { get; set; } = 5521;
 
-    public bool IsRunning => UdpProxy.IsRunning || TcpProxy.IsRunning;
+    public bool IsRunning => false; // proxy removed — capture via DLL hook
     public DateTime? StartTime { get; private set; }
 
     public long TotalPackets => PacketLog.TotalPackets;
     public long UdpPackets => PacketLog.PacketsUdp;
     // FIX 2: Add TcpPackets property
-    public long TcpPackets => PacketLog.PacketsTcp;
 
-    public ConcurrentBag<SecurityEvent> SecurityEvents { get; } = new();
     public bool ShowAboutWindow;
 
     public List<string> InGameLog { get; } = new();
@@ -58,7 +47,6 @@ public class AppState : IDisposable
     private readonly object _sessionLogLock = new();
 
     public event PacketReceivedHandler? OnPacketReceived;
-    public event Action? OnSecurityEvent;
     public event Action? OnMemoryDataUpdated;
     public event Action? OnKeysUpdated;
 
@@ -71,53 +59,38 @@ public class AppState : IDisposable
     private readonly Queue<string> _pendingKeyFiles = new();
     private readonly System.Timers.Timer _retryTimer;
     private readonly PacketReceivedHandler _packetHandlerDelegate;
-    // FIX 2: Add TCP packet handler delegate
-    private readonly PacketReceivedHandler _tcpPacketHandlerDelegate;
+
     private string? _activeKeyLogFile = null;
+    private DateTime _lastKeyCheck = DateTime.MinValue;
+    private long _lastKeyFileSize = 0;
+    private bool _showRestartBanner;
 
     // ── Permanent key log fields ──────────────────────────────────────────
     public  string PermanentKeyLogPath { get; private set; } = "";
     private long   _permFileReadPos    = 0;
     private bool   _permanentLogReady  = false;
+
     public  bool   NeedsFirstTimeSetup => !_permanentLogReady;
+
+    public bool ShowRestartBanner { get; internal set; }
 
     public AppState()
     {
-        DllPipeServer = new Networking.DllPipeServer(this);
-        Log = new TestLog();
-        UdpProxy = new UdpProxy(Log);
-        // FIX 2: Initialize TcpProxy
-        TcpProxy = new TcpProxy(Log);
         PacketLog = new PacketLog(10000);
-        Database = new PlayerItemDatabase();
-
         _packetHandlerDelegate = HandlePacket;
-        UdpProxy.OnPacket += _packetHandlerDelegate;
-
-        // FIX 2: Subscribe to TCP packets
-        _tcpPacketHandlerDelegate = HandlePacket;
-        TcpProxy.OnPacket += _tcpPacketHandlerDelegate;
-
         Directory.CreateDirectory(ExportDirectory);
-        // Create session log file immediately
         SessionLogPath = Path.Combine(ExportDirectory,
             $"hyforce_session_{DateTime.Now:yyyyMMdd_HHmmss}.log");
-
         SetupAutoDecryption();
-
         _retryTimer = new System.Timers.Timer(2000);
         _retryTimer.Elapsed += (s, e) => ProcessPendingKeyFiles();
         _retryTimer.AutoReset = true;
         _retryTimer.Start();
-
-        // Permanent key log -- runs immediately so keys are ready before any UI interaction
+        // Permanent key log setup
         InitPermanentKeyLog();
     }
 
-    public string? GetActiveKeyLogFile()
-    {
-        return _activeKeyLogFile;
-    }
+
 
     // =========================================================================
     // PERMANENT KEY LOG  -- set-once / watch-forever
@@ -133,80 +106,88 @@ public class AppState : IDisposable
     {
         try
         {
-            // ── Use a FIXED path in %APPDATA%\HyForce  ──────────────────────────────
-            // This is INDEPENDENT of ExportDirectory so it never breaks when the user
-            // changes the export folder in Settings. The JVM env-var always points here.
+            // Use FIXED path in %APPDATA%\HyForce
             string hyforceAppData = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 "HyForce");
             Directory.CreateDirectory(hyforceAppData);
             PermanentKeyLogPath = Path.Combine(hyforceAppData, "sslkeys_permanent.log");
 
+            // CRITICAL: Check if User-scope env var is already set correctly
             string? existingUser = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.User);
-            string? existingMachine = Environment.GetEnvironmentVariable("SSLKEYLOGFILE", EnvironmentVariableTarget.Machine);
 
-            bool pointingAtOurs =
-                string.Equals(existingUser, PermanentKeyLogPath, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(existingMachine, PermanentKeyLogPath, StringComparison.OrdinalIgnoreCase);
+            bool needsRestart = false;
 
-            if (!pointingAtOurs)
+            if (string.IsNullOrEmpty(existingUser) ||
+                !string.Equals(existingUser, PermanentKeyLogPath, StringComparison.OrdinalIgnoreCase))
             {
-                // Override: always force the permanent path even if something else was set before
+                // Set it PERMANENTLY for the user
                 try
                 {
                     Environment.SetEnvironmentVariable("SSLKEYLOGFILE", PermanentKeyLogPath, EnvironmentVariableTarget.User);
-                    bool wasOldSession = existingUser?.Contains("sslkeys_session") == true;
-                    if (wasOldSession)
-                        AddInGameLog("[AUTOKEY] Cleared old session log pointer -> now using permanent log");
-                    else
-                        AddInGameLog("[AUTOKEY] Set SSLKEYLOGFILE -> sslkeys_permanent.log (User scope)");
-                    AddInGameLog("[AUTOKEY] *** Restart Hytale ONCE to activate. After that: fully automatic. ***");
-                    _permanentLogReady = false;
+                    AddInGameLog("[AUTOKEY] ✅ Set SSLKEYLOGFILE permanently for your Windows user");
+                    AddInGameLog("[AUTOKEY] 📁 Keys will be saved to: sslkeys_permanent.log");
+                    needsRestart = true;
                 }
-                catch
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        Environment.SetEnvironmentVariable("SSLKEYLOGFILE", PermanentKeyLogPath, EnvironmentVariableTarget.Machine);
-                        AddInGameLog("[AUTOKEY] Set SSLKEYLOGFILE at Machine scope.");
-                        _permanentLogReady = false;
-                    }
-                    catch (Exception ex2)
-                    {
-                        AddInGameLog($"[AUTOKEY] Cannot set env var ({ex2.Message}) -- run as Admin once.");
-                    }
+                    AddInGameLog($"[AUTOKEY] ⚠️ Could not set user env var: {ex.Message}");
+                    // Fallback: try to set at Process level at least
+                    Environment.SetEnvironmentVariable("SSLKEYLOGFILE", PermanentKeyLogPath, EnvironmentVariableTarget.Process);
                 }
             }
             else
             {
+                AddInGameLog("[AUTOKEY] ✅ SSLKEYLOGFILE already configured correctly");
                 _permanentLogReady = true;
-                AddInGameLog("[AUTOKEY] Permanent key log already active -- fully automatic.");
             }
 
+            // Always set for current process (helps if we launch Hytale as child)
             Environment.SetEnvironmentVariable("SSLKEYLOGFILE", PermanentKeyLogPath, EnvironmentVariableTarget.Process);
 
+            // Create empty file if missing (triggers file watcher)
             if (!File.Exists(PermanentKeyLogPath))
-                File.WriteAllText(PermanentKeyLogPath, "# HyForce permanent SSL key log\r\n");
+            {
+                File.WriteAllText(PermanentKeyLogPath,
+                    "# HyForce permanent SSL key log - QUIC/TLS 1.3 keys for Hytale\n" +
+                    "# Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\n");
+            }
 
-            // Watch our permanent log
+            // Start watching the file
             StartPermanentKeyWatcher();
 
-            // ALSO watch the real system sslkeys.log live — Hytale may be writing there right now
-            WatchAllKnownKeyFiles();
-
-            Task.Run(async () =>
+            // CRITICAL: Check if Hytale is running with OLD keys
+            if (needsRestart && IsHytaleRunning())
             {
-                await Task.Delay(1200);
-                // Import all existing key files immediately
-                await ImportAllKnownKeyFiles();
-                // Then also scan the permanent log
-                ImportPermanentKeyLogFull("startup");
-            });
+                AddInGameLog("[AUTOKEY] ⚠️ HYTALE RESTART REQUIRED");
+                AddInGameLog("[AUTOKEY] Close Hytale completely (system tray too), then restart it");
+                ShowHytaleRestartNotification();
+            }
+            else if (!needsRestart)
+            {
+                // Keys are configured, now check if Hytale is running to import keys
+                Task.Run(async () =>
+                {
+                    await Task.Delay(2000);
+                    ImportPermanentKeyLogFull("startup");
+                });
+            }
+
+            // Also watch system-wide sslkeys.log as fallback
+            WatchAllKnownKeyFiles();
         }
         catch (Exception ex)
         {
             AddInGameLog($"[AUTOKEY] Init error: {ex.Message}");
         }
+    }
+
+    
+
+    private void ShowHytaleRestartNotification()
+    {
+        // This shows a prominent banner in the UI
+        _showRestartBanner = true;
     }
 
     // Set up FileSystemWatchers for all known key file locations
@@ -371,6 +352,82 @@ public class AppState : IDisposable
         catch { return 0; }
     }
 
+    public void CheckForNewKeys()
+    {
+        if ((DateTime.Now - _lastKeyCheck).TotalSeconds < 2) return;
+        _lastKeyCheck = DateTime.Now;
+
+        if (!File.Exists(PermanentKeyLogPath)) return;
+
+        var info = new FileInfo(PermanentKeyLogPath);
+        if (info.Length > _lastKeyFileSize)
+        {
+            _lastKeyFileSize = info.Length;
+            ImportPermanentKeyLogIncremental();
+
+            // If we got new keys, notify user
+            if (PacketDecryptor.DiscoveredKeys.Count > 0 && !_permanentLogReady)
+            {
+                _permanentLogReady = true;
+                AddInGameLog($"[AUTOKEY] Keys detected! {PacketDecryptor.DiscoveredKeys.Count} keys loaded automatically");
+                OnKeysUpdated?.Invoke();
+            }
+        }
+    }
+
+    private bool IsHytaleRunning()
+    {
+        return System.Diagnostics.Process.GetProcesses()
+            .Any(p =>
+            {
+                try
+                {
+                    string name = p.ProcessName.ToLowerInvariant();
+                    bool isHytale = name.Contains("hytale");
+                    bool isJava = name.Contains("java") || name.Contains("javaw");
+                    bool hasMemory = p.WorkingSet64 > 200 * 1024 * 1024;
+                    return isHytale || (isJava && hasMemory);
+                }
+                catch { return false; }
+            });
+    }
+
+    public bool GetShowRestartBanner()
+    {
+        return ShowRestartBanner;
+    }
+
+    public void ForceSetupEnvironmentVariable(bool showRestartBanner)
+    {
+        try
+        {
+            Environment.SetEnvironmentVariable("SSLKEYLOGFILE", PermanentKeyLogPath, EnvironmentVariableTarget.User);
+            Environment.SetEnvironmentVariable("SSLKEYLOGFILE", PermanentKeyLogPath, EnvironmentVariableTarget.Process);
+
+            AddInGameLog("[AUTOKEY] SSLKEYLOGFILE set permanently");
+            AddInGameLog("[AUTOKEY] Path: " + PermanentKeyLogPath);
+
+            if (IsHytaleRunning())
+            {
+                AddInGameLog("[AUTOKEY] Please restart Hytale for changes to take effect");
+                showRestartBanner = true;
+            }
+            else
+            {
+                AddInGameLog("[AUTOKEY] Start Hytale now - keys will be captured automatically");
+            }
+
+            _permanentLogReady = false;
+        }
+        catch (Exception ex)
+        {
+            AddInGameLog($"[AUTOKEY] Failed to set env var: {ex.Message}");
+            AddInGameLog("[AUTOKEY] Try running HyForce as Administrator");
+        }
+    }
+
+    
+
     // Call this when you successfully decrypt a packet
     public void PromoteKeyToWorking(EncryptionKey key)
     {
@@ -489,7 +546,7 @@ public class AppState : IDisposable
                 AddInGameLog($"[AUTOKEY] {reason}: {lines.Count} lines, 0 QUIC keys -- Hytale may not be running yet");
             }
         }
-        catch (Exception ex) { Log.Warn($"[AUTOKEY] Full import: {ex.Message}", "AutoKey"); }
+        catch (Exception ex) { Log.Warning($"[AUTOKEY] Full import: {ex.Message}", "AutoKey"); }
     }
 
     // Incremental scan: only reads new bytes appended since last read
@@ -525,7 +582,7 @@ public class AppState : IDisposable
                 _permanentLogReady = true;
             }
         }
-        catch (Exception ex) { Log.Warn($"[AUTOKEY] Incremental: {ex.Message}", "AutoKey"); }
+        catch (Exception ex) { Log.Warning($"[AUTOKEY] Incremental: {ex.Message}", "AutoKey"); }
     }
 
     // Public: UI "Re-Import" button
@@ -542,9 +599,9 @@ public class AppState : IDisposable
     /// </summary>
     public void OnHookPacket(CapturedPacket packet)
     {
-        if (packet?.RawBytes == null || packet.RawBytes.Length < 20) return;
+        if (packet?.RawBytes == null || packet.RawBytes.Length < 4) return;  // was 20, lowered for short QUIC packets
         PacketLog.Add(packet);
-        _packetHandlerDelegate?.Invoke(packet);  
+        _packetHandlerDelegate?.Invoke(packet);
     }
 
     // Public: UI "Clear Log" button -- wipes file and memory keys
@@ -655,11 +712,10 @@ public class AppState : IDisposable
         _autoDecryptTimer.Elapsed += (s, e) =>
         {
             // CRITICAL FIX: Only auto-decrypt if we have keys AND proxy is running
-            if (PacketDecryptor.AutoDecryptEnabled &&
-                PacketDecryptor.DiscoveredKeys.Count > 0 &&
-                IsRunning &&
-                UdpProxy.ActiveSessions > 0)
-            {
+            if (!(!PacketDecryptor.AutoDecryptEnabled ||
+                PacketDecryptor.DiscoveredKeys.Count <= 0 ||
+                !IsRunning)
+!)          {
                 // Run on thread pool to avoid blocking
                 Task.Run(() => TryAutoDecryptPackets());
             }
@@ -752,11 +808,8 @@ public class AppState : IDisposable
         // Start proxies — Hytale uses QUIC/UDP ONLY (confirmed from protocol docs)
         // TCP proxy is disabled: adds overhead and can interfere with QUIC connections
         // int tcpListenPort = ListenPort + 1;
-        // TcpProxy.Start("0.0.0.0", tcpListenPort, TargetHost, TargetPort);
         // Thread.Sleep(50);
-        UdpProxy.Start("0.0.0.0", ListenPort, TargetHost, TargetPort);
         // IP isolation: only accept packets from our target server
-        UdpProxy.FilterToServerIp = TargetHost;
         AddInGameLog($"[SESSION] UDP-only mode | IP filter: {TargetHost}");
 
         StartTime = DateTime.Now;
@@ -772,7 +825,7 @@ public class AppState : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Warn($"Failed to copy: {ex.Message}", "System");
+            Log.Warning($"Failed to copy: {ex.Message}", "System");
         }
     }
 
@@ -810,7 +863,7 @@ public class AppState : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Warn($"[KEYS] Watcher setup failed: {ex.Message}", "System");
+            Log.Warning($"[KEYS] Watcher setup failed: {ex.Message}", "System");
         }
     }
 
@@ -949,11 +1002,11 @@ public class AppState : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    Log.Warn($"[KEYS] Could not clear {path}: {ex.Message}", "System");
+                    Log.Warning($"[KEYS] Could not clear {path}: {ex.Message}", "System");
                 }
             }
 
-            Log.Info("[KEYS] All key log files cleared/reset", "System");
+            Log.Information("[KEYS] All key log files cleared/reset", "System");
         }
         catch (Exception ex)
         {
@@ -1009,7 +1062,7 @@ public class AppState : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Warn($"[KEYS] Scan failed: {ex.Message}", "System");
+            Log.Warning($"[KEYS] Scan failed: {ex.Message}", "System");
         }
     }
 
@@ -1020,7 +1073,7 @@ public class AppState : IDisposable
             var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length < 3)
             {
-                Log.Warn($"Parse failed: only {parts.Length} parts", "Keys");
+                Log.Warning($"Parse failed: only {parts.Length} parts", "Keys");
                 return null;
             }
 
@@ -1029,7 +1082,7 @@ public class AppState : IDisposable
             // Double-check it's a QUIC label we want
             if (!IsHytaleQuicKey(line))
             {
-                Log.Warn($"Parse failed: not a QUIC key label", "Keys");
+                Log.Warning($"Parse failed: not a QUIC key label", "Keys");
                 return null;
             }
 
@@ -1043,20 +1096,20 @@ public class AppState : IDisposable
             }
             catch (FormatException ex)
             {
-                Log.Warn($"Hex decode failed: {ex.Message}", "Keys");
+                Log.Warning($"Hex decode failed: {ex.Message}", "Keys");
                 return null;
             }
 
             // Validate lengths
             if (clientRandom.Length != 32)
             {
-                Log.Warn($"Unexpected client_random length: {clientRandom.Length} bytes", "Keys");
+                Log.Warning($"Unexpected client_random length: {clientRandom.Length} bytes", "Keys");
             }
 
             // 32B = AES-128/SHA-256, 48B = AES-256/SHA-384
             if (secret.Length != 32 && secret.Length != 48)
             {
-                Log.Warn($"Unusual secret length: {secret.Length}B (expected 32 or 48)", "Keys");
+                Log.Warning($"Unusual secret length: {secret.Length}B (expected 32 or 48)", "Keys");
             }
 
             // Determine key type based on label
@@ -1084,16 +1137,16 @@ public class AppState : IDisposable
 
             if (key.Key.Length == 0)
             {
-                Log.Warn("Key derivation failed - empty key produced", "Keys");
+                Log.Warning("Key derivation failed - empty key produced", "Keys");
                 return null;
             }
 
-            Log.Success($"Parsed {label} ({secret.Length * 8} bits) -> {keyType}", "Keys");
+            Log.Verbose($"Parsed {label} ({secret.Length * 8} bits) -> {keyType}", "Keys");
             return key;
         }
         catch (Exception ex)
         {
-            Log.Warn($"Parse error: {ex.Message}", "Keys");
+            Log.Warning($"Parse error: {ex.Message}", "Keys");
             return null;
         }
     }
@@ -1161,7 +1214,7 @@ public class AppState : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Warn($"SSLKEYLOGFILE setup failed: {ex.Message}", "System");
+            Log.Warning($"SSLKEYLOGFILE setup failed: {ex.Message}", "System");
         }
     }
 
@@ -1371,13 +1424,11 @@ public class AppState : IDisposable
 
     public void Stop()
     {
-        UdpProxy.Stop();
         // FIX 2: Stop TCP proxy too
-        TcpProxy.Stop();
         StartTime = null;
         _autoDecryptTimer?.Stop();
         PacketDecryptor.StopAutoDecrypt();
-        Log.Info("[HyForce] Proxy stopped", "System");
+        Log.Information("[HyForce] Proxy stopped", "System");
         AddInGameLog("Proxy stopped");
     }
 
@@ -1385,7 +1436,6 @@ public class AppState : IDisposable
     {
         PacketLog.Add(packet);
         AnalyzePacket(packet);
-        Database.ProcessPacket(packet);
         OnPacketReceived?.Invoke(packet);
 
         if (PacketDecryptor.FailedDecryptions > 100 &&
@@ -1399,38 +1449,7 @@ public class AppState : IDisposable
     private void AnalyzePacket(CapturedPacket packet)
     {
         if (packet.RawBytes.Length > Config.AnomalyThresholdSize)
-        {
-            LogSecurityEvent("Anomaly", "Oversized packet detected", new Dictionary<string, object>
-            {
-                ["size"] = packet.RawBytes.Length,
-                ["opcode"] = packet.Opcode,
-                ["direction"] = packet.Direction.ToString()
-            });
-        }
-
-        if (packet.Opcode > 0x1000 && packet.Direction == Networking.PacketDirection.ClientToServer)
-        {
-            LogSecurityEvent("Anomaly", "Suspicious C2S opcode", new Dictionary<string, object>
-            {
-                ["opcode"] = packet.Opcode,
-                ["size"] = packet.RawBytes.Length
-            });
-        }
-    }
-
-    public void LogSecurityEvent(string category, string message, Dictionary<string, object> metadata)
-    {
-        var evt = new SecurityEvent
-        {
-            Timestamp = DateTime.Now,
-            Category = category,
-            Message = message,
-            Metadata = metadata
-        };
-        SecurityEvents.Add(evt);
-        Log.Security(message, category, metadata);
-        AddInGameLog($"[{category}] {message}");
-        OnSecurityEvent?.Invoke();
+            AddInGameLog($"[ANOMALY] Oversized packet: {packet.RawBytes.Length}B");
     }
 
     public void TriggerMemoryScan()
@@ -1441,12 +1460,11 @@ public class AppState : IDisposable
     public void ClearAll()
     {
         PacketLog.Clear();
-        Database.Clear();
-        SecurityEvents.Clear();
-        Log.Clear();
+        
+        Log.CloseAndFlush();
         lock (InGameLog) InGameLog.Clear();
         PacketDecryptor.ClearKeys();
-        Log.Info("[HyForce] All data cleared", "System");
+        Log.Information("[HyForce] All data cleared", "System");
         AddInGameLog("All data cleared");
     }
 
@@ -1483,23 +1501,14 @@ public class AppState : IDisposable
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                                PROXY STATUS                                   ");
         sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine($"UDP Proxy: {(UdpProxy.IsRunning ? "RUNNING " : "STOPPED")}");
-        sb.AppendLine($"  - Status: {UdpProxy.StatusMessage}");
-        sb.AppendLine($"  - Active Sessions: {UdpProxy.ActiveSessions}");
-        sb.AppendLine($"  - Total Clients: {UdpProxy.TotalClients}");
         sb.AppendLine();
         // FIX 2: Add TCP proxy status to diagnostics
-        sb.AppendLine($"TCP Proxy: {(TcpProxy.IsRunning ? "RUNNING " : "STOPPED")}");
-        sb.AppendLine($"  - Status: {TcpProxy.StatusMessage}");
-        sb.AppendLine($"  - Active Connections: {TcpProxy.ActiveSessions}");
-        sb.AppendLine($"  - Total Connections: {TcpProxy.TotalConnections}");
         sb.AppendLine();
 
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                              TRAFFIC STATISTICS                               ");
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine($"Total Packets: {TotalPackets:N0}");
-        sb.AppendLine($"  TCP: {TcpPackets:N0} ({FormatBytes(PacketLog.BytesTcp)} bytes) - Registry/Login");
         sb.AppendLine($"  UDP: {UdpPackets:N0} ({FormatBytes(PacketLog.BytesUdp)} bytes) - Gameplay");
         sb.AppendLine();
         sb.AppendLine($"Bytes Total: {FormatBytes(PacketLog.BytesSc + PacketLog.BytesCs)}");
@@ -1540,34 +1549,7 @@ public class AppState : IDisposable
         }
         sb.AppendLine();
 
-        sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine("                               PLAYER DATABASE                                 ");
-        sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine($"Unique Items: {Database.Items.Count:N0}");
-        sb.AppendLine($"Unique Players: {Database.Players.Count:N0}");
-        sb.AppendLine();
-
-        sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine("                               SECURITY EVENTS                                 ");
-        sb.AppendLine("-------------------------------------------------------------------------------");
-        sb.AppendLine($"Total Events: {SecurityEvents.Count:N0}");
-        var categories = SecurityEvents.GroupBy(e => e.Category).Select(g => $"{g.Key}: {g.Count()}");
-        sb.AppendLine($"By Category: {string.Join(", ", categories)}");
-        sb.AppendLine();
-
-        sb.AppendLine("--- Recent Events (Last 20) ---");
-        foreach (var evt in SecurityEvents.OrderByDescending(e => e.Timestamp).Take(20))
-        {
-            sb.AppendLine($"[{evt.Timestamp:HH:mm:ss}] [{evt.Category,-12}] {evt.Message}");
-            if (evt.Metadata.Any())
-            {
-                foreach (var meta in evt.Metadata.Take(5))
-                {
-                    sb.AppendLine($"    {meta.Key}: {meta.Value}");
-                }
-            }
-        }
-        sb.AppendLine();
+       
 
         sb.AppendLine("-------------------------------------------------------------------------------");
         sb.AppendLine("                                IN-GAME LOG                                    ");
@@ -1621,7 +1603,7 @@ public class AppState : IDisposable
             string filename = Path.Combine(ExportDirectory,
                 $"hyforce_diagnostics_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
             File.WriteAllText(filename, report);
-            Log.Success($"Diagnostics exported to {filename}", "Export");
+            Log.Verbose($"Diagnostics exported to {filename}", "Export");
             AddInGameLog($"[SUCCESS] Diagnostics exported to {filename}");
         }
         catch (Exception ex)
@@ -1640,7 +1622,7 @@ public class AppState : IDisposable
             string filename = Path.Combine(ExportDirectory,
                 $"hyforce_packets_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
             File.WriteAllText(filename, report);
-            Log.Success($"Packet log exported to {filename}", "Export");
+            Log.Verbose($"Packet log exported to {filename}", "Export");
             AddInGameLog($"[SUCCESS] Packet log exported to {filename}");
         }
         catch (Exception ex)
@@ -1665,34 +1647,6 @@ public class AppState : IDisposable
             lock (InGameLog)
             {
                 File.WriteAllLines(Path.Combine(basePath, "ingame_log.txt"), InGameLog);
-            }
-
-            var securitySb = new System.Text.StringBuilder();
-            securitySb.AppendLine("=== SECURITY EVENTS ===");
-            foreach (var evt in SecurityEvents.OrderBy(e => e.Timestamp))
-            {
-                securitySb.AppendLine($"[{evt.Timestamp:yyyy-MM-dd HH:mm:ss}] [{evt.Category}] {evt.Message}");
-                foreach (var meta in evt.Metadata)
-                {
-                    securitySb.AppendLine($"    {meta.Key}: {meta.Value}");
-                }
-            }
-            File.WriteAllText(Path.Combine(basePath, "security_events.txt"), securitySb.ToString());
-
-            if (Protocol.RegistrySyncParser.NumericIdToName.Count > 0)
-            {
-                var itemsSb = new System.Text.StringBuilder();
-                itemsSb.AppendLine("=== ITEMS ===");
-                foreach (var item in Protocol.RegistrySyncParser.NumericIdToName.OrderBy(x => x.Key))
-                {
-                    itemsSb.AppendLine($"{item.Key:X8} = {item.Value}");
-                }
-                File.WriteAllText(Path.Combine(basePath, "items.txt"), itemsSb.ToString());
-            }
-
-            if (Protocol.RegistrySyncParser.PlayerNamesSeen.Count > 0)
-            {
-                File.WriteAllLines(Path.Combine(basePath, "players.txt"), Protocol.RegistrySyncParser.PlayerNamesSeen);
             }
 
             if (PacketDecryptor.DiscoveredKeys.Count > 0)
@@ -1747,6 +1701,10 @@ public class AppState : IDisposable
         return $"{duration.Seconds}s";
     }
 
+    
+
+    
+
     public void Dispose()
     {
         // Clear keys but don't clear file (might be needed for debugging)
@@ -1757,8 +1715,6 @@ public class AppState : IDisposable
         }
         catch { }
 
-        UdpProxy.OnPacket -= _packetHandlerDelegate;
-        TcpProxy.OnPacket -= _tcpPacketHandlerDelegate;
 
         Stop();
         _autoDecryptTimer?.Dispose();
@@ -1770,8 +1726,6 @@ public class AppState : IDisposable
         GC.SuppressFinalize(this);
     }
 }
-
-// In AppState.cs, update the KeyStatus class:
 
 public class KeyStatus
 {

@@ -15,6 +15,7 @@
     <!-- ImGui.NET for UI -->
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
     <PackageReference Include="ImGui.NET" Version="1.91.6.1" />
+    <PackageReference Include="Serilog" Version="4.3.1" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.3" />
     
     <!-- Veldrid for rendering -->
