@@ -134,7 +134,7 @@ namespace HyForce.Tabs
             ImGui.Separator();
 
             float tableH = ImGui.GetContentRegionAvail().Y - 4;
-            if (ImGui.BeginTable("##ent", 8,
+            if (ImGui.BeginTable("##ent", 9,  // ← FIXED: was 8, now 9
                 ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg |
                 ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable,
                 new Vector2(-1, tableH)))
