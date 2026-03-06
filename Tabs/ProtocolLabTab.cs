@@ -137,10 +137,10 @@ namespace HyForce.Tabs
 
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.6f,0.6f,0.6f,1f),
-                "What to look for:\n" +
-                "  - Kicked / disconnected  →  server validates packet integrity\n" +
-                "  - Graceful error reply   →  server has error handling\n" +
-                "  - Nothing happens        →  server silently drops bad packets (good)\n" +
+                "What to look for:" +
+                "  - Kicked / disconnected  →  server validates packet integrity" +
+                "  - Graceful error reply   →  server has error handling" +
+                "  - Nothing happens        →  server silently drops bad packets (good)" +
                 "  - Server crashes / hangs →  potential DoS vulnerability (report this!)");
         }
 
@@ -171,7 +171,7 @@ namespace HyForce.Tabs
             ImGui.SameLine();
             if (ImGui.Button("Send##rhex"))
             {
-                string clean = _replayHex.Replace(" ","").Replace("\n","").Trim();
+                string clean = _replayHex.Replace(" ","").Replace("","").Trim();
                 if (clean.Length > 0 && clean.Length % 2 == 0) {
                     _pipe.ReplayHex(clean);
                     _replayStatus = $"Sent {clean.Length/2}B custom packet.";
@@ -184,9 +184,9 @@ namespace HyForce.Tabs
 
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.6f,0.6f,0.6f,1f),
-                "What to look for:\n" +
-                "  - Replay accepted = no replay protection (e.g. duplicate item use, duplicate purchase)\n" +
-                "  - Nonce / sequence rejection = server has replay protection\n" +
+                "What to look for:" +
+                "  - Replay accepted = no replay protection (e.g. duplicate item use, duplicate purchase)" +
+                "  - Nonce / sequence rejection = server has replay protection" +
                 "  - Crash on custom hex = unsafe deserialization / missing length check");
         }
 
@@ -224,9 +224,9 @@ namespace HyForce.Tabs
 
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.6f,0.6f,0.6f,1f),
-                "Recommended test sequence:\n" +
-                "  10/1000ms → 50/1000ms → 100/1000ms → 500/1000ms\n" +
-                "  Watch the log for disconnects or error packets coming back.\n" +
+                "Recommended test sequence:" +
+                "  10/1000ms → 50/1000ms → 100/1000ms → 500/1000ms" +
+                "  Watch the log for disconnects or error packets coming back." +
                 "  Also watch server CPU via task manager if you have server access.");
         }
 
@@ -261,7 +261,7 @@ namespace HyForce.Tabs
 
             ImGui.Spacing();
             ImGui.TextColored(new Vector4(0.6f,0.6f,0.6f,1f),
-                "In Wireshark: Edit → Preferences → Protocols → QUIC\n" +
+                "In Wireshark: Edit → Preferences → Protocols → QUIC" +
                 "Add your SSLKEYLOGFILE path under 'TLS key log file' to decrypt inline.");
         }
 
@@ -385,7 +385,7 @@ namespace HyForce.Tabs
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                     "HyForce","Exports",$"timing_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                var sb = new StringBuilder("timestamp_us,length,direction\n");
+                var sb = new StringBuilder("timestamp_us,length,direction");
                 foreach (var e in entries)
                     sb.AppendLine($"{e.TimestampUs},{e.Length},{(e.Dir==0?"C->S":"S->C")}");
                 File.WriteAllText(path, sb.ToString());

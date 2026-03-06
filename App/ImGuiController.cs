@@ -111,7 +111,7 @@ public class ImGuiController : IDisposable
                 _clipboardPtr = IntPtr.Zero;
             }
 
-            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\\0");
+            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
             _clipboardPtr = Marshal.AllocHGlobal(bytes.Length);
             Marshal.Copy(bytes, 0, _clipboardPtr, bytes.Length);
             return _clipboardPtr;

@@ -43,7 +43,7 @@ public class LogTab : ITab
         {
             lock (_state.InGameLog)
             {
-                ImGui.SetClipboardText(string.Join("\n", _state.InGameLog));
+                ImGui.SetClipboardText(string.Join("", _state.InGameLog));
             }
         }
         ImGui.SameLine();

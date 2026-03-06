@@ -155,9 +155,9 @@ namespace HyForce.App
                     ImGui.Separator();
                     ImGui.TextWrapped(
                         "SSLKEYLOGFILE has been configured for automatic key capture, " +
-                        "but Hytale was already running.\n\n" +
-                        "1. Close Hytale completely (check system tray)\n" +
-                        "2. Restart Hytale\n" +
+                        "but Hytale was already running." +
+                        "1. Close Hytale completely (check system tray" +
+                        "2. Restart Hytale" +
                         "3. Keys will appear automatically in the Decryption tab");
 
                     if (ImGui.Button("I've Restarted Hytale", new Vector2(200, 40)))

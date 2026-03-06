@@ -160,4 +160,3 @@ public class PacketInspector
     public string QuicHeaderType { get; set; } = "";
     public string QuicVersion { get; set; } = "";
 }
-

@@ -27,7 +27,7 @@ namespace HyForce.Tabs
     {
         public string Name => "Memory Research";
 
-        private readonly AppState          _state;
+        private readonly AppState _state;
         private readonly PipeCaptureServer _pipe;
 
         // ── Bookmarks ─────────────────────────────────────────────
@@ -45,12 +45,12 @@ namespace HyForce.Tabs
         // ── Pattern scanner ───────────────────────────────────────
         private string _patternHex = "3F 80 00 00";
         private string _stringFilter = "";
-        private int    _minStrLen    = 5;
+        private int _minStrLen = 5;
 
         // ── Sub-tab ───────────────────────────────────────────────
-        private int  _subTab       = 0;
-        private int  _selectedHit  = -1;
-        private int  _selectedBm   = -1;
+        private int _subTab = 0;
+        private int _selectedHit = -1;
+        private int _selectedBm = -1;
 
         // Notes editor
         private string _notes = DefaultNotes;
@@ -58,7 +58,7 @@ namespace HyForce.Tabs
         public MemoryResearchTab(AppState state, PipeCaptureServer pipe)
         {
             _state = state;
-            _pipe  = pipe;
+            _pipe = pipe;
             _bookmarkFile = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 "HyForce", "bookmarks.json");
@@ -75,10 +75,10 @@ namespace HyForce.Tabs
                 _lastAutoRefresh = DateTime.Now;
             }
 
-            ImGui.TextColored(new Vector4(0.75f,0.45f,1f,1f), "Memory Research");
+            ImGui.TextColored(new Vector4(0.75f, 0.45f, 1f, 1f), "Memory Research");
             ImGui.SameLine();
             bool live = _pipe.DllConnected;
-            ImGui.TextColored(live ? new Vector4(0.1f,1f,0.4f,1f) : new Vector4(0.7f,0.3f,0.3f,1f),
+            ImGui.TextColored(live ? new Vector4(0.1f, 1f, 0.4f, 1f) : new Vector4(0.7f, 0.3f, 0.3f, 1f),
                 live ? $"● DLL Live" : "○ DLL offline");
             ImGui.SameLine();
             if (ImGui.SmallButton("Scan Now"))
@@ -90,7 +90,7 @@ namespace HyForce.Tabs
             string[] tabs = { "Entity Finder", $"Bookmarks ({_bookmarks.Count})",
                               "Saved Scans", "Struct Viewer",
                               "Client↔Packet", "Pattern Scan",
-                              "String Heap", "Module Map", "Notes" };
+                              "String Heap", "Module Map", "Notes", "Live Watch" };
 
             ImGui.SetNextItemWidth(-1);
             ImGui.BeginTabBar("##mrt");
@@ -102,15 +102,16 @@ namespace HyForce.Tabs
             ImGui.Spacing();
             switch (_subTab)
             {
-                case 0: RenderEntityFinder();  break;
-                case 1: RenderBookmarks();     break;
-                case 2: RenderSavedScans();    break;
-                case 3: RenderStructViewer();  break;
-                case 4: RenderClientVsPacket();break;
-                case 5: RenderPatternScan();   break;
-                case 6: RenderStringHeap();    break;
-                case 7: RenderModuleMap();     break;
-                case 8: RenderNotes();         break;
+                case 0: RenderEntityFinder(); break;
+                case 1: RenderBookmarks(); break;
+                case 2: RenderSavedScans(); break;
+                case 3: RenderStructViewer(); break;
+                case 4: RenderClientVsPacket(); break;
+                case 5: RenderPatternScan(); break;
+                case 6: RenderStringHeap(); break;
+                case 7: RenderModuleMap(); break;
+                case 8: RenderNotes(); break;
+                case 9: RenderLiveWatch(); break;
             }
         }
 
@@ -139,14 +140,15 @@ namespace HyForce.Tabs
                 new Vector2(-1, tableH)))
             {
                 ImGui.TableSetupScrollFreeze(0, 1);
-                ImGui.TableSetupColumn("★",        ImGuiTableColumnFlags.WidthFixed, 24);
-                ImGui.TableSetupColumn("#",        ImGuiTableColumnFlags.WidthFixed, 28);
-                ImGui.TableSetupColumn("Address",  ImGuiTableColumnFlags.WidthFixed, 145);
-                ImGui.TableSetupColumn("HP",       ImGuiTableColumnFlags.WidthFixed, 90);
-                ImGui.TableSetupColumn("X",        ImGuiTableColumnFlags.WidthFixed, 90);
-                ImGui.TableSetupColumn("Y",        ImGuiTableColumnFlags.WidthFixed, 80);
-                ImGui.TableSetupColumn("Z",        ImGuiTableColumnFlags.WidthFixed, 90);
-                ImGui.TableSetupColumn("Actions",  ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableSetupColumn("★", ImGuiTableColumnFlags.WidthFixed, 24);
+                ImGui.TableSetupColumn("#", ImGuiTableColumnFlags.WidthFixed, 28);
+                ImGui.TableSetupColumn("Address", ImGuiTableColumnFlags.WidthFixed, 145);
+                ImGui.TableSetupColumn("HP", ImGuiTableColumnFlags.WidthFixed, 90);
+                ImGui.TableSetupColumn("X", ImGuiTableColumnFlags.WidthFixed, 90);
+                ImGui.TableSetupColumn("Y", ImGuiTableColumnFlags.WidthFixed, 80);
+                ImGui.TableSetupColumn("Z", ImGuiTableColumnFlags.WidthFixed, 90);
+                ImGui.TableSetupColumn("Vel", ImGuiTableColumnFlags.WidthFixed, 100);
+                ImGui.TableSetupColumn("Actions", ImGuiTableColumnFlags.WidthStretch);
                 ImGui.TableHeadersRow();
 
                 lock (_pipe.MemHits)
@@ -173,7 +175,7 @@ namespace HyForce.Tabs
                             _selectedHit = i;
 
                         ImGui.TableSetColumnIndex(3);
-                        float frac = h.MaxHealth > 0 ? h.Health/h.MaxHealth : 0;
+                        float frac = h.MaxHealth > 0 ? h.Health / h.MaxHealth : 0;
                         var hc = frac > 0.6f ? Green : frac > 0.3f ? Yellow : Red;
                         ImGui.TextColored(hc, $"{h.Health:F0}/{h.MaxHealth:F0}");
 
@@ -182,6 +184,11 @@ namespace HyForce.Tabs
                         ImGui.TableSetColumnIndex(6); ImGui.Text($"{h.Z:F2}");
 
                         ImGui.TableSetColumnIndex(7);
+                        float speed = MathF.Sqrt(h.VelX * h.VelX + h.VelY * h.VelY + h.VelZ * h.VelZ);
+                        var vc = speed > 10f ? new Vector4(1f, 0.5f, 0.1f, 1f) : new Vector4(0.6f, 0.6f, 0.6f, 1f);
+                        ImGui.TextColored(vc, $"{speed:F1}m/s");
+
+                        ImGui.TableSetColumnIndex(8);
                         if (ImGui.SmallButton($"View##sv{i}"))
                         { _selectedHit = i; _subTab = 3; }
                         ImGui.SameLine();
@@ -222,17 +229,17 @@ namespace HyForce.Tabs
                 {
                     var bm = new BookmarkedHit
                     {
-                        Address    = _pendingBookmarkHit.Address,
-                        Label      = _bookmarkLabel,
-                        Category   = GuessCategory(_pendingBookmarkHit),
-                        CreatedAt  = DateTime.Now,
-                        LastSeen   = DateTime.Now,
+                        Address = _pendingBookmarkHit.Address,
+                        Label = _bookmarkLabel,
+                        Category = GuessCategory(_pendingBookmarkHit),
+                        CreatedAt = DateTime.Now,
+                        LastSeen = DateTime.Now,
                         LastHealth = _pendingBookmarkHit.Health,
-                        LastMaxHP  = _pendingBookmarkHit.MaxHealth,
-                        LastX      = _pendingBookmarkHit.X,
-                        LastY      = _pendingBookmarkHit.Y,
-                        LastZ      = _pendingBookmarkHit.Z,
-                        StructBytes= _pendingBookmarkHit.StructBytes,
+                        LastMaxHP = _pendingBookmarkHit.MaxHealth,
+                        LastX = _pendingBookmarkHit.X,
+                        LastY = _pendingBookmarkHit.Y,
+                        LastZ = _pendingBookmarkHit.Z,
+                        StructBytes = _pendingBookmarkHit.StructBytes,
                     };
                     _bookmarks.Add(bm);
                     SaveBookmarks();
@@ -275,14 +282,14 @@ namespace HyForce.Tabs
                         bm.LastSeen = DateTime.Now;
                     }
 
-                    ImGui.TextColored(live!=null ? Green : Muted,
+                    ImGui.TextColored(live != null ? Green : Muted,
                         $"HP {bm.LastHealth:F0}/{bm.LastMaxHP:F0}  " +
                         $"({bm.LastX:F1}, {bm.LastY:F1}, {bm.LastZ:F1})");
                     ImGui.SameLine();
                     ImGui.TextColored(Muted, $"0x{bm.Address:X14}");
                     ImGui.SameLine();
 
-                    if (ImGui.SmallButton("View")) { _selectedBm=_bookmarks.IndexOf(bm); _subTab=3; }
+                    if (ImGui.SmallButton("View")) { _selectedBm = _bookmarks.IndexOf(bm); _subTab = 3; }
                     ImGui.SameLine();
                     if (ImGui.SmallButton("Delete"))
                     { _bookmarks.Remove(bm); SaveBookmarks(); ImGui.PopID(); break; }
@@ -308,9 +315,9 @@ namespace HyForce.Tabs
             if (_savedScans.Any(s => s.Address == h.Address)) return;
             _savedScans.Add(new SavedScan
             {
-                Address   = h.Address,
-                Name      = $"Entity 0x{h.Address:X10}",
-                Fields    = new List<WatchField>
+                Address = h.Address,
+                Name = $"Entity 0x{h.Address:X10}",
+                Fields = new List<WatchField>
                 {
                     new("Health",    0,  FieldType.Float32),
                     new("MaxHealth", 4,  FieldType.Float32),
@@ -377,10 +384,10 @@ namespace HyForce.Tabs
                 if (ImGui.BeginTable($"##wf{scan.Address}", 4,
                     ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
                 {
-                    ImGui.TableSetupColumn("Field",  ImGuiTableColumnFlags.WidthFixed, 100);
+                    ImGui.TableSetupColumn("Field", ImGuiTableColumnFlags.WidthFixed, 100);
                     ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.WidthFixed, 60);
-                    ImGui.TableSetupColumn("Type",   ImGuiTableColumnFlags.WidthFixed, 80);
-                    ImGui.TableSetupColumn("Value",  ImGuiTableColumnFlags.WidthStretch);
+                    ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.WidthFixed, 80);
+                    ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthStretch);
                     ImGui.TableHeadersRow();
 
                     foreach (var f in scan.Fields)
@@ -392,7 +399,7 @@ namespace HyForce.Tabs
                         ImGui.TableSetColumnIndex(3);
                         bool changed = f.HasChanged;
                         if (changed) ImGui.TableSetBgColor(ImGuiTableBgTarget.CellBg,
-                            ImGui.ColorConvertFloat4ToU32(new Vector4(0.4f,0.2f,0f,0.6f)));
+                            ImGui.ColorConvertFloat4ToU32(new Vector4(0.4f, 0.2f, 0f, 0.6f)));
                         ImGui.TextColored(changed ? Yellow : Vector4.One, f.ValueStr);
                     }
                     ImGui.EndTable();
@@ -401,13 +408,13 @@ namespace HyForce.Tabs
                 // Add custom field
                 ImGui.TextColored(Muted, "Add field: ");
                 ImGui.SameLine();
-                if (ImGui.SmallButton("+float32")) scan.Fields.Add(new WatchField($"f+{scan.Fields.Count*4}", scan.Fields.Count*4, FieldType.Float32));
+                if (ImGui.SmallButton("+float32")) scan.Fields.Add(new WatchField($"f+{scan.Fields.Count * 4}", scan.Fields.Count * 4, FieldType.Float32));
                 ImGui.SameLine();
-                if (ImGui.SmallButton("+float64")) scan.Fields.Add(new WatchField($"d+{scan.Fields.Count*8}", scan.Fields.Count*8, FieldType.Float64));
+                if (ImGui.SmallButton("+float64")) scan.Fields.Add(new WatchField($"d+{scan.Fields.Count * 8}", scan.Fields.Count * 8, FieldType.Float64));
                 ImGui.SameLine();
-                if (ImGui.SmallButton("+int32"))   scan.Fields.Add(new WatchField($"i+{scan.Fields.Count*4}", scan.Fields.Count*4, FieldType.Int32));
+                if (ImGui.SmallButton("+int32")) scan.Fields.Add(new WatchField($"i+{scan.Fields.Count * 4}", scan.Fields.Count * 4, FieldType.Int32));
                 ImGui.SameLine();
-                if (ImGui.SmallButton("+byte"))    scan.Fields.Add(new WatchField($"b+{scan.Fields.Count}",  scan.Fields.Count,    FieldType.Byte));
+                if (ImGui.SmallButton("+byte")) scan.Fields.Add(new WatchField($"b+{scan.Fields.Count}", scan.Fields.Count, FieldType.Byte));
 
                 ImGui.PopID();
                 ImGui.Spacing();
@@ -424,9 +431,16 @@ namespace HyForce.Tabs
             else if (_selectedBm >= 0 && _selectedBm < _bookmarks.Count)
             {
                 var bm = _bookmarks[_selectedBm];
-                hit = new MemScanHit {
-                    Address=bm.Address, Health=bm.LastHealth, MaxHealth=bm.LastMaxHP,
-                    X=bm.LastX, Y=bm.LastY, Z=bm.LastZ, StructBytes=bm.StructBytes };
+                hit = new MemScanHit
+                {
+                    Address = bm.Address,
+                    Health = bm.LastHealth,
+                    MaxHealth = bm.LastMaxHP,
+                    X = bm.LastX,
+                    Y = bm.LastY,
+                    Z = bm.LastZ,
+                    StructBytes = bm.StructBytes
+                };
             }
 
             if (hit == null)
@@ -451,14 +465,15 @@ namespace HyForce.Tabs
                     for (int row = 0; row < b.Length; row += 16)
                     {
                         sb.Append($"  +{row:X4}  ");
-                        for (int c = 0; c < 16; c++) {
-                            if (row+c < b.Length) sb.Append($"{b[row+c]:X2} ");
+                        for (int c = 0; c < 16; c++)
+                        {
+                            if (row + c < b.Length) sb.Append($"{b[row + c]:X2} ");
                             else sb.Append("   ");
                             if (c == 7) sb.Append(" ");
                         }
                         sb.Append("  ");
-                        for (int c = 0; c < 16 && row+c < b.Length; c++)
-                        { char ch=(char)b[row+c]; sb.Append(ch>=0x20&&ch<0x7F?ch:'.'); }
+                        for (int c = 0; c < 16 && row + c < b.Length; c++)
+                        { char ch = (char)b[row + c]; sb.Append(ch >= 0x20 && ch < 0x7F ? ch : '.'); }
                         sb.AppendLine();
                     }
                     var hexDump = sb.ToString();
@@ -470,12 +485,12 @@ namespace HyForce.Tabs
                 {
                     byte[] b = hit.StructBytes;
                     if (ImGui.BeginTable("##interp", 4,
-                        ImGuiTableFlags.Borders|ImGuiTableFlags.RowBg|ImGuiTableFlags.ScrollY))
+                        ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY))
                     {
                         ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.WidthFixed, 60);
-                        ImGui.TableSetupColumn("Hex",    ImGuiTableColumnFlags.WidthFixed, 120);
-                        ImGui.TableSetupColumn("float32",ImGuiTableColumnFlags.WidthFixed, 120);
-                        ImGui.TableSetupColumn("float64",ImGuiTableColumnFlags.WidthStretch);
+                        ImGui.TableSetupColumn("Hex", ImGuiTableColumnFlags.WidthFixed, 120);
+                        ImGui.TableSetupColumn("float32", ImGuiTableColumnFlags.WidthFixed, 120);
+                        ImGui.TableSetupColumn("float64", ImGuiTableColumnFlags.WidthStretch);
                         ImGui.TableHeadersRow();
 
                         for (int off = 0; off + 4 <= b.Length; off += 4)
@@ -483,18 +498,19 @@ namespace HyForce.Tabs
                             ImGui.TableNextRow();
                             ImGui.TableSetColumnIndex(0); ImGui.Text($"+{off:X2}");
                             ImGui.TableSetColumnIndex(1);
-                            string hex = off+4<=b.Length ? BitConverter.ToString(b, off, 4) : "";
+                            string hex = off + 4 <= b.Length ? BitConverter.ToString(b, off, 4) : "";
                             ImGui.Text(hex);
                             ImGui.TableSetColumnIndex(2);
-                            float f = off+4<=b.Length ? BitConverter.ToSingle(b, off) : 0;
-                            if (!float.IsNaN(f)&&!float.IsInfinity(f)&&Math.Abs(f)<1e9)
+                            float f = off + 4 <= b.Length ? BitConverter.ToSingle(b, off) : 0;
+                            if (!float.IsNaN(f) && !float.IsInfinity(f) && Math.Abs(f) < 1e9)
                                 ImGui.TextColored(Yellow, $"{f:G6}");
                             else ImGui.TextColored(Muted, "---");
                             ImGui.TableSetColumnIndex(3);
-                            if (off+8<=b.Length){
+                            if (off + 8 <= b.Length)
+                            {
                                 double d = BitConverter.ToDouble(b, off);
-                                if (!double.IsNaN(d)&&!double.IsInfinity(d)&&Math.Abs(d)<1e12)
-                                    ImGui.TextColored(new Vector4(0.5f,0.9f,1f,1f), $"{d:G10}");
+                                if (!double.IsNaN(d) && !double.IsInfinity(d) && Math.Abs(d) < 1e12)
+                                    ImGui.TextColored(new Vector4(0.5f, 0.9f, 1f, 1f), $"{d:G10}");
                                 else ImGui.TextColored(Muted, "---");
                             }
                         }
@@ -521,37 +537,40 @@ namespace HyForce.Tabs
                 { ImGui.TextColored(Muted, "Run entity scan first."); return; }
 
                 var lp = _pipe.MemHits[0];
-                ImGui.TextColored(new Vector4(0.4f,0.9f,1f,1f), "First scan hit (local player candidate):");
+                ImGui.TextColored(new Vector4(0.4f, 0.9f, 1f, 1f), "First scan hit (local player candidate):");
                 if (ImGui.BeginTable("##lpv", 2, ImGuiTableFlags.Borders))
                 {
                     ImGui.TableSetupColumn("Field", ImGuiTableColumnFlags.WidthFixed, 120);
                     ImGui.TableSetupColumn("Memory Value", ImGuiTableColumnFlags.WidthStretch);
                     ImGui.TableHeadersRow();
-                    void Row(string k, string v){ ImGui.TableNextRow();
-                        ImGui.TableSetColumnIndex(0);ImGui.Text(k);
-                        ImGui.TableSetColumnIndex(1);ImGui.Text(v);}
-                    Row("Address",  $"0x{lp.Address:X14}");
-                    Row("Health",   $"{lp.Health:F3}  /  {lp.MaxHealth:F3}");
+                    void Row(string k, string v)
+                    {
+                        ImGui.TableNextRow();
+                        ImGui.TableSetColumnIndex(0); ImGui.Text(k);
+                        ImGui.TableSetColumnIndex(1); ImGui.Text(v);
+                    }
+                    Row("Address", $"0x{lp.Address:X14}");
+                    Row("Health", $"{lp.Health:F3}  /  {lp.MaxHealth:F3}");
                     Row("Position", $"({lp.X:F4}, {lp.Y:F4}, {lp.Z:F4})");
-                    Row("Scan time",lp.FoundAt.ToString("HH:mm:ss.fff"));
+                    Row("Scan time", lp.FoundAt.ToString("HH:mm:ss.fff"));
                     ImGui.EndTable();
                 }
             }
 
             ImGui.Spacing();
             ImGui.TextColored(Muted,
-                "Packet-side position values will appear here once decryption is working.\n" +
-                "The hook fires stats every 5s — watch STATS lines in the Log tab to confirm\n" +
+                "Packet-side position values will appear here once decryption is working." +
+                "The hook fires stats every 5s — watch STATS lines in the Log tab to confirm" +
                 "which hook variant (WSASendTo or sendto) is catching Hytale's traffic.");
             ImGui.Spacing();
 
             // Show recent packet count as proxy for whether capture is working
-            ImGui.TextColored(new Vector4(0.5f,0.9f,0.5f,1f),
+            ImGui.TextColored(new Vector4(0.5f, 0.9f, 0.5f, 1f),
                 $"Packets captured so far: {_pipe.PacketCount}");
             if (_pipe.PacketCount == 0)
                 ImGui.TextColored(Red,
-                    "0 packets — DLL hooks not firing. Check STATS in Log tab.\n" +
-                    "If all 4 fire counts are 0, Hytale may use IOCP (async I/O).\n" +
+                    "0 packets — DLL hooks not firing. Check STATS in Log tab." +
+                    "If all 4 fire counts are 0, Hytale may use IOCP (async I/O)." +
                     "Next step: WinDivert capture (see Settings tab for setup guide).");
         }
 
@@ -572,50 +591,50 @@ namespace HyForce.Tabs
 
             ImGui.Spacing();
             ImGui.Text("Value → Hex converters:");
-            float  fIn  = 0; double dIn = 0; int iIn = 0;
+            float fIn = 0; double dIn = 0; int iIn = 0;
             ImGui.SetNextItemWidth(120); ImGui.InputFloat("float##fi", ref fIn);
             ImGui.SameLine();
             if (ImGui.SmallButton("Use##f"))
-                _patternHex = BitConverter.ToString(BitConverter.GetBytes(fIn)).Replace('-',' ');
+                _patternHex = BitConverter.ToString(BitConverter.GetBytes(fIn)).Replace('-', ' ');
             ImGui.SameLine(0, 20);
             ImGui.SetNextItemWidth(120); ImGui.InputDouble("double##di", ref dIn);
             ImGui.SameLine();
             if (ImGui.SmallButton("Use##d"))
-                _patternHex = BitConverter.ToString(BitConverter.GetBytes(dIn)).Replace('-',' ');
+                _patternHex = BitConverter.ToString(BitConverter.GetBytes(dIn)).Replace('-', ' ');
             ImGui.SameLine(0, 20);
             ImGui.SetNextItemWidth(120); ImGui.InputInt("int32##ii", ref iIn);
             ImGui.SameLine();
             if (ImGui.SmallButton("Use##i"))
-                _patternHex = BitConverter.ToString(BitConverter.GetBytes(iIn)).Replace('-',' ');
+                _patternHex = BitConverter.ToString(BitConverter.GetBytes(iIn)).Replace('-', ' ');
 
             ImGui.Spacing();
             ImGui.Text("Presets:");
-            if (ImGui.SmallButton("float 1.0"))   _patternHex = "3F 80 00 00";
+            if (ImGui.SmallButton("float 1.0")) _patternHex = "3F 80 00 00";
             ImGui.SameLine();
             if (ImGui.SmallButton("float 100.0")) _patternHex = "42 C8 00 00";
             ImGui.SameLine();
-            if (ImGui.SmallButton("\"Hytale\""))  _patternHex = "48 79 74 61 6C 65";
+            if (ImGui.SmallButton("\"Hytale\"")) _patternHex = "48 79 74 61 6C 65";
             ImGui.SameLine();
-            if (ImGui.SmallButton("\"QUIC\""))    _patternHex = "51 55 49 43";
+            if (ImGui.SmallButton("\"QUIC\"")) _patternHex = "51 55 49 43";
             ImGui.SameLine();
-            if (ImGui.SmallButton("UUID pattern"))_patternHex = "?? ?? ?? ?? - ?? ?? - ?? ?? - ?? ?? - ?? ?? ?? ?? ?? ??";
+            if (ImGui.SmallButton("UUID pattern")) _patternHex = "?? ?? ?? ?? - ?? ?? - ?? ?? - ?? ?? - ?? ?? ?? ?? ?? ??";
 
             ImGui.Spacing();
-            if (ImGui.Button("Trigger Scan", new Vector2(140,28)))
-            { _pipe.MemHits.Clear(); _pipe.MemScan(); _subTab=0; }
+            if (ImGui.Button("Trigger Scan", new Vector2(140, 28)))
+            { _pipe.MemHits.Clear(); _pipe.MemScan(); _subTab = 0; }
             ImGui.SameLine();
             ImGui.TextColored(Muted, "→ results appear in Entity Finder tab");
 
             ImGui.Spacing();
             ImGui.Separator();
             ImGui.TextColored(Muted,
-                "Workflow for finding unknown structs:\n" +
-                "  1. Note a known value (your HP = 87.5)\n" +
-                "  2. Enter it in the float converter → click Use\n" +
-                "  3. Scan, note all addresses found\n" +
-                "  4. Change the value in-game (take damage)\n" +
-                "  5. Re-scan with new value — surviving address = live struct\n" +
-                "  6. Inspect surrounding bytes in Struct Viewer\n" +
+                "Workflow for finding unknown structs:" +
+                "  1. Note a known value (your HP = 87.5)" +
+                "  2. Enter it in the float converter → click Use" +
+                "  3. Scan, note all addresses found" +
+                "  4. Change the value in-game (take damage)" +
+                "  5. Re-scan with new value — surviving address = live struct" +
+                "  6. Inspect surrounding bytes in Struct Viewer" +
                 "  7. Map all fields → cross-reference with captured packets");
         }
 
@@ -640,12 +659,12 @@ namespace HyForce.Tabs
 
             ImGui.Spacing();
             ImGui.TextColored(Muted,
-                "Interesting findings to look for:\n" +
-                "  ● Internal IPs / hostnames  → dev/staging server exposure\n" +
-                "  ● 'admin' / 'debug' flags    → undocumented privilege levels\n" +
-                "  ● JWT tokens in cleartext    → auth token leakage\n" +
-                "  ● Error messages / stack paths → internal code layout\n" +
-                "  ● Encryption key-like strings  → critical if present\n\n" +
+                "Interesting findings to look for:" +
+                "  ● Internal IPs / hostnames  → dev/staging server exposure" +
+                "  ● 'admin' / 'debug' flags    → undocumented privilege levels" +
+                "  ● JWT tokens in cleartext    → auth token leakage" +
+                "  ● Error messages / stack paths → internal code layout" +
+                "  ● Encryption key-like strings  → critical if present" +
                 "Results appear in the Log tab as [DLL] lines.");
         }
 
@@ -661,7 +680,7 @@ namespace HyForce.Tabs
                 _pipe.SendCommand("MODLIST");
             ImGui.Spacing();
             ImGui.TextColored(Muted,
-                "Results appear in Log tab as [DLL] MODULE: entries.\n" +
+                "Results appear in Log tab as [DLL] MODULE: entries." +
                 "Look for: BoringSSL, OpenSSL, netty, libquiche, jvm.dll versions.");
         }
 
@@ -674,14 +693,16 @@ namespace HyForce.Tabs
                 new Vector2(-1, ImGui.GetContentRegionAvail().Y - 32));
             if (ImGui.Button("Export Notes"))
             {
-                try {
+                try
+                {
                     string path = Path.Combine(
                         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                        "HyForce","Exports",$"notes_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                        "HyForce", "Exports", $"notes_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
                     Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                     File.WriteAllText(path, _notes);
                     _state.AddInGameLog($"[MEM] Notes exported: {path}");
-                } catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
+                }
+                catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
             }
         }
 
@@ -695,52 +716,61 @@ namespace HyForce.Tabs
 
         private void ExportStruct(MemScanHit h)
         {
-            try {
+            try
+            {
                 string path = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "HyForce","Exports",$"struct_0x{h.Address:X14}_{DateTime.Now:HHmmss}.bin");
+                    "HyForce", "Exports", $"struct_0x{h.Address:X14}_{DateTime.Now:HHmmss}.bin");
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 File.WriteAllBytes(path, h.StructBytes);
                 _state.AddInGameLog($"[MEM] Exported: {path}");
-            } catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
+            }
+            catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
         }
 
         private void ExportBookmarks()
         {
-            try {
+            try
+            {
                 string path = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "HyForce","Exports",$"bookmarks_{DateTime.Now:yyyyMMdd}.json");
+                    "HyForce", "Exports", $"bookmarks_{DateTime.Now:yyyyMMdd}.json");
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                File.WriteAllText(path, JsonSerializer.Serialize(_bookmarks, new JsonSerializerOptions{WriteIndented=true}));
+                File.WriteAllText(path, JsonSerializer.Serialize(_bookmarks, new JsonSerializerOptions { WriteIndented = true }));
                 _state.AddInGameLog($"[MEM] Bookmarks exported: {path}");
-            } catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
+            }
+            catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
         }
 
         private void LoadBookmarks()
         {
-            try {
-                if (File.Exists(_bookmarkFile)) {
+            try
+            {
+                if (File.Exists(_bookmarkFile))
+                {
                     var loaded = JsonSerializer.Deserialize<List<BookmarkedHit>>(File.ReadAllText(_bookmarkFile));
                     if (loaded != null) { _bookmarks.Clear(); _bookmarks.AddRange(loaded); }
                 }
-            } catch { }
+            }
+            catch { }
         }
 
         private void SaveBookmarks()
         {
-            try {
+            try
+            {
                 Directory.CreateDirectory(Path.GetDirectoryName(_bookmarkFile)!);
-                File.WriteAllText(_bookmarkFile, JsonSerializer.Serialize(_bookmarks, new JsonSerializerOptions{WriteIndented=true}));
-            } catch { }
+                File.WriteAllText(_bookmarkFile, JsonSerializer.Serialize(_bookmarks, new JsonSerializerOptions { WriteIndented = true }));
+            }
+            catch { }
         }
 
         // ─── Colours ──────────────────────────────────────────────
-        static readonly Vector4 Accent = new(0.75f,0.45f,1f,1f);
-        static readonly Vector4 Yellow = new(1f,0.85f,0.1f,1f);
-        static readonly Vector4 Green  = new(0.2f,1f,0.4f,1f);
-        static readonly Vector4 Red    = new(1f,0.3f,0.2f,1f);
-        static readonly Vector4 Muted  = new(0.55f,0.55f,0.55f,1f);
+        static readonly Vector4 Accent = new(0.75f, 0.45f, 1f, 1f);
+        static readonly Vector4 Yellow = new(1f, 0.85f, 0.1f, 1f);
+        static readonly Vector4 Green = new(0.2f, 1f, 0.4f, 1f);
+        static readonly Vector4 Red = new(1f, 0.3f, 0.2f, 1f);
+        static readonly Vector4 Muted = new(0.55f, 0.55f, 0.55f, 1f);
 
         const string DefaultNotes = @"# HyForce Memory Research Notes
 
@@ -758,62 +788,134 @@ namespace HyForce.Tabs
 
 ## Other Findings
 ";
-    }
 
-    // ─── Data types ───────────────────────────────────────────────
-    public class BookmarkedHit
-    {
-        public ulong    Address    { get; set; }
-        public string   Label      { get; set; } = "";
-        public string   Category   { get; set; } = "Unknown";
-        public DateTime CreatedAt  { get; set; } = DateTime.Now;
-        public DateTime LastSeen   { get; set; } = DateTime.Now;
-        public float    LastHealth { get; set; }
-        public float    LastMaxHP  { get; set; }
-        public double   LastX      { get; set; }
-        public double   LastY      { get; set; }
-        public double   LastZ      { get; set; }
-        public byte[]   StructBytes{ get; set; } = Array.Empty<byte>();
-    }
 
-    public enum FieldType { Byte, Int16, Int32, Int64, Float32, Float64 }
+        // ─── Live Watch ───────────────────────────────────────────────
+        private string _watchAddrStr = "";
+        private int _watchMs = 250;
 
-    public class WatchField
-    {
-        public string    Name        { get; set; }
-        public int       Offset      { get; set; }
-        public FieldType Type        { get; set; }
-        public string    ValueStr    { get; private set; } = "---";
-        public string    PrevStr     { get; private set; } = "";
-        public bool      HasChanged  => ValueStr != PrevStr;
-
-        public WatchField(string name, int offset, FieldType type)
-        { Name=name; Offset=offset; Type=type; }
-
-        public void Update(byte[] buf)
+        private void RenderLiveWatch()
         {
-            PrevStr = ValueStr;
-            if (Offset < 0 || Offset >= buf.Length) { ValueStr="[OOB]"; return; }
-            try {
-                ValueStr = Type switch {
-                    FieldType.Byte    => $"{buf[Offset]}",
-                    FieldType.Int16   => Offset+2<=buf.Length ? $"{BitConverter.ToInt16(buf,Offset)}" : "[OOB]",
-                    FieldType.Int32   => Offset+4<=buf.Length ? $"{BitConverter.ToInt32(buf,Offset)}" : "[OOB]",
-                    FieldType.Int64   => Offset+8<=buf.Length ? $"{BitConverter.ToInt64(buf,Offset)}" : "[OOB]",
-                    FieldType.Float32 => Offset+4<=buf.Length ? $"{BitConverter.ToSingle(buf,Offset):G6}" : "[OOB]",
-                    FieldType.Float64 => Offset+8<=buf.Length ? $"{BitConverter.ToDouble(buf,Offset):G10}" : "[OOB]",
-                    _ => "?"
-                };
-            } catch { ValueStr="[ERR]"; }
-        }
-    }
+            bool live = _pipe.DllConnected;
+            ImGui.Spacing();
+            ImGui.TextColored(live ? Green : Red, live ? "● DLL Connected — watch active" : "○ DLL Disconnected");
+            ImGui.Separator();
+            ImGui.Spacing();
 
-    public class SavedScan
-    {
-        public ulong           Address    { get; set; }
-        public string          Name       { get; set; } = "";
-        public List<WatchField> Fields    { get; set; } = new();
-        public DateTime        LastUpdate { get; set; } = DateTime.MinValue;
-        public bool            Stale      { get; set; } = false;
+            ImGui.Text("Watch Address (hex):");
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(160);
+            ImGui.InputText("##waddr", ref _watchAddrStr, 20);
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(70);
+            ImGui.InputInt("ms##wms", ref _watchMs);
+            _watchMs = Math.Max(50, _watchMs);
+            ImGui.SameLine();
+            if (ImGui.Button("Start Watch") && live)
+            {
+                if (ulong.TryParse(_watchAddrStr.TrimStart('0', 'x', 'X'),
+                    System.Globalization.NumberStyles.HexNumber, null, out ulong addr))
+                    _pipe.MemWatch(addr, _watchMs);
+                else
+                    _state.AddInGameLog("[MEMWATCH] Invalid hex address");
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Stop")) _pipe.MemWatchStop();
+            ImGui.SameLine();
+            ImGui.TextColored(Muted, $"{_pipe.MemWatchLog.Count} deltas");
+
+            ImGui.Spacing();
+            ImGui.Separator();
+            ImGui.TextColored(Yellow, "Live snapshots (most recent first):");
+            ImGui.Spacing();
+
+            var log = _pipe.MemWatchLog;
+            lock (log)
+            {
+                for (int i = log.Count - 1; i >= Math.Max(0, log.Count - 30); i--)
+                {
+                    var e = log[i];
+                    ImGui.TextColored(Muted, $"{e.Timestamp:HH:mm:ss.fff}");
+                    ImGui.SameLine(0, 8);
+
+                    float frac = e.MaxHealth > 0 ? e.Health / e.MaxHealth : 0;
+                    var hc = frac > 0.6f ? Green : frac > 0.3f ? Yellow : Red;
+                    ImGui.TextColored(hc, $"HP {e.Health:F1}/{e.MaxHealth:F1}");
+                    ImGui.SameLine(0, 8);
+                    ImGui.Text($"({e.X:F1}, {e.Y:F1}, {e.Z:F1})");
+
+                    if (e.Snapshot.Length >= 16)
+                    {
+                        var sb2 = new System.Text.StringBuilder();
+                        for (int j = 0; j < Math.Min(16, e.Snapshot.Length); j++)
+                            sb2.Append($"{e.Snapshot[j]:X2} ");
+                        ImGui.SameLine(0, 8);
+                        ImGui.TextColored(Muted, sb2.ToString().TrimEnd());
+                    }
+                }
+            }
+            if (log.Count == 0)
+                ImGui.TextColored(Muted, "No data yet — bookmark an entity, copy its address, click Start Watch.");
+        }
+
+        // ─── Data types ───────────────────────────────────────────────
+        public class BookmarkedHit
+        {
+            public ulong Address { get; set; }
+            public string Label { get; set; } = "";
+            public string Category { get; set; } = "Unknown";
+            public DateTime CreatedAt { get; set; } = DateTime.Now;
+            public DateTime LastSeen { get; set; } = DateTime.Now;
+            public float LastHealth { get; set; }
+            public float LastMaxHP { get; set; }
+            public double LastX { get; set; }
+            public double LastY { get; set; }
+            public double LastZ { get; set; }
+            public byte[] StructBytes { get; set; } = Array.Empty<byte>();
+        }
+
+        public enum FieldType { Byte, Int16, Int32, Int64, Float32, Float64 }
+
+        public class WatchField
+        {
+            public string Name { get; set; }
+            public int Offset { get; set; }
+            public FieldType Type { get; set; }
+            public string ValueStr { get; private set; } = "---";
+            public string PrevStr { get; private set; } = "";
+            public bool HasChanged => ValueStr != PrevStr;
+
+            public WatchField(string name, int offset, FieldType type)
+            { Name = name; Offset = offset; Type = type; }
+
+            public void Update(byte[] buf)
+            {
+                PrevStr = ValueStr;
+                if (Offset < 0 || Offset >= buf.Length) { ValueStr = "[OOB]"; return; }
+                try
+                {
+                    ValueStr = Type switch
+                    {
+                        FieldType.Byte => $"{buf[Offset]}",
+                        FieldType.Int16 => Offset + 2 <= buf.Length ? $"{BitConverter.ToInt16(buf, Offset)}" : "[OOB]",
+                        FieldType.Int32 => Offset + 4 <= buf.Length ? $"{BitConverter.ToInt32(buf, Offset)}" : "[OOB]",
+                        FieldType.Int64 => Offset + 8 <= buf.Length ? $"{BitConverter.ToInt64(buf, Offset)}" : "[OOB]",
+                        FieldType.Float32 => Offset + 4 <= buf.Length ? $"{BitConverter.ToSingle(buf, Offset):G6}" : "[OOB]",
+                        FieldType.Float64 => Offset + 8 <= buf.Length ? $"{BitConverter.ToDouble(buf, Offset):G10}" : "[OOB]",
+                        _ => "?"
+                    };
+                }
+                catch { ValueStr = "[ERR]"; }
+            }
+        }
+
+        public class SavedScan
+        {
+            public ulong Address { get; set; }
+            public string Name { get; set; } = "";
+            public List<WatchField> Fields { get; set; } = new();
+            public DateTime LastUpdate { get; set; } = DateTime.MinValue;
+            public bool Stale { get; set; } = false;
+        }
     }
 }

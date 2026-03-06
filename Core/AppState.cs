@@ -88,6 +88,7 @@ public class AppState : IDisposable
         _retryTimer.Start();
         // Permanent key log setup
         InitPermanentKeyLog();
+
     }
 
 
@@ -149,8 +150,8 @@ public class AppState : IDisposable
             if (!File.Exists(PermanentKeyLogPath))
             {
                 File.WriteAllText(PermanentKeyLogPath,
-                    "# HyForce permanent SSL key log - QUIC/TLS 1.3 keys for Hytale\n" +
-                    "# Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\n");
+                    "# HyForce permanent SSL key log - QUIC/TLS 1.3 keys for Hytale" +
+                    "# Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "");
             }
 
             // Start watching the file
@@ -182,7 +183,11 @@ public class AppState : IDisposable
         }
     }
 
-    
+    public void NotifyMemoryDataUpdated()
+    {
+        OnMemoryDataUpdated?.Invoke();
+    }
+
 
     private void ShowHytaleRestartNotification()
     {
@@ -444,8 +449,8 @@ public class AppState : IDisposable
 
             // Append to working keys file
             File.AppendAllText(WorkingHytaleKeysPath,
-                $"# Promoted at {DateTime.Now:yyyy-MM-dd HH:mm:ss}\r\n" +
-                FormatKeyLine(key) + "\r\n");
+                $"# Promoted at {DateTime.Now:yyyy-MM-dd HH:mm:ss}" +
+                FormatKeyLine(key) + "");
 
             AddInGameLog($"[KEYS] Promoted {key.Type} key to HytaleKeys.log");
         }
@@ -586,6 +591,33 @@ public class AppState : IDisposable
     }
 
     // Public: UI "Re-Import" button
+    /// <summary>
+    /// Accept a single SSL keylog line directly from the DLL pipe (MSG_KEYLOG 0x09).
+    /// This bypasses file I/O for real-time key extraction from BoringSSL hook.
+    /// Line format: "CLIENT_TRAFFIC_SECRET_0 &lt;client_random_hex&gt; &lt;secret_hex&gt;"
+    /// </summary>
+    public void ImportKeylogLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#")) return;
+        try
+        {
+            var key = ParseSSLKeyLogLine(line, "DLL_HOOK");
+            if (key != null)
+            {
+                PacketDecryptor.AddKey(key);
+                AddInGameLog($"[KEYLOG] Key imported: {key.EncType} ({PacketDecryptor.DiscoveredKeys.Count} total)");
+                OnKeysUpdated?.Invoke();
+
+                // Also append to permanent log for persistence
+                if (!string.IsNullOrEmpty(PermanentKeyLogPath))
+                {
+                    try { File.AppendAllText(PermanentKeyLogPath, line + "\n"); } catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
     public void ForceReImportKeys()
     {
         _permFileReadPos = 0;
@@ -611,7 +643,7 @@ public class AppState : IDisposable
         {
             PacketDecryptor.ClearKeys();
             _permFileReadPos = 0;
-            File.WriteAllText(PermanentKeyLogPath, "# HyForce permanent SSL key log - cleared\r\n");
+            File.WriteAllText(PermanentKeyLogPath, "# HyForce permanent SSL key log - cleared");
             AddInGameLog("[AUTOKEY] Permanent log cleared.");
         }
         catch (Exception ex) { AddInGameLog($"[AUTOKEY] Clear error: {ex.Message}"); }
@@ -631,7 +663,7 @@ public class AppState : IDisposable
             Directory.CreateDirectory(ExportDirectory);
 
             // Create empty file (this triggers file watcher)
-            File.WriteAllText(keyLogPath, $"# HyForce Session {sessionId}\r\n");
+            File.WriteAllText(keyLogPath, $"# HyForce Session {sessionId}");
 
             // CRITICAL: Set for THIS PROCESS ONLY - Hytale must be restarted to pick this up
             Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.Process);
@@ -772,7 +804,7 @@ public class AppState : IDisposable
         {
             lock (_sessionLogLock)
             {
-                try { File.AppendAllText(SessionLogPath, stamped + "\n"); }
+                try { File.AppendAllText(SessionLogPath, stamped + ""); }
                 catch { /* never crash from log write failure */ }
             }
         }
@@ -879,7 +911,7 @@ public class AppState : IDisposable
 
             var fileInfo = new FileInfo(sessionFilePath);
             var content = File.ReadAllText(sessionFilePath);
-            var lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            var lines = content.Split(' ', StringSplitOptions.RemoveEmptyEntries)
                               .Where(l => !string.IsNullOrWhiteSpace(l) && !l.StartsWith("#"))
                               .ToList();
 
@@ -970,7 +1002,8 @@ public class AppState : IDisposable
             systemKeyLog,
             Path.Combine(ExportDirectory, "sslkeys.log"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "sslkeys.log"),
-            @"C:\Users\benja\source\repos\HyForce\Exported logs\sslkeys.log"
+            @"C:\Usersenja\source
+epos\HyForce\Exported logs\sslkeys.log"
         };
 
             foreach (var path in possiblePaths.Where(p => !string.IsNullOrEmpty(p)).Distinct())
@@ -998,7 +1031,7 @@ public class AppState : IDisposable
                     }
 
                     // Create fresh empty file with header
-                    File.WriteAllText(path, "# SSL Key Log - Fresh session started by HyForce\r\n");
+                    File.WriteAllText(path, "# SSL Key Log - Fresh session started by HyForce");
                 }
                 catch (Exception ex)
                 {
@@ -1035,7 +1068,7 @@ public class AppState : IDisposable
             {
                 // Strategy 2: Delete and recreate
                 File.Delete(path);
-                File.WriteAllText(path, "# SSL Key Log - Fresh start\r\n");
+                File.WriteAllText(path, "# SSL Key Log - Fresh start");
                 return true;
             }
             catch
