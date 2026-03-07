@@ -20,7 +20,8 @@ public class PacketFeedTab : ITab
     public string Name => "Packets";
 
     // -- Core state ------------------------------------------------------------
-    private readonly AppState         _state;
+    private readonly AppState               _state;
+    private readonly HyForce.Networking.PipeCaptureServer _pipe;
     private PacketLogEntry?           _selectedPacket;
 
     // Filter flags
@@ -56,8 +57,9 @@ public class PacketFeedTab : ITab
         ["Movement"]   = new[] { (ushort)0x6C },
     };
 
-    public PacketFeedTab(AppState state)
+    public PacketFeedTab(AppState state, HyForce.Networking.PipeCaptureServer pipe)
     {
+        _pipe = pipe;
         _state     = state;
         if (_excludeHandshake) _excluded.Add(0x0000);
     }
@@ -144,7 +146,7 @@ public class PacketFeedTab : ITab
         var acBg = new Vector4(Theme.ColAccent.X*.28f, Theme.ColAccent.Y*.28f, Theme.ColAccent.Z*.28f, 1f);
         ImGui.PushStyleColor(ImGuiCol.Button,  acBg);
         ImGui.PushStyleColor(ImGuiCol.Text,    Theme.ColAccent);
-        ImGui.PushStyleColor(ImGuiCol.Border,  Theme.ColAccent with { W = .7f });
+        ImGui.PushStyleColor(ImGuiCol.Border,  new System.Numerics.Vector4(Theme.ColAccent.X, Theme.ColAccent.Y, Theme.ColAccent.Z, .7f));
         if (ImGui.Button("F8: Capture", new Vector2(90f, bh))) { /* hotkey hint */ }
         ImGui.PopStyleColor(3);
         ImGui.SameLine(0, 4);
@@ -377,8 +379,24 @@ public class PacketFeedTab : ITab
 
             ImGui.PushStyleColor(ImGuiCol.Button, Theme.ColDanger);
             if (ImGui.Button("Inject", new Vector2(56f, bh)))
-                _state.AddInGameLog($"[INJECT] 0x{pkt.OpcodeDecimal:X4} -- not yet wired");
+            {
+                if (!string.IsNullOrEmpty(pkt.RawHexPreview))
+                {
+                    _pipe.PktForge(pkt.RawHexPreview);
+                    _state.AddInGameLog($"[INJECT] Sent 0x{pkt.OpcodeDecimal:X4} ({pkt.RawHexPreview.Length / 2}B) → server");
+                }
+                else
+                    _state.AddInGameLog("[INJECT] No raw bytes available for this packet");
+            }
             ImGui.PopStyleColor();
+            ImGui.SameLine(0, 4);
+
+            if (ImGui.Button("Copy Hex", new Vector2(70f, bh)))
+            {
+                try { TextCopy.ClipboardService.SetText(pkt.RawHexPreview); }
+                catch { }
+                _state.AddInGameLog("[COPY] Hex copied to clipboard");
+            }
             ImGui.SameLine(0, 4);
 
             bool aSet = _differA != null;
@@ -430,7 +448,7 @@ public class PacketFeedTab : ITab
         ImGui.SetNextWindowSizeConstraints(new Vector2(360f, 300f), new Vector2(800f, io.DisplaySize.Y - 100f));
 
         // Color the window border with the category color
-        ImGui.PushStyleColor(ImGuiCol.Border, cc with { W = .6f });
+        ImGui.PushStyleColor(ImGuiCol.Border, new System.Numerics.Vector4(cc.X, cc.Y, cc.Z, .6f));
         ImGui.PushStyleColor(ImGuiCol.TitleBg,       Theme.Current?.ChildBg ?? Theme.ColBg3);
         ImGui.PushStyleColor(ImGuiCol.TitleBgActive,  new Vector4(cc.X*.2f, cc.Y*.2f, cc.Z*.2f, 1f));
 
@@ -960,7 +978,7 @@ public class PacketFeedTab : ITab
         ImGui.PushStyleColor(ImGuiCol.Button,        bgCol);
         ImGui.PushStyleColor(ImGuiCol.ButtonHovered, bgCol);
         ImGui.PushStyleColor(ImGuiCol.Text,          col);
-        ImGui.PushStyleColor(ImGuiCol.Border,        col with { W = .7f });
+        ImGui.PushStyleColor(ImGuiCol.Border,        new System.Numerics.Vector4(col.X, col.Y, col.Z, .7f));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding,  new Vector2(5f, 1f));
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 4f);
         ImGui.SmallButton(label);
@@ -974,7 +992,7 @@ public class PacketFeedTab : ITab
         ImGui.PushStyleColor(ImGuiCol.Button,        bgCol);
         ImGui.PushStyleColor(ImGuiCol.ButtonHovered, bgCol);
         ImGui.PushStyleColor(ImGuiCol.Text,          cc);
-        ImGui.PushStyleColor(ImGuiCol.Border,        cc with { W = .65f });
+        ImGui.PushStyleColor(ImGuiCol.Border,        new System.Numerics.Vector4(cc.X, cc.Y, cc.Z, .65f));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding,  new Vector2(6f, 2f));
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8f);
         ImGui.SmallButton(cat);
@@ -1069,7 +1087,7 @@ public class PacketFeedTab : ITab
             ImGui.PushStyleColor(ImGuiCol.Button,        bgOn);
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(activeCol.X*.42f, activeCol.Y*.42f, activeCol.Z*.42f, 1f));
             ImGui.PushStyleColor(ImGuiCol.Text,          activeCol);
-            ImGui.PushStyleColor(ImGuiCol.Border,        activeCol with { W = .9f });
+            ImGui.PushStyleColor(ImGuiCol.Border,        new System.Numerics.Vector4(activeCol.X, activeCol.Y, activeCol.Z, .9f));
         }
         else
         {

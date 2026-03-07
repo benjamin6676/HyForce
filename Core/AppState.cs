@@ -33,6 +33,9 @@ public class AppState : IDisposable
     public List<string> InGameLog { get; } = new();
     public const int MaxInGameLogLines = 1000;
 
+    // Last server IP seen in captured packets (set by hook log parser)
+    public string LastServerIp { get; set; } = "(unknown)";
+
     // ExportDirectory: defaults to %APPDATA%\HyForce\Exports (user-configurable in Settings)
     public string ExportDirectory { get; set; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -612,6 +615,10 @@ public class AppState : IDisposable
 
     public void ForceReImportKeys()
     {
+        // Clean key file first (deduplicate, cap at 100 sessions)
+        int cleaned = PacketDecryptor.CleanKeyLogFile(PermanentKeyLogPath);
+        if (cleaned > 0)
+            AddInGameLog($"[KEYS] Key file cleaned: {cleaned} lines remaining");
         _permFileReadPos = 0;
         PacketDecryptor.ClearKeys();
         ImportPermanentKeyLogFull("manual re-import");
@@ -781,9 +788,18 @@ public class AppState : IDisposable
             return InGameLog.TakeLast(count).ToList();
     }
 
+
     public void AddInGameLog(string message)
     {
         var stamped = $"[{DateTime.Now:HH:mm:ss}] {message}";
+        // Parse server IP from DLL stats log
+        int srvIdx = message.IndexOf("srvIP:");
+        if (srvIdx >= 0)
+        {
+            string ipPart = message[(srvIdx + 6)..].Split(' ')[0].Trim();
+            if (!string.IsNullOrEmpty(ipPart) && ipPart != "0.0.0.0")
+                LastServerIp = ipPart;
+        }
         // ── Write to in-game log buffer ──
         lock (InGameLog)
         {

@@ -1,4 +1,5 @@
 using HyForce.Core;
+using HyForce.Diagnostics;
 using HyForce.Tabs;
 using HyForce.UI;
 using HyForce.Utils;
@@ -36,6 +37,9 @@ namespace HyForce.App
         private readonly List<ITab> _tabs = new();
         private int _activeTab;
 
+        // ── Memory Toggle Manager ─────────────────────────────────
+        private HyForce.Core.MemoryToggleManager _toggleMgr = null!;
+
         // ── Frame state ───────────────────────────────────────────
         private float _dt;
         private float _fpsSmooth = 60f;
@@ -69,13 +73,20 @@ namespace HyForce.App
             // WinDivert auto-start check: if DLL shows 0 packets after 30s
             _winDivertCheckAt = DateTime.Now.AddSeconds(30);
 
-            // ── Register the 7 tabs ───────────────────────────────
-            _tabs.Add(new PacketFeedTab(_state));
+            // ── Register the tabs ─────────────────────────────────
+            _tabs.Add(new PacketFeedTab(_state, _pipeServer));
             _tabs.Add(new DecryptionTab(_state));
+            _toggleMgr = new HyForce.Core.MemoryToggleManager(_pipeServer, _state);
+            var togglesTab    = new MemoryTogglesTab(_state, _pipeServer, _toggleMgr);
+            var valueToggleTab = new ValueToggleTab(_state, _pipeServer);   // v11 modular system
             _tabs.Add(new MemoryResearchTab(_state, _pipeServer));
+            _tabs.Add(togglesTab);
+            _tabs.Add(valueToggleTab);
             _tabs.Add(new ProtocolLabTab(_state, _pipeServer));
+            _tabs.Add(new SecurityAuditTab(_state, _pipeServer));
             _tabs.Add(new InjectionTab(_state, _pipeServer));
             _tabs.Add(new LogTab(_state));
+            _tabs.Add(new DiagnosticsTab(_state, _pipeServer, _toggleMgr, valueToggleTab));
             _tabs.Add(new SettingsTab(_state));
 
 

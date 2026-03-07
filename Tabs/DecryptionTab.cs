@@ -85,115 +85,50 @@ namespace HyForce.Tabs
                 statusDetail = "Decryption ready! Packets will be decrypted automatically.";
             }
 
-            // Render status panel
-            ImGui.PushStyleColor(ImGuiCol.ChildBg, statusColor with { W = 0.12f });
-            ImGui.PushStyleColor(ImGuiCol.Border, statusColor with { W = 0.5f });
-            ImGui.BeginChild("##status", new Vector2(-1, 90), ImGuiChildFlags.Borders);
-
-            ImGui.TextColored(statusColor, statusTitle);
-            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), statusDetail);
-
-            // Action buttons
-            if (!envConfigured || !envCorrect)
-            {
-                ImGui.SameLine(ImGui.GetContentRegionAvail().X - 140);
-                ImGui.PushStyleColor(ImGuiCol.Button, statusColor with { W = 0.3f });
-                if (ImGui.Button("🔧 Fix Environment", new Vector2(140, 28)))
-                {
-                    _state.ForceSetupEnvironmentVariable(                    _state.GetShowRestartBanner());
-                }
-                ImGui.PopStyleColor();
-            }
-            else if (keys == 0)
-            {
-                ImGui.SameLine(ImGui.GetContentRegionAvail().X - 140);
-                if (ImGui.Button("🔄 Re-Import Keys", new Vector2(140, 28)))
-                {
-                    _state.ForceReImportKeys();
-                }
-            }
-
-            ImGui.EndChild();
-            ImGui.PopStyleColor(2);
-
-            
-            string statusText;
-
-            if (!envConfigured)
-            {
-                statusColor = new Vector4(1f, 0.3f, 0.2f, 1f); // Red
-                statusText = "SSLKEYLOGFILE NOT SET - Run as Administrator once";
-            }
-            else if (!envCorrect)
-            {
-                statusColor = new Vector4(1f, 0.7f, 0.2f, 1f); // Orange
-                statusText = "SSLKEYLOGFILE points to wrong location - Click 'Fix'";
-            }
-            else if (keys == 0)
-            {
-                statusColor = new Vector4(0.9f, 0.8f, 0.2f, 1f); // Yellow
-                statusText = "Waiting for Hytale to connect and generate keys...";
-            }
-            else
-            {
-                statusColor = new Vector4(0.2f, 1f, 0.4f, 1f); // Green
-                statusText = $"✅ {keys} keys active - Decryption ready";
-            }
-
-            ImGui.PushStyleColor(ImGuiCol.ChildBg, statusColor with { W = 0.15f });
-            ImGui.BeginChild("##status", new Vector2(-1, 80), ImGuiChildFlags.Borders);
-
-            ImGui.TextColored(statusColor, statusText);
-
-            if (!envConfigured || !envCorrect)
-            {
-                if (ImGui.Button("🔧 Fix Environment Variable"))
-                {
-                    _state.ForceSetupEnvironmentVariable(                    _state.GetShowRestartBanner());
-                }
-                ImGui.SameLine();
-            }
-
-            if (keys == 0 && envCorrect)
-            {
-                ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f),
-                    "Make sure Hytale is running and connected to a server");
-            }
-
-            ImGui.EndChild();
-            ImGui.PopStyleColor();
+            // --- Unified status panel (single ##status child — no duplicate IDs) ---
             int success = (int)stats["SuccessfulDecryptions"];
             int failed  = (int)stats["FailedDecryptions"];
             bool hasKeys = keys > 0;
 
-            // Status panel
-            var bgCol = hasKeys ? new Vector4(.04f,.14f,.04f,1f) : new Vector4(.18f,.10f,.02f,1f);
-            ImGui.PushStyleColor(ImGuiCol.ChildBg, bgCol);
-            ImGui.BeginChild("##status", new Vector2(-1, 70), ImGuiChildFlags.Borders);
+            // Derive panel background from state priority: env error > session mismatch > waiting > ready
+            Vector4 panelBg;
+            if (!envConfigured || !envCorrect)
+                panelBg = new Vector4(.18f, .04f, .04f, 1f);   // dark red
+            else if (hasKeys && failed > 200 && success == 0)
+                panelBg = new Vector4(.18f, .10f, .02f, 1f);   // dark orange
+            else if (!hasKeys)
+                panelBg = new Vector4(.12f, .10f, .02f, 1f);   // dark yellow
+            else
+                panelBg = new Vector4(.04f, .14f, .04f, 1f);   // dark green
 
-            if (!hasKeys)
+            ImGui.PushStyleColor(ImGuiCol.ChildBg, panelBg);
+            ImGui.PushStyleColor(ImGuiCol.Border,  new System.Numerics.Vector4(statusColor.X, statusColor.Y, statusColor.Z, 0.5f));
+            ImGui.BeginChild("##statusPanel", new Vector2(-1, 95), ImGuiChildFlags.Borders);
+
+            // Row 1: title + detail
+            ImGui.TextColored(statusColor, statusTitle);
+            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1f), statusDetail);
+
+            // Row 2: contextual body text for session mismatch / waiting
+            if (hasKeys && failed > 200 && success == 0)
             {
-                ImGui.TextColored(new Vector4(1f,.7f,.1f,1f), "WAITING FOR HYTALE");
-                ImGui.TextColored(new Vector4(.6f,.6f,.6f,1f), "Launch Hytale -- keys will appear here automatically.");
-            }
-            else if (failed > 200 && success == 0)
-            {
-                // 200+ failures = almost certainly session mismatch
                 ImGui.TextColored(new Vector4(1f,.4f,.1f,1f), $"SESSION MISMATCH — {keys} keys loaded but 0 decrypted from {failed} attempts");
                 ImGui.TextColored(new Vector4(1f,.9f,.2f,1f), "FIX: With proxy running, RESTART HYTALE so it connects THROUGH the proxy.");
-                ImGui.TextColored(new Vector4(.5f,.5f,.5f,1f), "Keys log new session on reconnect — they will then match the captured packets.");
-            }
-            else
-            {
-                ImGui.TextColored(new Vector4(.2f,1f,.4f,1f), $"KEYS READY ({keys})  --  label: {_fmtLabels[_selectedFmt]}");
-                ImGui.TextColored(new Vector4(.6f,.6f,.6f,1f), failed == 0
-                    ? "Start capturing to see decryption results"
-                    : $"Decrypting: {success} OK  {failed} failed");
             }
 
-            if (ImGui.Button("Re-Import Keys")) _state.ForceReImportKeys();
+            // Row 3: action buttons
+            if (!envConfigured || !envCorrect)
+            {
+                ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(statusColor.X, statusColor.Y, statusColor.Z, 0.3f));
+                if (ImGui.Button("🔧 Fix Environment")) _state.ForceSetupEnvironmentVariable(_state.GetShowRestartBanner());
+                ImGui.PopStyleColor();
+                ImGui.SameLine();
+            }
+            if (ImGui.Button("🔄 Re-Import Keys")) _state.ForceReImportKeys();
             ImGui.SameLine();
-            if (ImGui.Button("Open Key Log File")) { try { System.Diagnostics.Process.Start("notepad.exe", _state.PermanentKeyLogPath); } catch { } }
+            if (ImGui.Button("Fresh Start")) PacketDecryptor.FreshStart(_state.PermanentKeyLogPath);
+            ImGui.SameLine();
+            if (ImGui.Button("Open Key Log")) { try { System.Diagnostics.Process.Start("notepad.exe", _state.PermanentKeyLogPath); } catch { } }
             ImGui.SameLine();
             if (ImGui.Button("Export Diagnostics")) ExportDiagnostics();
             ImGui.SameLine();
@@ -212,7 +147,7 @@ namespace HyForce.Tabs
             if (ImGui.Button("Advanced")) _showAdvanced = !_showAdvanced;
 
             ImGui.EndChild();
-            ImGui.PopStyleColor();
+            ImGui.PopStyleColor(2);
 
             // Pill badges
             ImGui.Spacing();
@@ -677,7 +612,7 @@ namespace HyForce.Tabs
                 sb.AppendLine("No .key files found in any location.");
                 sb.AppendLine();
                 sb.AppendLine("To add a manual path, edit this line in DecryptionTab.cs:");
-                sb.AppendLine($"  string manualKeyPath = @\"{manualKeyPath}\";");
+                sb.AppendLine($"  string manualKeyPath = @\"{manualKeyPath}\";");;
                 sb.AppendLine();
                 sb.AppendLine("Or set the HYFORCE_KEY_PATH environment variable.");
             }
@@ -735,10 +670,10 @@ namespace HyForce.Tabs
 
         private static void Pill(string text, Vector4 col)
         {
-            ImGui.PushStyleColor(ImGuiCol.Button, col with { W = .22f });
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, col with { W = .22f });
+            ImGui.PushStyleColor(ImGuiCol.Button, new System.Numerics.Vector4(col.X, col.Y, col.Z, .22f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new System.Numerics.Vector4(col.X, col.Y, col.Z, .22f));
             ImGui.PushStyleColor(ImGuiCol.Text, col);
-            ImGui.PushStyleColor(ImGuiCol.Border, col with { W = .55f });
+            ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(col.X, col.Y, col.Z, 0.55f));
             ImGui.SmallButton(text);
             ImGui.PopStyleColor(4);
         }

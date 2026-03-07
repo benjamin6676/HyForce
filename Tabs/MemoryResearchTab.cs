@@ -52,6 +52,13 @@ namespace HyForce.Tabs
         private int _selectedHit = -1;
         private int _selectedBm = -1;
 
+        // ── Freeze state ──────────────────────────────────────────
+        private ulong  _frozenHpAddr  = 0;   // 0 = not frozen
+        private ulong  _frozenPosAddr = 0;
+        private float  _frozenHpVal   = 0f;
+        private float  _frozenMaxHpVal = 0f;
+        private double _frozenX, _frozenY, _frozenZ;
+
         // Notes editor
         private string _notes = DefaultNotes;
 
@@ -83,6 +90,11 @@ namespace HyForce.Tabs
             ImGui.SameLine();
             if (ImGui.SmallButton("Scan Now"))
             { _pipe.MemHits.Clear(); _pipe.MemScan(); }
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Broad Scan"))
+            { _pipe.MemHits.Clear(); _pipe.MemScanBroad(); }
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.55f,0.55f,0.55f,1f), "(Broad: looser filters, more hits)");
             ImGui.SameLine();
             ImGui.Checkbox("Auto-refresh 10s", ref _autoRefreshScans);
             ImGui.Separator();
@@ -121,6 +133,35 @@ namespace HyForce.Tabs
             ImGui.TextColored(Accent, "Entity / Player Struct Finder");
             ImGui.TextWrapped("Scans process memory for structs matching the pattern: [float health][float maxHP][double X][double Y][double Z][float vx][float vy][float vz]. NOTE: JVM heap objects move on GC. Re-scan periodically. If no hits: Hytale may use different struct layout — try Pattern Scan with known values.");
             ImGui.Spacing();
+
+            // ── Active freeze status bar ──────────────────────────
+            bool anyFrozen = _frozenHpAddr != 0 || _frozenPosAddr != 0;
+            if (anyFrozen)
+            {
+                ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0.35f, 0.05f, 0.05f, 0.85f));
+                ImGui.BeginChild("##freezeStatus", new Vector2(-1, 26), ImGuiChildFlags.None);
+                ImGui.SetCursorPosY(ImGui.GetCursorPosY() + 4);
+                ImGui.TextColored(new Vector4(1f, 0.35f, 0.35f, 1f), "  🔒 FREEZE ACTIVE:");
+                if (_frozenHpAddr != 0)
+                {
+                    ImGui.SameLine();
+                    ImGui.TextColored(Yellow, $" HP @ 0x{_frozenHpAddr:X}  ({_frozenHpVal:F1}/{_frozenMaxHpVal:F1})");
+                    ImGui.SameLine();
+                    if (ImGui.SmallButton("Stop HP##globalstop"))
+                    { _pipe.FreezeHpStop(); _frozenHpAddr = 0; }
+                }
+                if (_frozenPosAddr != 0)
+                {
+                    ImGui.SameLine();
+                    ImGui.TextColored(new Vector4(0.4f, 0.9f, 1f, 1f), $" Pos @ 0x{_frozenPosAddr:X}  ({_frozenX:F1}, {_frozenY:F1}, {_frozenZ:F1})");
+                    ImGui.SameLine();
+                    if (ImGui.SmallButton("Stop Pos##globalstop"))
+                    { _pipe.FreezePosStop(); _frozenPosAddr = 0; }
+                }
+                ImGui.EndChild();
+                ImGui.PopStyleColor();
+                ImGui.Spacing();
+            }
 
             ImGui.Text($"Results: {_pipe.MemHits.Count}");
             ImGui.SameLine();
@@ -192,6 +233,55 @@ namespace HyForce.Tabs
                         if (ImGui.SmallButton($"Save##ss{i}")) AddSavedScan(h);
                         ImGui.SameLine();
                         if (ImGui.SmallButton($"Export##ex{i}")) ExportStruct(h);
+                        ImGui.SameLine();
+                        if (ImGui.SmallButton($"Copy addr##ca{i}"))
+                        {
+                            ImGui.SetClipboardText($"0x{h.Address:X}");
+                            _state.AddInGameLog($"[COPY] Address 0x{h.Address:X} copied — paste into Value Toggles tab");
+                        }
+
+                        // ── Freeze HP toggle ──────────────────────
+                        ImGui.SameLine();
+                        bool hpFrozen = _frozenHpAddr == h.Address;
+                        if (hpFrozen)
+                        {
+                            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.7f, 0.15f, 0.15f, 1f));
+                            if (ImGui.SmallButton($"🔒 HP##fhp{i}"))
+                            { _pipe.FreezeHpStop(); _frozenHpAddr = 0; }
+                            ImGui.PopStyleColor();
+                        }
+                        else
+                        {
+                            if (ImGui.SmallButton($"🔓 HP##fhp{i}"))
+                            {
+                                _frozenHpVal    = h.Health > 0 ? h.Health : h.MaxHealth;
+                                _frozenMaxHpVal = h.MaxHealth > 0 ? h.MaxHealth : h.Health;
+                                _pipe.FreezeHp(h.Address, _frozenHpVal, _frozenMaxHpVal);
+                                _frozenHpAddr = h.Address;
+                                _state.AddInGameLog($"[FREEZE] HP frozen @ 0x{h.Address:X} = {_frozenHpVal:F1}/{_frozenMaxHpVal:F1}");
+                            }
+                        }
+
+                        // ── Freeze Position toggle ─────────────────
+                        ImGui.SameLine();
+                        bool posFrozen = _frozenPosAddr == h.Address;
+                        if (posFrozen)
+                        {
+                            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.7f, 0.15f, 0.15f, 1f));
+                            if (ImGui.SmallButton($"🔒 Pos##fps{i}"))
+                            { _pipe.FreezePosStop(); _frozenPosAddr = 0; }
+                            ImGui.PopStyleColor();
+                        }
+                        else
+                        {
+                            if (ImGui.SmallButton($"🔓 Pos##fps{i}"))
+                            {
+                                _frozenX = h.X; _frozenY = h.Y; _frozenZ = h.Z;
+                                _pipe.FreezePos(h.Address, _frozenX, _frozenY, _frozenZ);
+                                _frozenPosAddr = h.Address;
+                                _state.AddInGameLog($"[FREEZE] Pos frozen @ 0x{h.Address:X} ({_frozenX:F2}, {_frozenY:F2}, {_frozenZ:F2})");
+                            }
+                        }
                     }
                 }
                 ImGui.EndTable();
@@ -370,13 +460,14 @@ namespace HyForce.Tabs
                 if (ImGui.InputText("Name##sn", ref name, 64))
                     scan.Name = name;
 
-                if (ImGui.BeginTable($"##wf{scan.Address}", 4,
+                if (ImGui.BeginTable($"##wf{scan.Address}", 5,
                     ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
                 {
                     ImGui.TableSetupColumn("Field", ImGuiTableColumnFlags.WidthFixed, 100);
                     ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.WidthFixed, 60);
                     ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.WidthFixed, 80);
-                    ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthStretch);
+                    ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthFixed, 130);
+                    ImGui.TableSetupColumn("Write", ImGuiTableColumnFlags.WidthStretch);
                     ImGui.TableHeadersRow();
 
                     foreach (var f in scan.Fields)
@@ -390,6 +481,62 @@ namespace HyForce.Tabs
                         if (changed) ImGui.TableSetBgColor(ImGuiTableBgTarget.CellBg,
                             ImGui.ColorConvertFloat4ToU32(new Vector4(0.4f, 0.2f, 0f, 0.6f)));
                         ImGui.TextColored(changed ? Yellow : Vector4.One, f.ValueStr);
+
+                        // ── One-shot write (all supported types) ──
+                        ImGui.TableSetColumnIndex(4);
+                        ImGui.PushID($"wr{scan.Address}{f.Offset}");
+                        ImGui.SetNextItemWidth(80);
+                        ulong targetAddr = scan.Address + (ulong)f.Offset;
+
+                        if (f.Type == FieldType.Float32)
+                        {
+                            float writeVal = float.TryParse(f.ValueStr, out float pv) ? pv : 0f;
+                            ImGui.InputFloat("##wv", ref writeVal, 0, 0, "%.3f");
+                            ImGui.SameLine();
+                            if (ImGui.SmallButton("Set"))
+                            {
+                                _pipe.MemWriteF32(targetAddr, writeVal);
+                                _state.AddInGameLog($"[WRITE] {f.Name} @ 0x{targetAddr:X} ← {writeVal:G6} (f32)");
+                            }
+                        }
+                        else if (f.Type == FieldType.Float64)
+                        {
+                            float writeVal = float.TryParse(f.ValueStr, out float pv64) ? pv64 : 0f;
+                            ImGui.InputFloat("##wv", ref writeVal, 0, 0, "%.4f");
+                            ImGui.SameLine();
+                            if (ImGui.SmallButton("Set"))
+                            {
+                                _pipe.MemWriteF64(targetAddr, (double)writeVal);
+                                _state.AddInGameLog($"[WRITE] {f.Name} @ 0x{targetAddr:X} ← {writeVal:G8} (f64)");
+                            }
+                        }
+                        else if (f.Type == FieldType.Int32)
+                        {
+                            int writeVal = int.TryParse(f.ValueStr, out int pvi) ? pvi : 0;
+                            ImGui.InputInt("##wv", ref writeVal);
+                            ImGui.SameLine();
+                            if (ImGui.SmallButton("Set"))
+                            {
+                                _pipe.MemWriteI32(targetAddr, writeVal);
+                                _state.AddInGameLog($"[WRITE] {f.Name} @ 0x{targetAddr:X} ← {writeVal} (i32)");
+                            }
+                        }
+                        else if (f.Type == FieldType.Byte)
+                        {
+                            int writeVal = int.TryParse(f.ValueStr, out int pvb) ? pvb & 0xFF : 0;
+                            ImGui.InputInt("##wv", ref writeVal);
+                            ImGui.SameLine();
+                            if (ImGui.SmallButton("Set"))
+                            {
+                                _pipe.MemWriteU8(targetAddr, (byte)(writeVal & 0xFF));
+                                _state.AddInGameLog($"[WRITE] {f.Name} @ 0x{targetAddr:X} ← {(byte)writeVal} (u8)");
+                            }
+                        }
+                        else
+                        {
+                            ImGui.TextColored(Muted, "—");
+                        }
+                        ImGui.PopID();
                     }
                     ImGui.EndTable();
                 }

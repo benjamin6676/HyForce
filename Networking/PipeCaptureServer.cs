@@ -141,17 +141,36 @@ namespace HyForce.Networking
         private readonly object _gadgetLock = new();
 
         public readonly List<MemScanHit>    MemHits      = new();
+        public readonly List<MemReadResult>  MemReadResults = new();
         public readonly List<TimingEntry>   TimingLog    = new();
         public readonly List<string>        SeqAnomalies = new();
         public readonly List<MemWatchEntry> MemWatchLog  = new();
         public readonly List<ModuleInfo>    Modules      = new();
         public readonly List<GadgetHit>     Gadgets      = new();
         public readonly List<StringHit>     Strings      = new();
+        public readonly List<PlaintextEntry> PlaintextPackets = new();
         public readonly object              StringLock   = new();
+        public readonly object              PlaintextLock = new();
 
         public const int MAX_TIMING = 2000;
         public int LastRateLimitSent;
         public int LastRateLimitIntervalMs;
+
+        // ── Diagnostics properties (for DiagnosticsCollector) ────────────────
+        public DateTime StartedAt       { get; private set; } = DateTime.Now;
+        public DateTime LastMessageAt   { get; private set; } = DateTime.MinValue;
+        public int  S2cCount            { get; private set; }
+        public int  C2sCount            { get; private set; }
+        public int  TcpCount            { get; private set; }
+        // Hook fire counts from DLL STATS reply
+        public long StatWSASendTo       { get; private set; }
+        public long StatSendTo          { get; private set; }
+        public long StatWSARecvFrom     { get; private set; }
+        public long StatRecvFrom        { get; private set; }
+
+        // ── MemoryToggleSystem hookup ─────────────────────────────────────────
+        // Set this after construction so HandleMemRead can forward read-backs
+        public HyForce.Core.MemoryToggleSystem? ToggleSystem { get; set; }
 
         // ── Public properties ─────────────────────────────────────────────────────
         public bool     IsRunning       => _running;
@@ -240,6 +259,19 @@ namespace HyForce.Networking
             => SendCommand($"MEMWATCH {address:X} {pollMs}");
         public void MemWatchStop()
             => SendCommand("MEMWATCH_STOP");
+
+        // ── Freeze / write helpers ────────────────────────────────
+        public void FreezeHp(ulong address, float hp, float maxHp)
+            => SendCommand($"FREEZE_HP {address:X} {hp:G6} {maxHp:G6}");
+        public void FreezeHpStop()
+            => SendCommand("FREEZE_HP_STOP");
+        public void FreezePos(ulong address, double x, double y, double z)
+            => SendCommand($"FREEZE_POS {address:X} {x:G10} {y:G10} {z:G10}");
+        public void FreezePosStop()
+            => SendCommand("FREEZE_POS_STOP");
+        public void MemWriteF32(ulong address, float value)
+            => SendCommand($"MEMWRITE_F32 {address:X} {value:G6}");
+
 
         public void RegisterInjectorPid()
             => SendCommand($"INJPID {System.Diagnostics.Process.GetCurrentProcess().Id}");
@@ -363,6 +395,8 @@ namespace HyForce.Networking
                     case 0x12: HandleGadget(pay);        break;
                     case 0x13: HandleExploitResult(pay); break;
                     case 0x14: HandleProcDump(pay);      break;
+                    case 0x15: HandlePlaintext(pay);     break;
+                    case 0x1C: HandleMemRead(pay);       break;
                     // Unknown types are silently skipped
                 }
             }
@@ -396,8 +430,12 @@ namespace HyForce.Networking
                 DestPort       = dir == 0 ? port : 0,
             };
 
+            if (pkt.Direction == PacketDirection.ServerToClient) S2cCount++;
+            else C2sCount++;
+            if (pkt.IsTcp) TcpCount++;
+
             Interlocked.Increment(ref _packetCount);
-            _lastPkt = DateTime.Now;
+            LastMessageAt = _lastPkt = DateTime.Now;
             OnPacketReceived?.Invoke(pkt);
         }
 
@@ -405,12 +443,36 @@ namespace HyForce.Networking
         {
             _dllStatus = System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0');
             _state.AddInGameLog($"[DLL] {_dllStatus}");
+            LastMessageAt = DateTime.Now;
         }
 
         private void HandleLog(byte[] pay)
         {
-            _state.AddInGameLog(
-                $"[DLL] {System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0')}");
+            string msg = System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0');
+            _state.AddInGameLog($"[DLL] {msg}");
+            LastMessageAt = DateTime.Now;
+
+            // Parse STATS line from DLL: "[STATS] WSASendTo:N sendto:N WSARecvFrom:N recvfrom:N pkts:N"
+            if (msg.Contains("[STATS]"))
+            {
+                try
+                {
+                    long Parse(string key)
+                    {
+                        int i = msg.IndexOf(key + ":");
+                        if (i < 0) return 0;
+                        i += key.Length + 1;
+                        int end = i;
+                        while (end < msg.Length && (char.IsDigit(msg[end]) || msg[end] == '-')) end++;
+                        return long.TryParse(msg[i..end], out long v) ? v : 0;
+                    }
+                    StatWSASendTo  = Parse("WSASendTo");
+                    StatSendTo     = Parse("sendto");
+                    StatWSARecvFrom= Parse("WSARecvFrom");
+                    StatRecvFrom   = Parse("recvfrom");
+                }
+                catch { }
+            }
         }
 
         private void HandleTiming(byte[] pay)
@@ -460,6 +522,21 @@ namespace HyForce.Networking
                 hit.VelZ      = BitConverter.ToSingle(data, 40);
             }
             lock (_memLock) { MemHits.Add(hit); }
+        }
+
+        private readonly object _memReadLock = new();
+        private void HandleMemRead(byte[] pay)
+        {
+            if (pay.Length < 8) return;
+            ulong addr = BitConverter.ToUInt64(pay, 0);
+            byte[] data = new byte[pay.Length - 8];
+            if (data.Length > 0) Buffer.BlockCopy(pay, 8, data, 0, data.Length);
+            var result = new MemReadResult { Address = addr, Data = data, ReadAt = DateTime.Now };
+            lock (_memReadLock) { MemReadResults.Add(result); if (MemReadResults.Count > 200) MemReadResults.RemoveAt(0); }
+            _state.AddInGameLog($"[MEMREAD] 0x{addr:X14}: {data.Length}B → {BitConverter.ToString(data.Take(16).ToArray()).Replace("-"," ")}");
+            // Forward to ToggleSystem for write confirmation
+            ToggleSystem?.OnMemReadResult(addr, data);
+            LastMessageAt = DateTime.Now;
         }
 
         private void HandleRateLimit(byte[] pay)
@@ -588,6 +665,49 @@ namespace HyForce.Networking
                 $"[DUMP] @0x{addr:X16} {sz}B  {hex[..Math.Min(64, hex.Length)]}{(hex.Length > 64 ? "..." : "")}");
         }
 
+        private void HandlePlaintext(byte[] pay)
+        {
+            // MSG_PLAINTEXT layout: 1B direction, 4B IP, 2B port, rest = plaintext app data
+            if (pay.Length < 7) return;
+            byte   dir   = pay[0];
+            uint   ipRaw = BitConverter.ToUInt32(pay, 1);
+            ushort port  = BitConverter.ToUInt16(pay, 5);
+            int    dLen  = pay.Length - 7;
+            if (dLen <= 0) return;
+
+            byte[] data = new byte[dLen];
+            Array.Copy(pay, 7, data, 0, dLen);
+
+            var ip = new System.Net.IPAddress(ipRaw).ToString();
+            var entry = new PlaintextEntry
+            {
+                Timestamp  = DateTime.UtcNow,
+                Direction  = dir == 0 ? "C→S" : "S→C",
+                RemoteAddr = $"{ip}:{port}",
+                Data       = data,
+                HexPreview = BitConverter.ToString(data, 0, Math.Min(32, data.Length)).Replace("-", " ")
+            };
+
+            lock (PlaintextLock)
+            {
+                PlaintextPackets.Add(entry);
+                if (PlaintextPackets.Count > 2000)
+                    PlaintextPackets.RemoveAt(0);
+            }
+            _state.AddInGameLog($"[PLAIN] {entry.Direction} {entry.RemoteAddr}  {dLen}B  {entry.HexPreview[..Math.Min(32, entry.HexPreview.Length)]}");
+        }
+
+        public void QuicheProbe() => SendCommand("QUICHEPROBE");
+        public void MemScanBroad()                           => SendCommand("MEMSCAN_BROAD");
+        public void MemRead(ulong address, uint size = 64)   => SendCommand($"MEMREAD {address:X} {size}");
+        public void MemWriteF64(ulong address, double value) => SendCommand($"MEMWRITE_F64 {address:X} {value:G15}");
+        public void MemWriteI32(ulong address, int value)    => SendCommand($"MEMWRITE_I32 {address:X} {value}");
+        public void MemWriteU8(ulong address, byte value)    => SendCommand($"MEMWRITE_U8 {address:X} {value}");
+        public void FreezeGeneric(int slot, ulong address, string dtype, string value, int intervalMs = 50)
+            => SendCommand($"FREEZE_GENERIC {slot} {address:X} {dtype} {value} {intervalMs}");
+        public void FreezeGenericStop(int slot) => SendCommand($"FREEZE_GENERIC_STOP {slot}");
+        public void FreezeAllStop() => SendCommand("FREEZE_ALL_STOP");
+
         private static bool ReadExact(System.IO.Stream s, byte[] buf, int count)
         {
             int read = 0;
@@ -602,11 +722,30 @@ namespace HyForce.Networking
     }
 
     // ── Supporting data types ─────────────────────────────────────────────────────
+    public class PlaintextEntry
+    {
+        public DateTime Timestamp  { get; set; }
+        public string   Direction  { get; set; } = "";
+        public string   RemoteAddr { get; set; } = "";
+        public byte[]   Data       { get; set; } = Array.Empty<byte>();
+        public string   HexPreview { get; set; } = "";
+    }
+
     public class TimingEntry
     {
         public ulong TimestampUs { get; set; }
         public uint  Length      { get; set; }
         public byte  Dir         { get; set; }
+    }
+
+    public class MemReadResult
+    {
+        public ulong    Address { get; set; }
+        public byte[]   Data    { get; set; } = Array.Empty<byte>();
+        public DateTime ReadAt  { get; set; } = DateTime.Now;
+        public float    AsF32(int offset = 0) => offset + 4 <= Data.Length ? BitConverter.ToSingle(Data, offset) : float.NaN;
+        public double   AsF64(int offset = 0) => offset + 8 <= Data.Length ? BitConverter.ToDouble(Data, offset) : double.NaN;
+        public int      AsI32(int offset = 0) => offset + 4 <= Data.Length ? BitConverter.ToInt32(Data, offset) : 0;
     }
 
     public class MemScanHit

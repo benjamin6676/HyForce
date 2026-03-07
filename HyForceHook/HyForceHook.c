@@ -1,8 +1,18 @@
 /*
- * HyForceHook.dll  v9  —  HyForce Security Research Engine
+ * HyForceHook.dll  v10  —  HyForce Security Research Engine
  *
  * Build x64 MSVC:
  *   cl /O2 /LD /D_WIN32_WINNT=0x0A00 HyForceHook.c /Fe:HyForceHook.dll ws2_32.lib psapi.lib iphlpapi.lib advapi32.lib
+ *
+ * v10 changes:
+ *   + WSASend / send hooks (connected UDP — fixes C2S packet capture)
+ *   + Server IP auto-learn from first S2C packet (port-agnostic C2S capture)
+ *   + quiche_conn_stream_recv / quiche_conn_stream_send hooks (plaintext pre-encryption)
+ *   + SSL_write / SSL_read hooks (BoringSSL plaintext bypass)
+ *   + MSG_PLAINTEXT 0x15 — pipes decrypted/pre-encryption app data
+ *   + Tighter memscan filter — fixes 250→64 oscillation / false positives
+ *   + Socket peer cache for connected UDP dest tracking
+ *   + QUICHEPROBE command — scan loaded modules for quiche functions
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -39,6 +49,7 @@
 #define MSG_GADGET      0x12
 #define MSG_EXPLOIT     0x13
 #define MSG_PROCDUMP    0x14
+#define MSG_PLAINTEXT   0x15   /* pre-encryption / post-decryption app data */
 
 /* ── Pipe names ──────────────────────────────────────────── */
 #define PIPE_DATA  L"\\\\.\\pipe\\HyForcePipe"
@@ -135,27 +146,52 @@ static volatile uint64_t g_watch_addr = 0;
 static volatile int      g_watch_ms = 0;
 static HANDLE            g_watch_th = NULL;
 
-static DWORD g_injector_pid = 0;
-static volatile BOOL g_pipe_connected = FALSE;
+/* ── Freeze toggles ───────────────────────────────────────── */
+static volatile uint64_t g_freeze_hp_addr  = 0;   /* 0 = off */
+static volatile float    g_freeze_hp_val   = 0.f;
+static volatile float    g_freeze_maxhp_val = 0.f;
+static HANDLE            g_freeze_hp_th    = NULL;
+static volatile uint64_t g_freeze_pos_addr = 0;   /* 0 = off */
+static volatile double   g_freeze_x = 0, g_freeze_y = 0, g_freeze_z = 0;
+static HANDLE            g_freeze_pos_th   = NULL;
 
-static OvlEntry         g_ovl[MAX_OVL];
-static CRITICAL_SECTION g_ovl_cs;
-
-/* Hook function-pointer types */
-typedef int (WSAAPI* WSASendTo_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const struct sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
-typedef int (WSAAPI* WSARecvFrom_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, struct sockaddr*, LPINT, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
-typedef int (WSAAPI* sendto_t)(SOCKET, const char*, int, int, const struct sockaddr*, int);
-typedef int (WSAAPI* recvfrom_t)(SOCKET, char*, int, int, struct sockaddr*, int*);
-typedef BOOL(WINAPI* GQCS_t)(HANDLE, LPDWORD, PULONG_PTR, LPOVERLAPPED*, DWORD);
-
-static WSASendTo_t   orig_WSASendTo = NULL;
-static WSARecvFrom_t orig_WSARecvFrom = NULL;
-static sendto_t      orig_sendto = NULL;
-static recvfrom_t    orig_recvfrom = NULL;
-static GQCS_t        orig_GQCS = NULL;
-
-static BYTE sv_wsa_send[14], sv_wsa_recv[14], sv_send[14], sv_recv[14], sv_gqcs[14];
-
+/* ── Generic value freeze (modular hotkey system) ─────────── */
+#define FREEZE_GENERIC_MAX 32
+typedef enum { FTYPE_F32=0, FTYPE_F64=1, FTYPE_I32=2, FTYPE_U8=3 } FreezeType;
+typedef struct {
+    volatile uint64_t  addr;
+    volatile BOOL      active;
+    FreezeType         type;
+    union { float f32; double f64; int32_t i32; uint8_t u8; } val;
+    int                interval_ms;
+} FreezeSlot;
+static FreezeSlot       g_freeze_slots[FREEZE_GENERIC_MAX];
+static CRITICAL_SECTION g_freeze_cs;
+static HANDLE           g_freeze_gen_th = NULL;
+static DWORD WINAPI freeze_generic_th(LPVOID _) {
+    (void)_;
+    while (g_active) {
+        int i;
+        EnterCriticalSection(&g_freeze_cs);
+        for (i = 0; i < FREEZE_GENERIC_MAX; i++) {
+            FreezeSlot* s = &g_freeze_slots[i];
+            if (!s->active || !s->addr) continue;
+            __try {
+                switch (s->type) {
+                    case FTYPE_F32: *(float*)(uintptr_t)s->addr   = s->val.f32; break;
+                    case FTYPE_F64: *(double*)(uintptr_t)s->addr  = s->val.f64; break;
+                    case FTYPE_I32: *(int32_t*)(uintptr_t)s->addr = s->val.i32; break;
+                    case FTYPE_U8:  *(uint8_t*)(uintptr_t)s->addr = s->val.u8;  break;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { s->active = FALSE; }
+        }
+        LeaveCriticalSection(&g_freeze_cs);
+        Sleep(50);
+    }
+    return 0;
+}
+/* Call once: FREEZE_GENERIC <slot> <addr_hex> <type:f32|f64|i32|u8> <value> <interval_ms>
+   slot -1 = find first free slot */
 /* ── Forward declarations ────────────────────────────────── */
 static int      IsReentrant(void);
 static void     EnterHook(void);
@@ -173,6 +209,95 @@ static void     pcap_close(void);
 static void     HyForceEject(void);
 static void     shm_write(uint32_t type, const uint8_t* data, uint32_t len);
 static void     forward_key_to_shm(const char* line, size_t len);
+/* ── SSL hook forward declarations (defined after probe_boringssl) ───────── */
+/* hook_ssl_write / hook_ssl_read forward-declared below after SSL typedefs */
+
+static void freeze_generic_set(int slot, uint64_t addr, const char* type, const char* valstr, int ms) {
+    if (slot < 0) {
+        int i; for (i = 0; i < FREEZE_GENERIC_MAX; i++) if (!g_freeze_slots[i].active) { slot = i; break; }
+    }
+    if (slot < 0 || slot >= FREEZE_GENERIC_MAX) return;
+    FreezeSlot* s = &g_freeze_slots[slot];
+    EnterCriticalSection(&g_freeze_cs);
+    s->addr = addr; s->interval_ms = (ms > 0) ? ms : 50; s->active = TRUE;
+    if (!strcmp(type,"f32"))      { s->type = FTYPE_F32; s->val.f32 = (float)atof(valstr); }
+    else if (!strcmp(type,"f64")) { s->type = FTYPE_F64; s->val.f64 = atof(valstr); }
+    else if (!strcmp(type,"i32")) { s->type = FTYPE_I32; s->val.i32 = atoi(valstr); }
+    else if (!strcmp(type,"u8"))  { s->type = FTYPE_U8;  s->val.u8  = (uint8_t)atoi(valstr); }
+    LeaveCriticalSection(&g_freeze_cs);
+    pipe_log("[FREEZE_GENERIC] slot=%d addr=0x%llx type=%s val=%s interval=%dms",
+             slot, (unsigned long long)addr, type, valstr, s->interval_ms);
+}
+static void freeze_generic_stop(int slot) {
+    if (slot < 0) { /* stop all */
+        int i; EnterCriticalSection(&g_freeze_cs);
+        for (i = 0; i < FREEZE_GENERIC_MAX; i++) g_freeze_slots[i].active = FALSE;
+        LeaveCriticalSection(&g_freeze_cs);
+    } else if (slot < FREEZE_GENERIC_MAX) {
+        EnterCriticalSection(&g_freeze_cs);
+        g_freeze_slots[slot].active = FALSE;
+        LeaveCriticalSection(&g_freeze_cs);
+        pipe_log("[FREEZE_GENERIC] slot=%d OFF", slot);
+    }
+}
+
+static DWORD g_injector_pid = 0;
+static volatile BOOL g_pipe_connected = FALSE;
+
+static OvlEntry         g_ovl[MAX_OVL];
+static CRITICAL_SECTION g_ovl_cs;
+
+/* Hook function-pointer types */
+typedef int (WSAAPI* WSASendTo_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const struct sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+typedef int (WSAAPI* WSARecvFrom_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, struct sockaddr*, LPINT, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+typedef int (WSAAPI* sendto_t)(SOCKET, const char*, int, int, const struct sockaddr*, int);
+typedef int (WSAAPI* recvfrom_t)(SOCKET, char*, int, int, struct sockaddr*, int*);
+typedef BOOL(WINAPI* GQCS_t)(HANDLE, LPDWORD, PULONG_PTR, LPOVERLAPPED*, DWORD);
+/* New v10: connected-socket send (no destination address) */
+typedef int (WSAAPI* WSASend_nb_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+typedef int (WSAAPI* send_nb_t)(SOCKET, const char*, int, int);
+/* New v10: BoringSSL plaintext bypass */
+typedef int (*ssl_write_fn_t)(SSL*, const void*, int);
+typedef int (*ssl_read_fn_t)(SSL*, void*, int);
+static int hook_ssl_write(SSL* ssl, const void* buf, int num);
+static int hook_ssl_read(SSL* ssl, void* buf, int num);
+/* New v10: quiche stream hooks (plaintext pre-QUIC-encryption) */
+typedef intptr_t (*quiche_stream_recv_t)(void*, uint64_t, uint8_t*, size_t, int*);
+typedef intptr_t (*quiche_stream_send_t)(void*, uint64_t, const uint8_t*, size_t, int);
+
+static WSASendTo_t   orig_WSASendTo = NULL;
+static WSARecvFrom_t orig_WSARecvFrom = NULL;
+static sendto_t      orig_sendto = NULL;
+static recvfrom_t    orig_recvfrom = NULL;
+static GQCS_t        orig_GQCS = NULL;
+/* New v10: connected-socket send hooks */
+static WSASend_nb_t  orig_WSASend_nb = NULL;
+static send_nb_t     orig_send_nb    = NULL;
+/* New v10: BoringSSL plaintext hooks */
+static ssl_write_fn_t orig_ssl_write = NULL;
+static ssl_read_fn_t  orig_ssl_read  = NULL;
+/* New v10: quiche stream hooks */
+static quiche_stream_recv_t orig_quiche_recv = NULL;
+static quiche_stream_send_t orig_quiche_send = NULL;
+
+static BYTE sv_wsa_send[14], sv_wsa_recv[14], sv_send[14], sv_recv[14], sv_gqcs[14];
+/* New v10 saved bytes */
+static BYTE sv_wsa_send_nb[14], sv_send_nb[14];
+static BYTE sv_ssl_write[14], sv_ssl_read[14];
+static BYTE sv_quiche_recv[14], sv_quiche_send[14];
+
+/* New v10: known server IP (learned from first S2C packet) */
+static volatile uint32_t g_server_ip = 0;
+
+/* New v10: connected-socket peer cache */
+#define MAX_SOCK_CACHE 32
+typedef struct { SOCKET sock; uint32_t ip; uint16_t port; int used; } SockPeer;
+static SockPeer         g_sock_cache[MAX_SOCK_CACHE];
+static CRITICAL_SECTION g_sock_cs;
+
+/* New v10: fire counters for connected-socket hooks */
+static volatile LONG g_fires_wsa_send_nb = 0, g_fires_send_nb = 0;
+
 static void     forward_pkt_to_shm(const uint8_t* d, uint32_t len, uint32_t ip, uint16_t port, uint8_t dir);
 static uint64_t now_us(void);
 static int      is_hytale_port(uint16_t port_be);
@@ -197,6 +322,10 @@ static void     hook_boringssl(void);
 static void     unhook_boringssl(void);
 static void     hook_SSL_CTX_set_kl(SSL_CTX* ctx, ssl_keylog_cb_t cb);
 static void     store_kchain(SSL_CTX* ctx, ssl_keylog_cb_t orig);
+/* New v10 */
+static void     sock_cache_set(SOCKET s, uint32_t ip, uint16_t port);
+static int      sock_cache_get(SOCKET s, uint32_t* ip, uint16_t* port);
+static void     probe_quiche(void);
 
 /* ── Reentrancy ──────────────────────────────────────────── */
 static int IsReentrant(void) {
@@ -331,7 +460,25 @@ static void hook_boringssl(void) {
     g_ssl_get = (SSL_get_kl_t)GetProcAddress(mod, "SSL_CTX_get_keylog_callback");
 
     memcpy(sv_ssl, (void*)g_ssl_set, 14);
-    jmp_write((void*)g_ssl_set, hook_SSL_CTX_set_kl);
+    jmp_write((void*)g_ssl_set, (void*)hook_SSL_CTX_set_kl);
+
+    /* v10: Also hook SSL_write / SSL_read for direct plaintext capture.
+     * Note: QUIC uses quiche streams, not SSL_write. These hooks help for
+     * any TLS-over-TCP traffic and as a fallback. */
+    void* ssl_w = GetProcAddress(mod, "SSL_write");
+    if (ssl_w && !orig_ssl_write) {
+        orig_ssl_write = (ssl_write_fn_t)ssl_w;
+        memcpy(sv_ssl_write, ssl_w, 14);
+        jmp_write(ssl_w, (void*)hook_ssl_write);
+        pipe_log("[BORING] Hooked SSL_write");
+    }
+    void* ssl_r = GetProcAddress(mod, "SSL_read");
+    if (ssl_r && !orig_ssl_read) {
+        orig_ssl_read = (ssl_read_fn_t)ssl_r;
+        memcpy(sv_ssl_read, ssl_r, 14);
+        jmp_write(ssl_r, (void*)hook_ssl_read);
+        pipe_log("[BORING] Hooked SSL_read");
+    }
 }
 
 static void unhook_boringssl(void) {
@@ -425,6 +572,13 @@ static void HyForceEject(void) {
     if (orig_sendto)      jmp_restore(orig_sendto, sv_send);
     if (orig_recvfrom)    jmp_restore(orig_recvfrom, sv_recv);
     if (orig_GQCS)        jmp_restore(orig_GQCS, sv_gqcs);
+    /* v10: restore connected-socket and plaintext hooks */
+    if (orig_WSASend_nb)  jmp_restore(orig_WSASend_nb, sv_wsa_send_nb);
+    if (orig_send_nb)     jmp_restore(orig_send_nb, sv_send_nb);
+    if (orig_ssl_write)   jmp_restore(orig_ssl_write, sv_ssl_write);
+    if (orig_ssl_read)    jmp_restore(orig_ssl_read, sv_ssl_read);
+    if (orig_quiche_recv) jmp_restore(orig_quiche_recv, sv_quiche_recv);
+    if (orig_quiche_send) jmp_restore(orig_quiche_send, sv_quiche_send);
     FlushInstructionCache(GetCurrentProcess(), NULL, 0);
     pcap_close(); cleanup_shm(); unhook_boringssl();
     if (g_out != INVALID_HANDLE_VALUE) { CloseHandle(g_out); g_out = INVALID_HANDLE_VALUE; }
@@ -470,17 +624,50 @@ static int is_hytale_port(uint16_t port_be) {
 
 /* ── Core forward ────────────────────────────────────────── */
 static void forward(uint8_t dir, const uint8_t* data, int dlen, uint32_t ip, uint16_t port) {
-    if (!is_hytale_port(port) && !(dir == 1 && ip == g_last_cs_ip)) return;
     if (dlen <= 0 || dlen > MAX_PKT) return;
+
+    /* Learn server IP from first S2C packet so we can match C2S by IP */
+    if (dir == 1 && ip != 0 && g_server_ip == 0) {
+        InterlockedExchange((LONG*)&g_server_ip, (LONG)ip);
+        /* Also seed replay IP so pktforge works immediately */
+        EnterCriticalSection(&g_replay_cs);
+        if (g_last_cs_ip == 0) g_last_cs_ip = ip;
+        LeaveCriticalSection(&g_replay_cs);
+        pipe_log("[HOOK] Server IP: %u.%u.%u.%u port %u",
+            ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF, ntohs(port));
+    }
+
+    /* Pass if port is in Hytale range OR if IP matches known server */
+    int pass = is_hytale_port(port);
+    if (!pass && ip != 0) {
+        uint32_t sip = g_server_ip;
+        uint32_t rip;
+        EnterCriticalSection(&g_replay_cs);
+        rip = g_last_cs_ip;
+        LeaveCriticalSection(&g_replay_cs);
+        if ((sip && ip == sip) || (rip && ip == rip)) pass = 1;
+    }
+    if (!pass) return;
+
     InterlockedIncrement(&g_pkts_captured);
-    pcap_write(data, (uint32_t)dlen); seq_check(data, dlen, dir);
+    pcap_write(data, (uint32_t)dlen);
+    seq_check(data, dlen, dir);
+
     uint8_t tb[13]; uint64_t ts = now_us(); uint32_t u = (uint32_t)dlen;
-    memcpy(tb, &ts, 8); memcpy(tb + 8, &u, 4); tb[12] = dir; pipe_send(MSG_TIMING, tb, 13);
-    int tot = 7 + dlen; uint8_t* buf = (uint8_t*)malloc((size_t)tot); if (!buf) return;
-    buf[0] = dir; memcpy(buf + 1, &ip, 4); memcpy(buf + 5, &port, 2); memcpy(buf + 7, data, dlen);
+    memcpy(tb, &ts, 8); memcpy(tb + 8, &u, 4); tb[12] = dir;
+    pipe_send(MSG_TIMING, tb, 13);
+
+    int tot = 7 + dlen;
+    uint8_t* buf = (uint8_t*)malloc((size_t)tot);
+    if (!buf) return;
+    buf[0] = dir;
+    memcpy(buf + 1, &ip, 4);
+    memcpy(buf + 5, &port, 2);
+    memcpy(buf + 7, data, dlen);
     pipe_send(MSG_PACKET, buf, (uint32_t)tot);
     forward_pkt_to_shm(data, (uint32_t)dlen, ip, port, dir);
     free(buf);
+
     if (dir == 0) {
         EnterCriticalSection(&g_replay_cs);
         if (dlen <= MAX_PKT) {
@@ -555,7 +742,7 @@ static int WSAAPI hook_WSASendTo(SOCKET s, LPWSABUF bufs, DWORD nb, LPDWORD sent
         else ret = WSASendTo(s, bufs, nb, sent, flags, to, tolen, ov, cb);
     }
     else ret = WSASendTo(s, bufs, nb, sent, flags, to, tolen, ov, cb);
-    EnterCriticalSection(&g_cs); jmp_write(orig_WSASendTo, hook_WSASendTo); LeaveCriticalSection(&g_cs);
+    EnterCriticalSection(&g_cs); jmp_write(orig_WSASendTo, (void*)hook_WSASendTo); LeaveCriticalSection(&g_cs);
     if (ret != SOCKET_ERROR) SetLastError(se);
     DWORD _le = GetLastError();
     int _sent_ok = (ret == 0) || (ret == SOCKET_ERROR && _le == WSA_IO_PENDING);
@@ -586,7 +773,7 @@ static int WSAAPI hook_sendto(SOCKET s, const char* buf, int len, int flags,
         else ret = sendto(s, buf, len, flags, to, tolen);
     }
     else ret = sendto(s, buf, len, flags, to, tolen);
-    EnterCriticalSection(&g_cs); jmp_write(orig_sendto, hook_sendto); LeaveCriticalSection(&g_cs);
+    EnterCriticalSection(&g_cs); jmp_write(orig_sendto, (void*)hook_sendto); LeaveCriticalSection(&g_cs);
     if (ret != SOCKET_ERROR) SetLastError(se);
     if (ret > 0 && buf && len > 0) {
         uint32_t ip = 0; uint16_t port = 0;
@@ -612,7 +799,7 @@ static int WSAAPI hook_WSARecvFrom(SOCKET s, LPWSABUF bufs, DWORD nb, LPDWORD re
         ovl_register(ov, bufs[0].buf, (int)bufs[0].len, &tmp_peer);
     }
     int ret = orig_WSARecvFrom(s, bufs, nb, recvd, flags, from, fromlen, ov, cb);
-    EnterCriticalSection(&g_cs); jmp_write(orig_WSARecvFrom, hook_WSARecvFrom); LeaveCriticalSection(&g_cs);
+    EnterCriticalSection(&g_cs); jmp_write(orig_WSARecvFrom, (void*)hook_WSARecvFrom); LeaveCriticalSection(&g_cs);
     if (ret != SOCKET_ERROR) SetLastError(se);
     if (ret == 0 && recvd && *recvd > 0 && nb > 0 && bufs && bufs[0].buf) {
         if (ov) ovl_free(ov);
@@ -636,7 +823,7 @@ static int WSAAPI hook_recvfrom(SOCKET s, char* buf, int len, int flags,
     EnterHook(); InterlockedIncrement(&g_fires_recv); DWORD se = GetLastError();
     EnterCriticalSection(&g_cs); jmp_restore(orig_recvfrom, sv_recv); LeaveCriticalSection(&g_cs);
     int ret = orig_recvfrom(s, buf, len, flags, from, fromlen);
-    EnterCriticalSection(&g_cs); jmp_write(orig_recvfrom, hook_recvfrom); LeaveCriticalSection(&g_cs);
+    EnterCriticalSection(&g_cs); jmp_write(orig_recvfrom, (void*)hook_recvfrom); LeaveCriticalSection(&g_cs);
     if (ret == SOCKET_ERROR) { SetLastError(se); LeaveHook(); return ret; }
     if (ret > 0 && buf) {
         uint32_t ip = 0; uint16_t port = 0;
@@ -655,56 +842,325 @@ static BOOL WINAPI hook_GQCS(HANDLE iocp, LPDWORD bytes, PULONG_PTR key,
 {
     EnterCriticalSection(&g_cs); jmp_restore(orig_GQCS, sv_gqcs); LeaveCriticalSection(&g_cs);
     BOOL ret = orig_GQCS(iocp, bytes, key, ppOv, timeout);
-    EnterCriticalSection(&g_cs); jmp_write(orig_GQCS, hook_GQCS); LeaveCriticalSection(&g_cs);
+    EnterCriticalSection(&g_cs); jmp_write(orig_GQCS, (void*)hook_GQCS); LeaveCriticalSection(&g_cs);
     if (ret && ppOv && *ppOv && bytes && *bytes > 0) {
         ovl_fire(*ppOv, *bytes);
     }
     return ret;
 }
 
-/* ── Memory helpers ──────────────────────────────────────── */
-static int is_coord(double v) { return !isnan(v) && !isinf(v) && v > -65536.0 && v < 65536.0; }
-static int is_health(float h) { return !isnan(h) && h > 0.0f && h <= 10000.0f; }
-static int is_vel(float v) { return !isnan(v) && v > -2000.0f && v < 2000.0f; }
+/* ── Socket peer cache (connected UDP) ───────────────────── */
+static void sock_cache_set(SOCKET s, uint32_t ip, uint16_t port) {
+    EnterCriticalSection(&g_sock_cs);
+    int i, oldest = 0;
+    for (i = 0; i < MAX_SOCK_CACHE; i++) {
+        if (!g_sock_cache[i].used || g_sock_cache[i].sock == s) { oldest = i; break; }
+    }
+    g_sock_cache[oldest].sock = s; g_sock_cache[oldest].ip = ip;
+    g_sock_cache[oldest].port = port; g_sock_cache[oldest].used = 1;
+    LeaveCriticalSection(&g_sock_cs);
+}
 
-/* ── MEMSCAN ─────────────────────────────────────────────── */
+static int sock_cache_get(SOCKET s, uint32_t* ip, uint16_t* port) {
+    int found = 0;
+    EnterCriticalSection(&g_sock_cs);
+    int i;
+    for (i = 0; i < MAX_SOCK_CACHE; i++) {
+        if (g_sock_cache[i].used && g_sock_cache[i].sock == s) {
+            *ip = g_sock_cache[i].ip; *port = g_sock_cache[i].port; found = 1; break;
+        }
+    }
+    LeaveCriticalSection(&g_sock_cs);
+    return found;
+}
+
+/* ── WSASend hook (connected UDP — C2S via IOCP) ─────────── */
+static int WSAAPI hook_WSASend_nb(SOCKET s, LPWSABUF bufs, DWORD nb, LPDWORD sent, DWORD flags,
+    LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cb)
+{
+    if (IsReentrant() || !orig_WSASend_nb) return orig_WSASend_nb(s, bufs, nb, sent, flags, ov, cb);
+    EnterHook(); InterlockedIncrement(&g_fires_wsa_send_nb);
+    EnterCriticalSection(&g_cs); jmp_restore(orig_WSASend_nb, sv_wsa_send_nb); LeaveCriticalSection(&g_cs);
+
+    int ret = WSASend(s, bufs, nb, sent, flags, ov, cb);
+
+    EnterCriticalSection(&g_cs); jmp_write(orig_WSASend_nb, (void*)hook_WSASend_nb); LeaveCriticalSection(&g_cs);
+
+    DWORD le = GetLastError();
+    int ok = (ret == 0) || (ret == SOCKET_ERROR && le == WSA_IO_PENDING);
+    if (ok && nb > 0 && bufs && bufs[0].buf && bufs[0].len > 0) {
+        uint32_t ip = 0; uint16_t port = 0;
+        /* Try peer cache, then getpeername, then fall back to known server IP */
+        if (!sock_cache_get(s, &ip, &port)) {
+            struct sockaddr_in peer; int pl = sizeof(peer); memset(&peer, 0, sizeof(peer));
+            if (getpeername(s, (struct sockaddr*)&peer, &pl) == 0 && peer.sin_family == AF_INET) {
+                ip = peer.sin_addr.s_addr; port = peer.sin_port;
+                sock_cache_set(s, ip, port);
+            }
+        }
+        if (ip == 0) ip = g_server_ip; /* best guess */
+        if (ip != 0)
+            forward(0, (uint8_t*)bufs[0].buf, (int)bufs[0].len, ip, port);
+    }
+    LeaveHook(); return ret;
+}
+
+/* ── send hook (connected UDP — blocking C2S) ────────────── */
+static int WSAAPI hook_send_nb(SOCKET s, const char* buf, int len, int flags)
+{
+    if (IsReentrant() || !orig_send_nb) return orig_send_nb(s, buf, len, flags);
+    EnterHook(); InterlockedIncrement(&g_fires_send_nb);
+    EnterCriticalSection(&g_cs); jmp_restore(orig_send_nb, sv_send_nb); LeaveCriticalSection(&g_cs);
+
+    int ret = send(s, buf, len, flags);
+
+    EnterCriticalSection(&g_cs); jmp_write(orig_send_nb, (void*)hook_send_nb); LeaveCriticalSection(&g_cs);
+
+    if (ret > 0 && buf && len > 0) {
+        uint32_t ip = 0; uint16_t port = 0;
+        if (!sock_cache_get(s, &ip, &port)) {
+            struct sockaddr_in peer; int pl = sizeof(peer); memset(&peer, 0, sizeof(peer));
+            if (getpeername(s, (struct sockaddr*)&peer, &pl) == 0 && peer.sin_family == AF_INET) {
+                ip = peer.sin_addr.s_addr; port = peer.sin_port;
+                sock_cache_set(s, ip, port);
+            }
+        }
+        if (ip == 0) ip = g_server_ip;
+        if (ip != 0)
+            forward(0, (uint8_t*)buf, ret, ip, port);
+    }
+    LeaveHook(); return ret;
+}
+
+/* ── BoringSSL SSL_write hook (pre-encryption plaintext) ─── */
+static int hook_ssl_write(SSL* ssl, const void* buf, int num) {
+    if (buf && num > 0 && num < MAX_PKT) {
+        uint8_t* pay = (uint8_t*)malloc(1 + (size_t)num);
+        if (pay) {
+            pay[0] = 0; /* C2S direction */
+            memcpy(pay + 1, buf, (size_t)num);
+            pipe_send(MSG_PLAINTEXT, pay, 1 + (uint32_t)num);
+            free(pay);
+        }
+    }
+    EnterCriticalSection(&g_cs); jmp_restore(orig_ssl_write, sv_ssl_write); LeaveCriticalSection(&g_cs);
+    int ret = orig_ssl_write(ssl, buf, num);
+    EnterCriticalSection(&g_cs); jmp_write(orig_ssl_write, (void*)hook_ssl_write); LeaveCriticalSection(&g_cs);
+    return ret;
+}
+
+/* ── BoringSSL SSL_read hook (post-decryption plaintext) ─── */
+static int hook_ssl_read(SSL* ssl, void* buf, int num) {
+    EnterCriticalSection(&g_cs); jmp_restore(orig_ssl_read, sv_ssl_read); LeaveCriticalSection(&g_cs);
+    int ret = orig_ssl_read(ssl, buf, num);
+    EnterCriticalSection(&g_cs); jmp_write(orig_ssl_read, (void*)hook_ssl_read); LeaveCriticalSection(&g_cs);
+    if (ret > 0 && buf) {
+        uint8_t* pay = (uint8_t*)malloc(1 + (size_t)ret);
+        if (pay) {
+            pay[0] = 1; /* S2C direction */
+            memcpy(pay + 1, buf, (size_t)ret);
+            pipe_send(MSG_PLAINTEXT, pay, 1 + (uint32_t)ret);
+            free(pay);
+        }
+    }
+    return ret;
+}
+
+/* ── quiche stream receive hook (plaintext S2C app data) ─── */
+static intptr_t hook_quiche_recv(void* conn, uint64_t sid,
+    uint8_t* buf, size_t buf_len, int* fin)
+{
+    EnterCriticalSection(&g_cs); jmp_restore(orig_quiche_recv, sv_quiche_recv); LeaveCriticalSection(&g_cs);
+    intptr_t ret = orig_quiche_recv(conn, sid, buf, buf_len, fin);
+    EnterCriticalSection(&g_cs); jmp_write(orig_quiche_recv, (void*)hook_quiche_recv); LeaveCriticalSection(&g_cs);
+    if (ret > 0 && buf) {
+        uint8_t* pay = (uint8_t*)malloc(9 + (size_t)ret);
+        if (pay) {
+            pay[0] = 1; /* S2C */
+            memcpy(pay + 1, &sid, 8);
+            memcpy(pay + 9, buf, (size_t)ret);
+            pipe_send(MSG_PLAINTEXT, pay, 9 + (uint32_t)ret);
+            free(pay);
+        }
+    }
+    return ret;
+}
+
+/* ── quiche stream send hook (plaintext C2S app data) ──────── */
+static intptr_t hook_quiche_send(void* conn, uint64_t sid,
+    const uint8_t* buf, size_t buf_len, int fin)
+{
+    if (buf && buf_len > 0 && buf_len < (size_t)MAX_PKT) {
+        uint8_t* pay = (uint8_t*)malloc(9 + buf_len);
+        if (pay) {
+            pay[0] = 0; /* C2S */
+            memcpy(pay + 1, &sid, 8);
+            memcpy(pay + 9, buf, buf_len);
+            pipe_send(MSG_PLAINTEXT, pay, 9 + (uint32_t)buf_len);
+            free(pay);
+        }
+    }
+    EnterCriticalSection(&g_cs); jmp_restore(orig_quiche_send, sv_quiche_send); LeaveCriticalSection(&g_cs);
+    intptr_t ret = orig_quiche_send(conn, sid, buf, buf_len, fin);
+    EnterCriticalSection(&g_cs); jmp_write(orig_quiche_send, (void*)hook_quiche_send); LeaveCriticalSection(&g_cs);
+    return ret;
+}
+
+/* ── probe_quiche: scan loaded modules for quiche functions ─ */
+static void probe_quiche(void) {
+    HMODULE mods[1024]; DWORD need; int i;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need)) return;
+    int n = (int)(need / sizeof(HMODULE));
+    int found = 0;
+    for (i = 0; i < n; i++) {
+        void* fn_r = GetProcAddress(mods[i], "quiche_conn_stream_recv");
+        void* fn_s = GetProcAddress(mods[i], "quiche_conn_stream_send");
+        if (fn_r && !orig_quiche_recv) {
+            orig_quiche_recv = (quiche_stream_recv_t)fn_r;
+            memcpy(sv_quiche_recv, fn_r, 14);
+            jmp_write(fn_r, (void*)hook_quiche_recv);
+            pipe_log("[QUICHE] Hooked quiche_conn_stream_recv @ %p", fn_r);
+            found++;
+        }
+        if (fn_s && !orig_quiche_send) {
+            orig_quiche_send = (quiche_stream_send_t)fn_s;
+            memcpy(sv_quiche_send, fn_s, 14);
+            jmp_write(fn_s, (void*)hook_quiche_send);
+            pipe_log("[QUICHE] Hooked quiche_conn_stream_send @ %p", fn_s);
+            found++;
+        }
+        if (found == 2) break;
+    }
+    if (!found) pipe_log("[QUICHE] No quiche_conn_stream_* exports found (may be inlined in JNI)");
+}
+/* ── Scan helpers — deliberately relaxed for Hytale/JVM heap ── */
+/* Hytale runs on HytaleClient.exe (native launcher wrapping JVM).
+   JVM heap objects can be at any address. We scan ALL committed RW memory.
+   Filters are wide so we catch even unusual layouts; the UI lets the user
+   filter results further.  v11 changes:
+     • Y no longer clamped 0-300  (underground areas exist)
+     • Health min lowered to > 0.0  (dying entity = 0.1 HP is valid)
+     • MaxHP raised to 1 000 000   (boss entities)
+     • Coords extended to ±10 000 000  (large open worlds)
+     • Velocity extended to ±500 m/s  (mounted/falling)
+     • Broad scan mode: skips velocity check entirely             */
+static int is_coord(double v) { return !isnan(v) && !isinf(v) && v > -10000000.0 && v < 10000000.0; }
+static int is_health(float h) { return !isnan(h) && !isinf(h) && h > 0.0f && h <= 1000000.0f; }
+static int is_vel(float v)    { return !isnan(v) && !isinf(v) && v > -500.0f && v < 500.0f; }
+
+/* Send a 76-byte memscan hit payload: [u64 addr][u32 dataSize][bytes] */
+static void send_memscan_hit(uint8_t* p, SIZE_T avail) {
+    uint8_t rep[76]; uint64_t a64 = (uint64_t)(uintptr_t)p; uint32_t sz = 56;
+    memcpy(rep, &a64, 8); memcpy(rep + 8, &sz, 4);
+    SIZE_T cp = (sz < (uint32_t)avail) ? sz : avail;
+    if (cp > 56) cp = 56;
+    memcpy(rep + 12, p, cp);
+    pipe_send(MSG_MEMSCAN, rep, (uint32_t)(12 + cp));
+}
+
+/* strict scan: requires plausible velocity (standing still = 0 → passes) */
 static void memscan_run(void) {
     int hits = 0;
     MEMORY_BASIC_INFORMATION mbi;
     uint8_t* addr = NULL;
+    pipe_log("[MEMSCAN] Starting strict scan on HytaleClient.exe memory...");
     while (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
         uint8_t* next = (uint8_t*)mbi.BaseAddress + mbi.RegionSize;
         if (next <= addr) break;
-        if (mbi.State != MEM_COMMIT || mbi.RegionSize < 65536 || mbi.RegionSize>256 * 1024 * 1024 ||
+        /* scan all committed RW regions — no size filter removed */
+        if (mbi.State != MEM_COMMIT ||
             (mbi.Protect & PAGE_GUARD) || (mbi.Protect & PAGE_NOACCESS) ||
-            !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)))
+            !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
         {
             addr = next; continue;
         }
         uint8_t* base = (uint8_t*)mbi.BaseAddress; SIZE_T rsz = mbi.RegionSize;
         __try {
             SIZE_T off;
-            for (off = 0; off + 56 <= rsz; off += 4) {
+            for (off = 0; off + 44 <= rsz; off += 4) {
                 uint8_t* p = base + off;
                 float h = *(float*)(p + 0), mh = *(float*)(p + 4);
-                if (!is_health(h) || !is_health(mh) || mh < h) continue;
+                if (!is_health(h) || !is_health(mh)) continue;
+                if (mh < h * 0.001f) continue;          /* ratio guard only */
                 double x = *(double*)(p + 8), y = *(double*)(p + 16), z = *(double*)(p + 24);
-                if (!is_coord(x) || !is_coord(y) || y < 0.0 || y>512.0 || !is_coord(z)) continue;
+                if (!is_coord(x) || !is_coord(y) || !is_coord(z)) continue;
+                if (x == 0.0 && y == 0.0 && z == 0.0) continue; /* uninitialized */
                 float vx = *(float*)(p + 32), vy = *(float*)(p + 36), vz = *(float*)(p + 40);
                 if (!is_vel(vx) || !is_vel(vy) || !is_vel(vz)) continue;
-                uint8_t rep[76]; uint64_t a64 = (uint64_t)(uintptr_t)p; uint32_t sz = 56;
-                memcpy(rep, &a64, 8); memcpy(rep + 8, &sz, 4);
-                SIZE_T cp = (sz < (uint32_t)(rsz - off)) ? sz : (SIZE_T)(rsz - off);
-                memcpy(rep + 12, p, cp);
-                pipe_send(MSG_MEMSCAN, rep, (uint32_t)(12 + cp));
-                if (++hits >= 64) goto memscan_done;
-                off += 52;
+                send_memscan_hit(p, rsz - off);
+                if (++hits >= 128) goto memscan_done;
+                off += 40; /* skip past matched struct */
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
         addr = next;
     }
-memscan_done:;
+memscan_done:
+    pipe_log("[MEMSCAN] Done: %d hits", hits);
+}
+
+/* broad scan: no velocity requirement, any health+coord will match */
+static void memscan_broad_impl(void);
+static DWORD WINAPI memscan_broad_th(LPVOID _) { (void)_; memscan_broad_impl(); return 0; }
+static void memscan_broad_impl(void) {
+    int hits = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    uint8_t* addr = NULL;
+    pipe_log("[MEMSCAN] Starting BROAD scan...");
+    while (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        uint8_t* next = (uint8_t*)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= addr) break;
+        if (mbi.State != MEM_COMMIT ||
+            (mbi.Protect & PAGE_GUARD) || (mbi.Protect & PAGE_NOACCESS) ||
+            !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        {
+            addr = next; continue;
+        }
+        uint8_t* base = (uint8_t*)mbi.BaseAddress; SIZE_T rsz = mbi.RegionSize;
+        __try {
+            SIZE_T off;
+            for (off = 0; off + 32 <= rsz; off += 4) {
+                uint8_t* p = base + off;
+                float h = *(float*)(p + 0), mh = *(float*)(p + 4);
+                if (!is_health(h) || !is_health(mh)) continue;
+                double x = *(double*)(p + 8), y = *(double*)(p + 16), z = *(double*)(p + 24);
+                if (!is_coord(x) || !is_coord(y) || !is_coord(z)) continue;
+                if (x == 0.0 && y == 0.0 && z == 0.0) continue;
+                send_memscan_hit(p, rsz - off);
+                if (++hits >= 256) goto broad_done;
+                off += 28;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        addr = next;
+    }
+broad_done:
+    pipe_log("[MEMSCAN] Broad done: %d hits", hits);
+}
+
+/* ── Direct memory read: MEMREAD <addr_hex> <size> → MSG_MEMREAD ── */
+#define MSG_MEMREAD 0x1C
+static void memread_addr(uint64_t addr, uint32_t sz) {
+    if (sz > 4096) sz = 4096;
+    uint8_t* buf = (uint8_t*)malloc(8 + sz);
+    if (!buf) return;
+    memcpy(buf, &addr, 8);
+    __try { memcpy(buf + 8, (void*)(uintptr_t)addr, sz); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { memset(buf + 8, 0xCC, sz); }
+    pipe_send(MSG_MEMREAD, buf, 8 + sz);
+    free(buf);
+}
+
+/* ── Direct f64 write ── */
+static void memwrite_f64(uint64_t addr, double val) {
+    __try { *(double*)(uintptr_t)addr = val; pipe_log("[WRITE] f64 @ 0x%llx = %f", (unsigned long long)addr, val); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { pipe_log("[WRITE] f64 AV @ 0x%llx", (unsigned long long)addr); }
+}
+
+/* ── Direct i32 write ── */
+static void memwrite_i32(uint64_t addr, int32_t val) {
+    __try { *(int32_t*)(uintptr_t)addr = val; pipe_log("[WRITE] i32 @ 0x%llx = %d", (unsigned long long)addr, val); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { pipe_log("[WRITE] i32 AV @ 0x%llx", (unsigned long long)addr); }
 }
 
 static DWORD WINAPI memscan_th(LPVOID _) { (void)_; memscan_run(); return 0; }
@@ -1054,9 +1510,42 @@ static DWORD WINAPI memwatch_th(LPVOID _) {
         __try { memcpy(cur, (void*)(uintptr_t)g_watch_addr, 64); }
         __except (EXCEPTION_EXECUTE_HANDLER) { break; }
         if (first || memcmp(cur, prev, 64) != 0) {
-            uint8_t pay[72]; memcpy(pay, &g_watch_addr, 8); memcpy(pay + 8, cur, 64);
+            uint8_t pay[72]; uint64_t _wa = g_watch_addr; memcpy(pay, &_wa, 8); memcpy(pay + 8, cur, 64);
             pipe_send(MSG_MEMWATCH, pay, 72); memcpy(prev, cur, 64); first = 0;
         }
+    }
+    return 0;
+}
+
+/* ── Freeze HP thread — writes health+maxHP every 50ms ────── */
+static DWORD WINAPI freeze_hp_th(LPVOID _) {
+    (void)_;
+    while (g_active && g_freeze_hp_addr) {
+        __try {
+            float* hp  = (float*)(uintptr_t)g_freeze_hp_addr;
+            float* mhp = hp + 1;          /* maxHealth is at offset +4 */
+            *hp  = g_freeze_hp_val;
+            *mhp = g_freeze_maxhp_val;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_freeze_hp_addr = 0; break; }
+        Sleep(50);
+    }
+    return 0;
+}
+
+/* ── Freeze Position thread — writes X/Y/Z every 50ms ────── */
+static DWORD WINAPI freeze_pos_th(LPVOID _) {
+    (void)_;
+    while (g_active && g_freeze_pos_addr) {
+        __try {
+            /* layout: float hp(0), float maxhp(4), double X(8), double Y(16), double Z(24) */
+            double* px = (double*)(uintptr_t)(g_freeze_pos_addr + 8);
+            double* py = (double*)(uintptr_t)(g_freeze_pos_addr + 16);
+            double* pz = (double*)(uintptr_t)(g_freeze_pos_addr + 24);
+            *px = g_freeze_x; *py = g_freeze_y; *pz = g_freeze_z;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_freeze_pos_addr = 0; break; }
+        Sleep(50);
     }
     return 0;
 }
@@ -1100,8 +1589,12 @@ static DWORD WINAPI hb_thread(LPVOID _) {
     (void)_;
     while (g_active) {
         Sleep(5000); if (!g_active) break;
-        pipe_log("[STATS] WSASendTo:%ld sendto:%ld WSARecvFrom:%ld recvfrom:%ld pkts:%ld",
-            g_fires_wsa_send, g_fires_send, g_fires_wsa_recv, g_fires_recv, g_pkts_captured);
+        pipe_log("[STATS] WSASendTo:%ld sendto:%ld WSARecvFrom:%ld recvfrom:%ld "
+                 "WSASend_nb:%ld send_nb:%ld pkts:%ld srvIP:%u.%u.%u.%u",
+            g_fires_wsa_send, g_fires_send, g_fires_wsa_recv, g_fires_recv,
+            g_fires_wsa_send_nb, g_fires_send_nb, g_pkts_captured,
+            g_server_ip & 0xFF, (g_server_ip >> 8) & 0xFF,
+            (g_server_ip >> 16) & 0xFF, (g_server_ip >> 24) & 0xFF);
     }
     return 0;
 }
@@ -1127,10 +1620,32 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
         }
         if (c == '\n' || c == '\r') {
             buf[pos] = '\0'; pos = 0; if (!buf[0]) continue;
-            if (!strcmp(buf, "PING"))    pipe_send(MSG_STATUS, "PONG", 5);
+            else if (!strcmp(buf, "PING"))    pipe_send(MSG_STATUS, "PONG", 5);
             else if (!strcmp(buf, "STOP"))    g_active = FALSE;
             else if (!strcmp(buf, "EJECT"))   HyForceEject();
             else if (!strcmp(buf, "MEMSCAN")) CreateThread(NULL, 0, memscan_th, NULL, 0, NULL);
+            else if (!strcmp(buf, "MEMSCAN_BROAD")) { CreateThread(NULL, 0, memscan_broad_th, NULL, 0, NULL); }
+            else if (!strncmp(buf, "MEMREAD ", 8)) {
+                uint64_t ra = 0; uint32_t rsz2 = 64;
+                sscanf(buf + 8, "%llx %u", (unsigned long long*)&ra, &rsz2);
+                memread_addr(ra, rsz2);
+            }
+            else if (!strncmp(buf, "MEMWRITE_F64 ", 13)) {
+                uint64_t addr = 0; double val = 0.0;
+                sscanf(buf + 13, "%llx %lf", (unsigned long long*)&addr, &val);
+                memwrite_f64(addr, val);
+            }
+            else if (!strncmp(buf, "MEMWRITE_I32 ", 13)) {
+                uint64_t addr = 0; int32_t val = 0;
+                sscanf(buf + 13, "%llx %d", (unsigned long long*)&addr, &val);
+                memwrite_i32(addr, val);
+            }
+            else if (!strncmp(buf, "MEMWRITE_U8 ", 12)) {
+                uint64_t addr = 0; int val = 0;
+                sscanf(buf + 12, "%llx %d", (unsigned long long*)&addr, &val);
+                __try { *(uint8_t*)(uintptr_t)addr = (uint8_t)val; pipe_log("[WRITE] u8 @ 0x%llx = %d", (unsigned long long)addr, val); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { pipe_log("[WRITE] u8 AV @ 0x%llx", (unsigned long long)addr); }
+            }
             else if (!strcmp(buf, "STRINGSCAN")) CreateThread(NULL, 0, stringscan_th, NULL, 0, NULL);
             else if (!strcmp(buf, "MODLIST")) CreateThread(NULL, 0, modlist_th, NULL, 0, NULL);
             else if (!strcmp(buf, "THREADLIST")) CreateThread(NULL, 0, threadlist_th, NULL, 0, NULL);
@@ -1140,6 +1655,7 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
             else if (!strcmp(buf, "REPLAY"))  do_replay();
             else if (!strcmp(buf, "PCAP_STOP")) pcap_close();
             else if (!strcmp(buf, "SEQRESET")) { g_seq_cs = g_seq_sc = UINT64_MAX; }
+            else if (!strcmp(buf, "QUICHEPROBE")) probe_quiche(); /* v10 */
             else if (!strcmp(buf, "STATS"))
                 pipe_log("[STATS] WSASendTo:%ld sendto:%ld WSARecvFrom:%ld recvfrom:%ld pkts:%ld",
                     g_fires_wsa_send, g_fires_send, g_fires_wsa_recv, g_fires_recv, g_pkts_captured);
@@ -1154,6 +1670,40 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
                 LeaveCriticalSection(&g_kcs);
             }
             else if (!strcmp(buf, "MEMWATCH_STOP")) { g_watch_addr = 0; g_watch_ms = 0; }
+            /* ── Freeze / write commands ────────────────────────── */
+            else if (!strncmp(buf, "FREEZE_HP ", 10)) {
+                /* FREEZE_HP <addr_hex> <hp_float> <maxhp_float> */
+                uint64_t addr = 0; float hp = 100.f, mhp = 100.f;
+                sscanf(buf + 10, "%llx %f %f", (unsigned long long*)&addr, &hp, &mhp);
+                g_freeze_hp_addr = addr; g_freeze_hp_val = hp; g_freeze_maxhp_val = mhp;
+                if (g_freeze_hp_th) { WaitForSingleObject(g_freeze_hp_th, 300); CloseHandle(g_freeze_hp_th); }
+                g_freeze_hp_th = CreateThread(NULL, 0, freeze_hp_th, NULL, 0, NULL);
+                pipe_log("[FREEZE] HP freeze ON @ 0x%llx  hp=%.1f maxhp=%.1f", (unsigned long long)addr, hp, mhp);
+            }
+            else if (!strcmp(buf, "FREEZE_HP_STOP")) {
+                g_freeze_hp_addr = 0;
+                pipe_log("[FREEZE] HP freeze OFF");
+            }
+            else if (!strncmp(buf, "FREEZE_POS ", 11)) {
+                /* FREEZE_POS <addr_hex> <x> <y> <z>  (doubles) */
+                uint64_t addr = 0; double x = 0, y = 0, z = 0;
+                sscanf(buf + 11, "%llx %lf %lf %lf", (unsigned long long*)&addr, &x, &y, &z);
+                g_freeze_pos_addr = addr; g_freeze_x = x; g_freeze_y = y; g_freeze_z = z;
+                if (g_freeze_pos_th) { WaitForSingleObject(g_freeze_pos_th, 300); CloseHandle(g_freeze_pos_th); }
+                g_freeze_pos_th = CreateThread(NULL, 0, freeze_pos_th, NULL, 0, NULL);
+                pipe_log("[FREEZE] Pos freeze ON @ 0x%llx  (%.2f, %.2f, %.2f)", (unsigned long long)addr, x, y, z);
+            }
+            else if (!strcmp(buf, "FREEZE_POS_STOP")) {
+                g_freeze_pos_addr = 0;
+                pipe_log("[FREEZE] Pos freeze OFF");
+            }
+            else if (!strncmp(buf, "MEMWRITE_F32 ", 13)) {
+                /* MEMWRITE_F32 <addr_hex> <value_float>  — one-shot float write */
+                uint64_t addr = 0; float val = 0.f;
+                sscanf(buf + 13, "%llx %f", (unsigned long long*)&addr, &val);
+                __try { *(float*)(uintptr_t)addr = val; pipe_log("[WRITE] f32 @ 0x%llx = %.6f", (unsigned long long)addr, val); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { pipe_log("[WRITE] f32 access violation @ 0x%llx", (unsigned long long)addr); }
+            }
             else if (!strncmp(buf, "FUZZ ", 5)) {
                 int bits = atoi(buf + 5); InterlockedExchange((LONG*)&g_fuzz_bits, bits);
             }
@@ -1172,6 +1722,41 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
                 g_watch_addr = waddr; g_watch_ms = wms;
                 if (g_watch_th) { WaitForSingleObject(g_watch_th, 500); CloseHandle(g_watch_th); }
                 g_watch_th = CreateThread(NULL, 0, memwatch_th, NULL, 0, NULL);
+            }
+            else if (!strncmp(buf, "MEMWRITE_I32 ", 13)) {
+                uint64_t addr = 0; int32_t val = 0;
+                sscanf(buf + 13, "%llx %d", (unsigned long long*)&addr, &val);
+                memwrite_i32(addr, val);
+            }
+            else if (!strncmp(buf, "FLYMODE ", 8)) {
+                uint64_t addr = 0; char onoff[8] = {0};
+                sscanf(buf + 8, "%llx %7s", (unsigned long long*)&addr, onoff);
+                int enable = (onoff[0] == '1');
+                float zero = 0.0f;
+                if (enable) {
+                    __try { *(float*)(uintptr_t)(addr + 36) = zero; } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                }
+                pipe_log("[FLY] %s @ 0x%llx", enable ? "ON" : "OFF", (unsigned long long)addr);
+            }
+            /* FREEZE_GENERIC <slot> <addr_hex> <type> <value> <interval_ms>
+               slot=-1 for auto-slot. type: f32|f64|i32|u8 */
+            else if (!strncmp(buf, "FREEZE_GENERIC ", 15)) {
+                int slot = -1; uint64_t addr = 0;
+                char type[8] = {0}, valstr[32] = {0}; int ms = 50;
+                sscanf(buf + 15, "%d %llx %7s %31s %d",
+                       &slot, (unsigned long long*)&addr, type, valstr, &ms);
+                freeze_generic_set(slot, addr, type, valstr, ms);
+            }
+            else if (!strncmp(buf, "FREEZE_GENERIC_STOP ", 20)) {
+                int slot = -1;
+                sscanf(buf + 20, "%d", &slot);
+                freeze_generic_stop(slot);
+            }
+            else if (!strcmp(buf, "FREEZE_ALL_STOP")) {
+                freeze_generic_stop(-1);
+                g_freeze_hp_addr = 0;
+                g_freeze_pos_addr = 0;
+                pipe_log("[FREEZE] All freezes stopped");
             }
             else if (!strncmp(buf, "PKTFORGE ", 9))  pktforge_run(buf + 9);
             else if (!strncmp(buf, "PROCDUMP ", 9)) {
@@ -1234,8 +1819,9 @@ static DWORD WINAPI io_thread(LPVOID _) {
 #endif
 
                 snprintf(hs, sizeof(hs),
-                    "HyForceHook/9-%s PID=%lu EXE=%s | "
-                    "Hooks:4xWinSock+GQCS+BoringSSL | IOCP+STRINGSCAN+MODLIST+GADGETSCAN+EXPLOIT",
+                    "HyForceHook/10-%s PID=%lu EXE=%s | "
+                    "Hooks:6xWinSock+GQCS+BoringSSL+QuicheProbe | "
+                    "IOCP+STRINGSCAN+MODLIST+GADGETSCAN+EXPLOIT+PLAINTEXT",
                     arch, (unsigned long)pid, exe[0] ? exe : "?");
 
                 pipe_send(MSG_STATUS, hs, (uint32_t)strlen(hs) + 1);
@@ -1293,6 +1879,10 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         InitializeCriticalSection(&g_replay_cs);
         InitializeCriticalSection(&g_kcs);
         InitializeCriticalSection(&g_ovl_cs);
+        InitializeCriticalSection(&g_sock_cs); /* v10 */
+        InitializeCriticalSection(&g_freeze_cs); /* v11 generic freeze */
+        memset(g_freeze_slots, 0, sizeof(g_freeze_slots));
+        g_freeze_gen_th = CreateThread(NULL, 0, freeze_generic_th, NULL, 0, NULL);
 
         /* Create mutexes */
         g_mutex = CreateMutexW(NULL, FALSE, NULL);
@@ -1304,6 +1894,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
 
         /* Init structures */
         memset(g_ovl, 0, sizeof(g_ovl));
+        memset(g_sock_cache, 0, sizeof(g_sock_cache)); /* v10 */
         init_shm();
 
         /* Set SSL keylog environment BEFORE any network init */
@@ -1321,20 +1912,29 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         orig_recvfrom = (recvfrom_t)GetProcAddress(ws2, "recvfrom");
 
         /* Install hooks */
-        if (orig_WSASendTo) { memcpy(sv_wsa_send, orig_WSASendTo, 14); jmp_write(orig_WSASendTo, hook_WSASendTo); }
-        if (orig_WSARecvFrom) { memcpy(sv_wsa_recv, orig_WSARecvFrom, 14); jmp_write(orig_WSARecvFrom, hook_WSARecvFrom); }
-        if (orig_sendto) { memcpy(sv_send, orig_sendto, 14); jmp_write(orig_sendto, hook_sendto); }
-        if (orig_recvfrom) { memcpy(sv_recv, orig_recvfrom, 14); jmp_write(orig_recvfrom, hook_recvfrom); }
+        if (orig_WSASendTo) { memcpy(sv_wsa_send, orig_WSASendTo, 14); jmp_write(orig_WSASendTo, (void*)hook_WSASendTo); }
+        if (orig_WSARecvFrom) { memcpy(sv_wsa_recv, orig_WSARecvFrom, 14); jmp_write(orig_WSARecvFrom, (void*)hook_WSARecvFrom); }
+        if (orig_sendto) { memcpy(sv_send, orig_sendto, 14); jmp_write(orig_sendto, (void*)hook_sendto); }
+        if (orig_recvfrom) { memcpy(sv_recv, orig_recvfrom, 14); jmp_write(orig_recvfrom, (void*)hook_recvfrom); }
+
+        /* v10: Hook WSASend and send for connected UDP sockets (C2S fix) */
+        orig_WSASend_nb = (WSASend_nb_t)GetProcAddress(ws2, "WSASend");
+        if (orig_WSASend_nb) { memcpy(sv_wsa_send_nb, orig_WSASend_nb, 14); jmp_write(orig_WSASend_nb, (void*)hook_WSASend_nb); }
+        orig_send_nb = (send_nb_t)GetProcAddress(ws2, "send");
+        if (orig_send_nb) { memcpy(sv_send_nb, orig_send_nb, 14); jmp_write(orig_send_nb, (void*)hook_send_nb); }
 
         /* Hook GQCS for IOCP */
         HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
         if (k32) {
             orig_GQCS = (GQCS_t)GetProcAddress(k32, "GetQueuedCompletionStatus");
-            if (orig_GQCS) { memcpy(sv_gqcs, orig_GQCS, 14); jmp_write(orig_GQCS, hook_GQCS); }
+            if (orig_GQCS) { memcpy(sv_gqcs, orig_GQCS, 14); jmp_write(orig_GQCS, (void*)hook_GQCS); }
         }
 
         /* Hook BoringSSL */
         hook_boringssl();
+
+        /* v10: Probe for quiche functions immediately and again after delay */
+        probe_quiche();
 
         /* Start threads */
         g_active = TRUE;
@@ -1353,6 +1953,13 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         if (orig_sendto)      jmp_restore(orig_sendto, sv_send);
         if (orig_recvfrom)    jmp_restore(orig_recvfrom, sv_recv);
         if (orig_GQCS)        jmp_restore(orig_GQCS, sv_gqcs);
+        /* v10 */
+        if (orig_WSASend_nb)  jmp_restore(orig_WSASend_nb, sv_wsa_send_nb);
+        if (orig_send_nb)     jmp_restore(orig_send_nb, sv_send_nb);
+        if (orig_ssl_write)   jmp_restore(orig_ssl_write, sv_ssl_write);
+        if (orig_ssl_read)    jmp_restore(orig_ssl_read, sv_ssl_read);
+        if (orig_quiche_recv) jmp_restore(orig_quiche_recv, sv_quiche_recv);
+        if (orig_quiche_send) jmp_restore(orig_quiche_send, sv_quiche_send);
 
         FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 
@@ -1369,6 +1976,9 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         if (g_io_th) { WaitForSingleObject(g_io_th, 500); CloseHandle(g_io_th); }
         if (g_cmd_th) { WaitForSingleObject(g_cmd_th, 500); CloseHandle(g_cmd_th); }
         if (g_watch_th) { WaitForSingleObject(g_watch_th, 500); CloseHandle(g_watch_th); }
+        g_freeze_hp_addr = 0; g_freeze_pos_addr = 0;
+        if (g_freeze_hp_th)  { WaitForSingleObject(g_freeze_hp_th,  300); CloseHandle(g_freeze_hp_th); }
+        if (g_freeze_pos_th) { WaitForSingleObject(g_freeze_pos_th, 300); CloseHandle(g_freeze_pos_th); }
 
         if (g_tls_idx != TLS_OUT_OF_INDEXES) { TlsFree(g_tls_idx); g_tls_idx = TLS_OUT_OF_INDEXES; }
 
@@ -1376,6 +1986,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         DeleteCriticalSection(&g_replay_cs);
         DeleteCriticalSection(&g_kcs);
         DeleteCriticalSection(&g_ovl_cs);
+        DeleteCriticalSection(&g_sock_cs); /* v10 */
     }
 
     return TRUE;

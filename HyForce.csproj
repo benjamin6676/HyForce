@@ -32,4 +32,11 @@
     <PackageReference Include="ZstdSharp.Port" Version="0.8.7" />
   </ItemGroup>
 
+
+  <ItemGroup>
+    <!-- Exclude the HyForce-master backup folder — it causes duplicate class definitions -->
+    <Compile Remove="HyForce-master/**/*.cs" />
+    <None Include="HyForce-master/**/*.cs" />
+  </ItemGroup>
+
 </Project>

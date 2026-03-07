@@ -70,6 +70,9 @@ namespace HyForce
             public string Source { get; set; }
             public DateTime DiscoveredAt { get; set; }
             public IntPtr? MemoryAddress { get; set; }
+            public byte[] AltKey               { get; set; } // alternate label format
+            public byte[] AltIV               { get; set; }
+            public byte[] AltHeaderProtectionKey { get; set; }
             public bool IsClient => Type == EncryptionType.QUIC_Client1RTT || Type == EncryptionType.QUIC_ClientHandshake || Type == EncryptionType.QUIC_Client0RTT;
             public bool IsValid => Key != null && Key.Length > 0 && IV != null && IV.Length > 0;
 
@@ -285,13 +288,77 @@ namespace HyForce
             };
         }
         
+        /// <summary>
+        /// Encrypt plaintext as a QUIC short-header 1-RTT packet.
+        /// Uses the current-session key matching the given direction.
+        /// Returns a fully formed QUIC short-header packet ready to send on UDP.
+        /// </summary>
         public static EncryptionResult TryEncrypt(byte[] plaintext, PacketDirection direction)
         {
             if (plaintext == null)
                 return new EncryptionResult { Success = false, ErrorMessage = "Plaintext is null" };
-            
-            // Return plaintext for now - encryption is complex
-            return new EncryptionResult { Success = true, EncryptedData = plaintext };
+            lock (_lock)
+            {
+                var conn = _connectionKeys.Values
+                    .Where(c2 => c2.IsCurrentSession)
+                    .OrderByDescending(c2 => c2.AddedAt)
+                    .FirstOrDefault();
+                if (conn == null)
+                    return new EncryptionResult { Success = false, ErrorMessage = "No active session keys" };
+                var key = direction == PacketDirection.ClientToServer ? conn.ClientKey : conn.ServerKey;
+                if (key?.IsValid != true)
+                    return new EncryptionResult { Success = false, ErrorMessage = $"No valid {direction} key" };
+                try
+                {
+                    // Assign next packet number (monotonically increasing per key)
+                    string keyId = BitConverter.ToString(SHA256.HashData(key.Secret).Take(8).ToArray());
+                    long pn = (_largestPktNum.TryGetValue(keyId, out var lp) ? lp : 0) + 1;
+                    _largestPktNum[keyId] = pn;
+                    // Build short header: Fixed=1, SpinBit=0, Reserved=0, KeyPhase=0, PNLen=3 (4 bytes)
+                    // First byte: 0x43 = 0100 0011 (Fixed=1, KeyPhase=0, PNLen=0b11 → 4-byte PN)
+                    byte firstByte = 0x43;
+                    int pnLen = 4;
+                    // Header = [firstByte][DCID (0 bytes for Hytale)][PN (4 bytes)]
+                    int dcidLen = conn.SuccessfulDCIDLength >= 0 ? conn.SuccessfulDCIDLength : 0;
+                    byte[] dcid = new byte[dcidLen]; // zeros — real DCID would come from a captured packet
+                    // Build unprotected header
+                    var hdr = new System.IO.MemoryStream();
+                    hdr.WriteByte(firstByte);
+                    hdr.Write(dcid);
+                    // Write 4-byte packet number big-endian
+                    hdr.WriteByte((byte)(pn >> 24)); hdr.WriteByte((byte)(pn >> 16));
+                    hdr.WriteByte((byte)(pn >>  8)); hdr.WriteByte((byte)(pn      ));
+                    byte[] header = hdr.ToArray();
+                    int pnOffset = 1 + dcidLen;
+                    // Build nonce = IV XOR pn
+                    byte[] nonce = new byte[12];
+                    Buffer.BlockCopy(key.IV, 0, nonce, 0, 12);
+                    for (int i = 0; i < 8; i++) nonce[11-i] ^= (byte)(pn >> (i*8));
+                    // AES-128-GCM encrypt
+                    byte[] tag       = new byte[16];
+                    byte[] ciphertext = new byte[plaintext.Length];
+                    using var aes = new AesGcm(key.Key, 16);
+                    aes.Encrypt(nonce, plaintext, ciphertext, tag, header);
+                    // Apply header protection
+                    int sampleOffset = pnOffset + 4; // sample starts after 4-byte PN slot
+                    byte[] sample = ciphertext.Skip(0).Take(16).ToArray(); // sample from start of ciphertext
+                    byte[] mask   = ComputeHPMask(key.HeaderProtectionKey, sample);
+                    byte[] packetBytes = new byte[header.Length + ciphertext.Length + 16];
+                    Buffer.BlockCopy(header,     0, packetBytes, 0,             header.Length);
+                    Buffer.BlockCopy(ciphertext, 0, packetBytes, header.Length, ciphertext.Length);
+                    Buffer.BlockCopy(tag,        0, packetBytes, header.Length + ciphertext.Length, 16);
+                    // Apply HP to first byte
+                    packetBytes[0] = (byte)((packetBytes[0] & 0xE0) | ((packetBytes[0] & 0x1F) ^ (mask[0] & 0x1F)));
+                    // Apply HP to packet number bytes
+                    for (int i = 0; i < pnLen; i++)
+                        packetBytes[pnOffset + i] ^= mask[i + 1];
+                    return new EncryptionResult { Success = true, EncryptedData = packetBytes };
+                }
+                catch (Exception ex)
+                {
+                    return new EncryptionResult { Success = false, ErrorMessage = $"Encrypt error: {ex.Message}" };
+                }
+            }
         }
         
         // Background decrypt pipeline
@@ -330,9 +397,13 @@ namespace HyForce
                     var result = TryDecryptWithAllKeysInternal(packet);
                     if (result != null)
                     {
-                        _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = true });
+                        lock (_lock) { _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = true }); }
                         OnDecrypted?.Invoke(packet, result);
-
+                    }
+                    else
+                    {
+                        // Bug fix: previously never logged failures from background worker
+                        lock (_lock) { _attemptLog.Add(new DecryptionAttempt { Timestamp = DateTime.Now, Success = false }); }
                     }
                 }
                 catch { }
@@ -407,22 +478,45 @@ namespace HyForce
                 Console.WriteLine($"[SSL] File not found: {filePath}");
                 return;
             }
-            
+
             lock (_lock)
             {
                 var lines = File.ReadAllLines(filePath);
-                int clientCount = 0, serverCount = 0;
-                
+
+                // Deduplicate: key = "label client_random", keep LAST occurrence per pair
+                // This prevents 11000+ keys from accumulating across many sessions
+                var clientMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var serverMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var earlyMap  = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); // 0-RTT
+
                 foreach (var line in lines)
                 {
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-                    
-                    var clientMatch = Regex.Match(line, @"CLIENT_TRAFFIC_SECRET_0\s+([0-9a-fA-F]{64})\s+([0-9a-fA-F]+)");
-                    if (clientMatch.Success)
+                    if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#")) continue;
+                    var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 3) continue;
+                    string label = parts[0]; string clientRandom = parts[1]; string secret = parts[2];
+                    if (label == "CLIENT_TRAFFIC_SECRET_0")
+                        clientMap[clientRandom] = secret;
+                    else if (label == "SERVER_TRAFFIC_SECRET_0")
+                        serverMap[clientRandom] = secret;
+                    else if (label == "CLIENT_EARLY_TRAFFIC_SECRET")
+                        earlyMap[clientRandom] = secret;  // 0-RTT
+                }
+
+                // Only load the N most recent sessions (by order in file = most recent = last)
+                // Cap at 50 unique sessions to avoid search explosion
+                int maxSessions = 50;
+                int clientCount = 0, serverCount = 0;
+
+                // Process in pairs - same client_random = same TLS session
+                var allCRs = clientMap.Keys.Union(serverMap.Keys).Union(earlyMap.Keys).TakeLast(maxSessions).ToList();
+                foreach (var cr in allCRs)
+                {
+                    if (clientMap.TryGetValue(cr, out var cSecret))
                     {
                         var key = new EncryptionKey
                         {
-                            Secret = HexToBytes(clientMatch.Groups[2].Value),
+                            Secret = HexToBytes(cSecret),
                             Type = EncryptionType.QUIC_Client1RTT,
                             Source = filePath,
                             DiscoveredAt = DateTime.Now
@@ -430,15 +524,12 @@ namespace HyForce
                         DeriveQUICKeys(key);
                         AddKey(key);
                         clientCount++;
-                        continue;
                     }
-                    
-                    var serverMatch = Regex.Match(line, @"SERVER_TRAFFIC_SECRET_0\s+([0-9a-fA-F]{64})\s+([0-9a-fA-F]+)");
-                    if (serverMatch.Success)
+                    if (serverMap.TryGetValue(cr, out var sSecret))
                     {
                         var key = new EncryptionKey
                         {
-                            Secret = HexToBytes(serverMatch.Groups[2].Value),
+                            Secret = HexToBytes(sSecret),
                             Type = EncryptionType.QUIC_Server1RTT,
                             Source = filePath,
                             DiscoveredAt = DateTime.Now
@@ -447,10 +538,90 @@ namespace HyForce
                         AddKey(key);
                         serverCount++;
                     }
+                    if (earlyMap.TryGetValue(cr, out var eSecret))
+                    {
+                        // 0-RTT early data key — CLIENT_EARLY_TRAFFIC_SECRET
+                        var key = new EncryptionKey
+                        {
+                            Secret = HexToBytes(eSecret),
+                            Type = EncryptionType.QUIC_Client0RTT,
+                            Source = filePath + " [0-RTT]",
+                            DiscoveredAt = DateTime.Now
+                        };
+                        DeriveQUICKeys(key);
+                        AddKey(key);
+                        serverCount++; // reuse counter
+                    }
                 }
-                
-                Console.WriteLine($"[SSL] Loaded {clientCount} client, {serverCount} server keys");
+
+                Console.WriteLine($"[SSL] Loaded {clientCount} client, {serverCount} server keys ({allCRs.Count} sessions, deduped from {lines.Length} lines)");
             }
+        }
+
+        /// <summary>
+        /// Clean the key log file: deduplicate, keep max N sessions, write back.
+        /// Call on startup and before re-importing.
+        /// </summary>
+        public static int CleanKeyLogFile(string filePath)
+        {
+            if (!File.Exists(filePath)) return 0;
+            try
+            {
+                var lines = File.ReadAllLines(filePath);
+                if (lines.Length <= 100) return lines.Length; // already small
+
+                // Keep header comments
+                var header = lines.Where(l => l.StartsWith("#")).ToList();
+
+                // Deduplicate: keep last occurrence per (label, client_random)
+                var clientMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var serverMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var line in lines)
+                {
+                    if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#")) continue;
+                    var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 3) continue;
+                    if (parts[0] == "CLIENT_TRAFFIC_SECRET_0")  clientMap[parts[1]] = parts[2];
+                    else if (parts[0] == "SERVER_TRAFFIC_SECRET_0") serverMap[parts[1]] = parts[2];
+                }
+
+                // Keep last 100 unique sessions
+                var allCRs = clientMap.Keys.Union(serverMap.Keys).TakeLast(100).ToList();
+                var cleaned = new List<string>(header);
+                foreach (var cr in allCRs)
+                {
+                    if (clientMap.TryGetValue(cr, out var cs))
+                        cleaned.Add($"CLIENT_TRAFFIC_SECRET_0 {cr} {cs}");
+                    if (serverMap.TryGetValue(cr, out var ss))
+                        cleaned.Add($"SERVER_TRAFFIC_SECRET_0 {cr} {ss}");
+                }
+
+                File.WriteAllLines(filePath, cleaned);
+                Console.WriteLine($"[SSL] Cleaned key file: {lines.Length} → {cleaned.Count} lines ({allCRs.Count} sessions)");
+                return cleaned.Count;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SSL] Clean failed: {ex.Message}");
+                return -1;
+            }
+        }
+
+        /// <summary>Fresh start: clear memory keys and truncate the key file. User must reconnect Hytale.</summary>
+        public static void FreshStart(string keyFilePath)
+        {
+            lock (_lock)
+            {
+                _connectionKeys.Clear();
+                _attemptLog.Clear();
+                _largestPktNum.Clear();
+            }
+            try
+            {
+                File.WriteAllText(keyFilePath,
+                    "# HyForce fresh-start key log\n# Reconnect Hytale to generate new keys\n");
+            }
+            catch { }
         }
         
         public static string TestKeyDerivation()
@@ -602,8 +773,22 @@ namespace HyForce
         private static byte[] TryDecryptInternal(byte[] packet, EncryptionKey key, int dcidLen)
         {
             byte firstByte = packet[0];
-            bool isLongHeader = (firstByte & 0x80) != 0;
-            return isLongHeader ? TryDecryptLongHeader(packet, key, dcidLen) : TryDecryptShortHeader(packet, key, dcidLen);
+            bool isLong = (firstByte & 0x80) != 0;
+            // Try primary label-format keys first
+            var result = isLong ? TryDecryptLongHeader(packet, key, dcidLen) : TryDecryptShortHeader(packet, key, dcidLen);
+            if (result != null) return result;
+            // Alt label-format fallback (fixes "tls13 " prefix ambiguity — RFC 9001 vs RFC 8446)
+            if (key.AltKey != null && key.AltIV != null && key.AltHeaderProtectionKey != null)
+            {
+                var altKey = new EncryptionKey
+                {
+                    Key = key.AltKey, IV = key.AltIV,
+                    HeaderProtectionKey = key.AltHeaderProtectionKey,
+                    Secret = key.Secret, Type = key.Type
+                };
+                return isLong ? TryDecryptLongHeader(packet, altKey, dcidLen) : TryDecryptShortHeader(packet, altKey, dcidLen);
+            }
+            return null;
         }
         
         private static byte[] TryDecryptLongHeader(byte[] packet, EncryptionKey key, int dcidLen)
@@ -615,7 +800,9 @@ namespace HyForce
                 uint version = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(offset)); offset += 4;
                 if (packet.Length < offset + 1) return null;
                 byte dcidLengthByte = packet[offset++];
-                int actualDcidLen = Math.Min(dcidLengthByte, dcidLen);
+                // Bug fix: for Long Header the DCID length is explicit on the wire.
+                // Do NOT clamp with dcidLen (that param is only relevant for Short Header).
+                int actualDcidLen = dcidLengthByte;
                 if (packet.Length < offset + actualDcidLen) return null;
                 offset += dcidLengthByte;
                 if (packet.Length < offset + 1) return null;
@@ -775,6 +962,53 @@ namespace HyForce
             return okm;
         }
         
+        // ── QUIC Initial Packet Decryption (RFC 9001 Appendix A) ─────────────
+        // Initial packets use a well-known salt + the client DCID to derive keys.
+        // No SSL key log needed — these can always be decrypted.
+        private static readonly byte[] QuicV1InitialSalt = Convert.FromHexString("38762cf7f55934b34d179ae6a4c80cadccbb7f0a");
+
+        public static byte[]? TryDecryptInitial(byte[] packet)
+        {
+            try
+            {
+                if (packet == null || packet.Length < 7) return null;
+                if ((packet[0] & 0x80) == 0) return null; // must be Long Header
+                // Extract version
+                uint version = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(1));
+                if (version != 0x00000001) return null; // only QUIC v1
+                // Extract DCID
+                int offset = 5;
+                byte dcidLen = packet[offset++];
+                if (packet.Length < offset + dcidLen) return null;
+                byte[] dcid = packet.Skip(offset).Take(dcidLen).ToArray();
+                // Derive initial secret: HKDF-Extract(QuicV1InitialSalt, DCID)
+                byte[] initialSecret = HkdfExtract(QuicV1InitialSalt, dcid);
+                // Derive client/server initial keys
+                byte[] clientInitialSecret = HkdfExpandLabelQUIC(initialSecret, "client in", 32, HkdfLabelFormat.RFC8446_WithPrefix);
+                byte[] serverInitialSecret = HkdfExpandLabelQUIC(initialSecret, "server in", 32, HkdfLabelFormat.RFC8446_WithPrefix);
+                foreach (var secret in new[] { clientInitialSecret, serverInitialSecret })
+                {
+                    var key = new EncryptionKey
+                    {
+                        Secret = secret,
+                        Key = HkdfExpandLabelQUIC(secret, "quic key", 16, HkdfLabelFormat.RFC8446_WithPrefix),
+                        IV  = HkdfExpandLabelQUIC(secret, "quic iv",  12, HkdfLabelFormat.RFC8446_WithPrefix),
+                        HeaderProtectionKey = HkdfExpandLabelQUIC(secret, "quic hp", 16, HkdfLabelFormat.RFC8446_WithPrefix),
+                    };
+                    var result = TryDecryptLongHeader(packet, key, dcidLen);
+                    if (result != null) return result;
+                }
+                return null;
+            }
+            catch { return null; }
+        }
+
+        private static byte[] HkdfExtract(byte[] salt, byte[] ikm)
+        {
+            using var hmac = new HMACSHA256 { Key = salt };
+            return hmac.ComputeHash(ikm);
+        }
+
         private static bool IsClientPacket(byte[] packet) { return (packet[0] & 0x40) != 0; }
         
         private static long ReadVarInt(byte[] data, ref int offset)

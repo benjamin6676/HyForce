@@ -334,6 +334,12 @@ namespace HyForce.Tabs
             }
             ImGui.SameLine();
             if (ImGui.SmallButton("PCAP Stop")) _pipe.SendCommand("PCAP_STOP");
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Quiche Probe"))
+            {
+                _pipe.QuicheProbe();
+                _state.AddInGameLog("[QUICHE] Probe sent — scanning loaded modules for quiche stream hooks");
+            }
 
             ImGui.Spacing();
             ImGui.Separator();
