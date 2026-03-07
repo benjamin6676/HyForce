@@ -72,7 +72,8 @@ namespace HyForce
             public IntPtr? MemoryAddress { get; set; }
             public bool IsClient => Type == EncryptionType.QUIC_Client1RTT || Type == EncryptionType.QUIC_ClientHandshake || Type == EncryptionType.QUIC_Client0RTT;
             public bool IsValid => Key != null && Key.Length > 0 && IV != null && IV.Length > 0;
-            public string EncType => Type.ToString();
+
+           
         }
         
         public class DecryptionResult

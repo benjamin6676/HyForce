@@ -649,7 +649,7 @@ public class PacketFeedTab : ITab
         }
 
         if (raw.Length > 512)
-            ImGui.TextColored(Theme.ColTextMuted, $"... {raw.Length - 512} more bytes -- use Export to see full");
+            ImGui.TextColored(Theme.ColTextMuted, $"\n  ... {raw.Length - 512} more bytes -- use Export to see full");
 
         ImGui.EndChild();
         ImGui.PopStyleColor();

@@ -119,11 +119,7 @@ namespace HyForce.Tabs
         private void RenderEntityFinder()
         {
             ImGui.TextColored(Accent, "Entity / Player Struct Finder");
-            ImGui.TextWrapped(
-                "Scans process memory for structs matching the pattern: " +
-                "[float health][float maxHP][double X][double Y][double Z][float vx][float vy][float vz]. " +
-                "NOTE: JVM heap objects move on GC. Re-scan periodically. " +
-                "If no hits: Hytale may use different struct layout — try Pattern Scan with known values.");
+            ImGui.TextWrapped("Scans process memory for structs matching the pattern: [float health][float maxHP][double X][double Y][double Z][float vx][float vy][float vz]. NOTE: JVM heap objects move on GC. Re-scan periodically. If no hits: Hytale may use different struct layout — try Pattern Scan with known values.");
             ImGui.Spacing();
 
             ImGui.Text($"Results: {_pipe.MemHits.Count}");
@@ -134,7 +130,7 @@ namespace HyForce.Tabs
             ImGui.Separator();
 
             float tableH = ImGui.GetContentRegionAvail().Y - 4;
-            if (ImGui.BeginTable("##ent", 9,  // ← FIXED: was 8, now 9
+            if (ImGui.BeginTable("##ent", 8,
                 ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg |
                 ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable,
                 new Vector2(-1, tableH)))
@@ -212,10 +208,7 @@ namespace HyForce.Tabs
         private void RenderBookmarks()
         {
             ImGui.TextColored(Accent, "Bookmarked Memory Locations");
-            ImGui.TextWrapped(
-                "Starred entities from the Entity Finder appear here. " +
-                "Each bookmark stores the base address and field snapshot. " +
-                "Use 'Refresh' to re-read current values from memory via the DLL.");
+            ImGui.TextWrapped("Starred entities from the Entity Finder appear here. Each bookmark stores the base address and field snapshot. Use 'Refresh' to re-read current values from memory via the DLL.");
             ImGui.Spacing();
 
             // Pending bookmark dialog
@@ -283,8 +276,7 @@ namespace HyForce.Tabs
                     }
 
                     ImGui.TextColored(live != null ? Green : Muted,
-                        $"HP {bm.LastHealth:F0}/{bm.LastMaxHP:F0}  " +
-                        $"({bm.LastX:F1}, {bm.LastY:F1}, {bm.LastZ:F1})");
+                        $"HP {bm.LastHealth:F0}/{bm.LastMaxHP:F0}  ({bm.LastX:F1}, {bm.LastY:F1}, {bm.LastZ:F1})");
                     ImGui.SameLine();
                     ImGui.TextColored(Muted, $"0x{bm.Address:X14}");
                     ImGui.SameLine();
@@ -294,8 +286,7 @@ namespace HyForce.Tabs
                     if (ImGui.SmallButton("Delete"))
                     { _bookmarks.Remove(bm); SaveBookmarks(); ImGui.PopID(); break; }
 
-                    ImGui.TextColored(Muted, $"  Created {bm.CreatedAt:HH:mm:ss}  " +
-                        $"Last seen {bm.LastSeen:HH:mm:ss}");
+                    ImGui.TextColored(Muted, $"  Created {bm.CreatedAt:HH:mm:ss}  Last seen {bm.LastSeen:HH:mm:ss}");
                     ImGui.PopID();
                     ImGui.Separator();
                 }
@@ -334,10 +325,7 @@ namespace HyForce.Tabs
         private void RenderSavedScans()
         {
             ImGui.TextColored(Accent, "Saved Scan Watch List");
-            ImGui.TextWrapped(
-                "Entities saved here get their values updated every time the DLL returns a scan hit " +
-                "with a matching address. NOTE: JVM GC moves objects — addresses become stale. " +
-                "Re-scan to find the new address, then update the entry.");
+            ImGui.TextWrapped("Entities saved here get their values updated every time the DLL returns a scan hit with a matching address. NOTE: JVM GC moves objects — addresses become stale. Re-scan to find the new address, then update the entry.");
             ImGui.Spacing();
 
             ImGui.Checkbox("Auto-refresh on DLL connection", ref _autoRefreshScans);
@@ -526,9 +514,7 @@ namespace HyForce.Tabs
         private void RenderClientVsPacket()
         {
             ImGui.TextColored(Accent, "Client Memory  ↔  Outgoing Packet Values");
-            ImGui.TextWrapped(
-                "If what the client holds in memory differs from what it sends to the server, " +
-                "that's a server-trust vulnerability. Every mismatch is a potential finding.");
+            ImGui.TextWrapped("If what the client holds in memory differs from what it sends to the server, that's a server-trust vulnerability. Every mismatch is a potential finding.");
             ImGui.Spacing();
 
             lock (_pipe.MemHits)
@@ -558,30 +544,25 @@ namespace HyForce.Tabs
             }
 
             ImGui.Spacing();
-            ImGui.TextColored(Muted,
-                "Packet-side position values will appear here once decryption is working." +
-                "The hook fires stats every 5s — watch STATS lines in the Log tab to confirm" +
-                "which hook variant (WSASendTo or sendto) is catching Hytale's traffic.");
+            ImGui.TextColored(Muted, "Packet-side position values will appear here once decryption is working.");
+            ImGui.TextColored(Muted, "The hook fires stats every 5s — watch STATS lines in the Log tab to confirm");
+            ImGui.TextColored(Muted, "which hook variant (WSASendTo or sendto) is catching Hytale's traffic.");
             ImGui.Spacing();
 
             // Show recent packet count as proxy for whether capture is working
             ImGui.TextColored(new Vector4(0.5f, 0.9f, 0.5f, 1f),
                 $"Packets captured so far: {_pipe.PacketCount}");
             if (_pipe.PacketCount == 0)
-                ImGui.TextColored(Red,
-                    "0 packets — DLL hooks not firing. Check STATS in Log tab." +
-                    "If all 4 fire counts are 0, Hytale may use IOCP (async I/O)." +
-                    "Next step: WinDivert capture (see Settings tab for setup guide).");
+                ImGui.TextColored(Red, "0 packets — DLL hooks not firing. Check STATS in Log tab.");
+            ImGui.TextColored(Red, "If all 4 fire counts are 0, Hytale may use IOCP (async I/O).");
+            ImGui.TextColored(Red, "Next step: WinDivert capture (see Settings tab for setup guide).");
         }
 
         // ─── Pattern Scan ─────────────────────────────────────────
         private void RenderPatternScan()
         {
             ImGui.TextColored(Accent, "Byte Pattern Scanner");
-            ImGui.TextWrapped(
-                "Know a value that exists in a struct (e.g. your exact HP = 87.5)? " +
-                "Convert it to hex and scan for it. Then watch which address changes when " +
-                "you take damage — that's the live struct.");
+            ImGui.TextWrapped("Know a value that exists in a struct (e.g. your exact HP = 87.5)? Convert it to hex and scan for it. Then watch which address changes when you take damage — that's the live struct.");
             ImGui.Spacing();
 
             ImGui.SetNextItemWidth(460);
@@ -627,24 +608,21 @@ namespace HyForce.Tabs
 
             ImGui.Spacing();
             ImGui.Separator();
-            ImGui.TextColored(Muted,
-                "Workflow for finding unknown structs:" +
-                "  1. Note a known value (your HP = 87.5)" +
-                "  2. Enter it in the float converter → click Use" +
-                "  3. Scan, note all addresses found" +
-                "  4. Change the value in-game (take damage)" +
-                "  5. Re-scan with new value — surviving address = live struct" +
-                "  6. Inspect surrounding bytes in Struct Viewer" +
-                "  7. Map all fields → cross-reference with captured packets");
+            ImGui.TextColored(Muted, "Workflow for finding unknown structs:");
+            ImGui.TextColored(Muted, "  1. Note a known value (your HP = 87.5)");
+            ImGui.TextColored(Muted, "  2. Enter it in the float converter → click Use");
+            ImGui.TextColored(Muted, "  3. Scan, note all addresses found");
+            ImGui.TextColored(Muted, "  4. Change the value in-game (take damage)");
+            ImGui.TextColored(Muted, "  5. Re-scan with new value — surviving address = live struct");
+            ImGui.TextColored(Muted, "  6. Inspect surrounding bytes in Struct Viewer");
+            ImGui.TextColored(Muted, "  7. Map all fields → cross-reference with captured packets");
         }
 
         // ─── String Heap ──────────────────────────────────────────
         private void RenderStringHeap()
         {
             ImGui.TextColored(Accent, "String Heap Scanner");
-            ImGui.TextWrapped(
-                "Finds ASCII strings in client memory. Useful for discovering internal " +
-                "server hostnames, auth tokens, debug strings, and protocol identifiers.");
+            ImGui.TextWrapped("Finds ASCII strings in client memory. Useful for discovering internal server hostnames, auth tokens, debug strings, and protocol identifiers.");
             ImGui.Spacing();
 
             ImGui.SetNextItemWidth(280);
@@ -658,30 +636,26 @@ namespace HyForce.Tabs
             { _pipe.SendCommand("STRINGSCAN"); _pipe.MemScan(); }
 
             ImGui.Spacing();
-            ImGui.TextColored(Muted,
-                "Interesting findings to look for:" +
-                "  ● Internal IPs / hostnames  → dev/staging server exposure" +
-                "  ● 'admin' / 'debug' flags    → undocumented privilege levels" +
-                "  ● JWT tokens in cleartext    → auth token leakage" +
-                "  ● Error messages / stack paths → internal code layout" +
-                "  ● Encryption key-like strings  → critical if present" +
-                "Results appear in the Log tab as [DLL] lines.");
+            ImGui.TextColored(Muted, "Interesting findings to look for:");
+            ImGui.TextColored(Muted, "  ● Internal IPs / hostnames  → dev/staging server exposure");
+            ImGui.TextColored(Muted, "  ● 'admin' / 'debug' flags    → undocumented privilege levels");
+            ImGui.TextColored(Muted, "  ● JWT tokens in cleartext    → auth token leakage");
+            ImGui.TextColored(Muted, "  ● Error messages / stack paths → internal code layout");
+            ImGui.TextColored(Muted, "  ● Encryption key-like strings  → critical if present");
+            ImGui.TextColored(Muted, "Results appear in the Log tab as [DLL] lines.");
         }
 
         // ─── Module Map ───────────────────────────────────────────
         private void RenderModuleMap()
         {
             ImGui.TextColored(Accent, "Loaded Module Map");
-            ImGui.TextWrapped(
-                "Shows DLLs loaded in the Hytale process. Identifies which crypto/network " +
-                "libraries are in use and their approximate base addresses.");
+            ImGui.TextWrapped("Shows DLLs loaded in the Hytale process. Identifies which crypto/network libraries are in use and their approximate base addresses.");
             ImGui.Spacing();
             if (ImGui.Button("Request Module List##ml"))
                 _pipe.SendCommand("MODLIST");
             ImGui.Spacing();
-            ImGui.TextColored(Muted,
-                "Results appear in Log tab as [DLL] MODULE: entries." +
-                "Look for: BoringSSL, OpenSSL, netty, libquiche, jvm.dll versions.");
+            ImGui.TextColored(Muted, "Results appear in Log tab as [DLL] MODULE: entries.");
+            ImGui.TextColored(Muted, "Look for: BoringSSL, OpenSSL, netty, libquiche, jvm.dll versions.");
         }
 
         // ─── Notes ────────────────────────────────────────────────
@@ -772,22 +746,7 @@ namespace HyForce.Tabs
         static readonly Vector4 Red = new(1f, 0.3f, 0.2f, 1f);
         static readonly Vector4 Muted = new(0.55f, 0.55f, 0.55f, 1f);
 
-        const string DefaultNotes = @"# HyForce Memory Research Notes
-
-## Entity Findings
-[Document entity struct addresses, field offsets, and what values the server trusts]
-
-## Packet-Memory Correlation
-[Note which packet fields correspond to which memory offsets]
-
-## Visibility Issues
-[Does client receive position data for hidden entities?]
-
-## Server Trust Issues
-[Which fields can be influenced client-side and accepted by server?]
-
-## Other Findings
-";
+        const string DefaultNotes = @"# HyForce Memory Research Notes\n\n## Entity Findings\n[Document entity struct addresses, field offsets, and what values the server trusts]\n\n## Packet-Memory Correlation\n[Note which packet fields correspond to which memory offsets]\n\n## Visibility Issues\n[Does client receive position data for hidden entities?]\n\n## Server Trust Issues\n[Which fields can be influenced client-side and accepted by server?]\n\n## Other Findings\n";
 
 
         // ─── Live Watch ───────────────────────────────────────────────

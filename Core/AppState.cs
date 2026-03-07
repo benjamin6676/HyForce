@@ -88,7 +88,6 @@ public class AppState : IDisposable
         _retryTimer.Start();
         // Permanent key log setup
         InitPermanentKeyLog();
-
     }
 
 
@@ -150,8 +149,7 @@ public class AppState : IDisposable
             if (!File.Exists(PermanentKeyLogPath))
             {
                 File.WriteAllText(PermanentKeyLogPath,
-                    "# HyForce permanent SSL key log - QUIC/TLS 1.3 keys for Hytale" +
-                    "# Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "");
+                    "# HyForce permanent SSL key log - QUIC/TLS 1.3 keys for Hytale\n# Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\n");
             }
 
             // Start watching the file
@@ -183,11 +181,7 @@ public class AppState : IDisposable
         }
     }
 
-    public void NotifyMemoryDataUpdated()
-    {
-        OnMemoryDataUpdated?.Invoke();
-    }
-
+    
 
     private void ShowHytaleRestartNotification()
     {
@@ -448,9 +442,7 @@ public class AppState : IDisposable
             }
 
             // Append to working keys file
-            File.AppendAllText(WorkingHytaleKeysPath,
-                $"# Promoted at {DateTime.Now:yyyy-MM-dd HH:mm:ss}" +
-                FormatKeyLine(key) + "");
+            File.AppendAllText(WorkingHytaleKeysPath, $"# Promoted at {DateTime.Now:yyyy-MM-dd HH:mm:ss}\n" + FormatKeyLine(key) + "\n");
 
             AddInGameLog($"[KEYS] Promoted {key.Type} key to HytaleKeys.log");
         }
@@ -605,7 +597,7 @@ public class AppState : IDisposable
             if (key != null)
             {
                 PacketDecryptor.AddKey(key);
-                AddInGameLog($"[KEYLOG] Key imported: {key.EncType} ({PacketDecryptor.DiscoveredKeys.Count} total)");
+                AddInGameLog($"[KEYLOG] Key imported: {key.Type} ({PacketDecryptor.DiscoveredKeys.Count} total)");
                 OnKeysUpdated?.Invoke();
 
                 // Also append to permanent log for persistence
@@ -643,7 +635,7 @@ public class AppState : IDisposable
         {
             PacketDecryptor.ClearKeys();
             _permFileReadPos = 0;
-            File.WriteAllText(PermanentKeyLogPath, "# HyForce permanent SSL key log - cleared");
+            File.WriteAllText(PermanentKeyLogPath, "# HyForce permanent SSL key log - cleared\n");
             AddInGameLog("[AUTOKEY] Permanent log cleared.");
         }
         catch (Exception ex) { AddInGameLog($"[AUTOKEY] Clear error: {ex.Message}"); }
@@ -663,7 +655,7 @@ public class AppState : IDisposable
             Directory.CreateDirectory(ExportDirectory);
 
             // Create empty file (this triggers file watcher)
-            File.WriteAllText(keyLogPath, $"# HyForce Session {sessionId}");
+            File.WriteAllText(keyLogPath, $"# HyForce Session {sessionId}\n");
 
             // CRITICAL: Set for THIS PROCESS ONLY - Hytale must be restarted to pick this up
             Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.Process);
@@ -804,7 +796,7 @@ public class AppState : IDisposable
         {
             lock (_sessionLogLock)
             {
-                try { File.AppendAllText(SessionLogPath, stamped + ""); }
+                try { File.AppendAllText(SessionLogPath, stamped + "\n"); }
                 catch { /* never crash from log write failure */ }
             }
         }
@@ -1002,8 +994,7 @@ public class AppState : IDisposable
             systemKeyLog,
             Path.Combine(ExportDirectory, "sslkeys.log"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "sslkeys.log"),
-            @"C:\Usersenja\source
-epos\HyForce\Exported logs\sslkeys.log"
+            @"C:\Users\benja\source\repos\HyForce\Exported logs\sslkeys.log"
         };
 
             foreach (var path in possiblePaths.Where(p => !string.IsNullOrEmpty(p)).Distinct())
@@ -1031,7 +1022,7 @@ epos\HyForce\Exported logs\sslkeys.log"
                     }
 
                     // Create fresh empty file with header
-                    File.WriteAllText(path, "# SSL Key Log - Fresh session started by HyForce");
+                    File.WriteAllText(path, "# SSL Key Log - Fresh session started by HyForce\n");
                 }
                 catch (Exception ex)
                 {
@@ -1068,7 +1059,7 @@ epos\HyForce\Exported logs\sslkeys.log"
             {
                 // Strategy 2: Delete and recreate
                 File.Delete(path);
-                File.WriteAllText(path, "# SSL Key Log - Fresh start");
+                File.WriteAllText(path, "# SSL Key Log - Fresh start\n");
                 return true;
             }
             catch
@@ -1614,9 +1605,7 @@ epos\HyForce\Exported logs\sslkeys.log"
         var packets = PacketLog.GetAll();
         foreach (var pkt in packets)
         {
-            sb.AppendLine($"[{pkt.Timestamp:HH:mm:ss.fff}] {pkt.DirStr} {(pkt.IsTcp ? "TCP" : "UDP")} " +
-                $"0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeName}) {pkt.ByteLength} bytes " +
-                $"[{pkt.CompressionMethod}] [{(pkt.EncryptionHint == "encrypted" ? "ENC" : "CLR")}]");
+            sb.AppendLine($"[{pkt.Timestamp:HH:mm:ss.fff}] {pkt.DirStr} {(pkt.IsTcp ? "TCP" : "UDP")} 0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeName}) {pkt.ByteLength} bytes [{pkt.CompressionMethod}] [{(pkt.EncryptionHint == "encrypted" ? "ENC" : "CLR")}]");
 
             if (pkt.ByteLength <= 256 && !string.IsNullOrEmpty(pkt.RawHexPreview))
             {
