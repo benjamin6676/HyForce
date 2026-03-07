@@ -365,7 +365,7 @@ namespace HyForce
         private static System.Collections.Concurrent.BlockingCollection<byte[]> _decryptQueue
             = new System.Collections.Concurrent.BlockingCollection<byte[]>(500); // cap at 500 queued
         private static System.Threading.Thread? _decryptWorker;
-        public static int MaxSessionsToSearch { get; set; } = 5; // only try N most recent sessions
+        public static int MaxSessionsToSearch { get; set; } = 50; // try all recent sessions
 
         // Fired when a packet is successfully decrypted
         public static event Action<byte[], byte[]>? OnDecrypted; // (encrypted, decrypted)

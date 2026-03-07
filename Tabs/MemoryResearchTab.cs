@@ -208,9 +208,11 @@ namespace HyForce.Tabs
                         ImGui.Text($"{i}");
 
                         ImGui.TableSetColumnIndex(2);
-                        if (ImGui.Selectable($"0x{h.Address:X14}##r{i}", sel,
-                            ImGuiSelectableFlags.SpanAllColumns))
-                            _selectedHit = i;
+                        // Use InvisibleButton for row selection — SpanAllColumns blocks SmallButtons
+                        bool rowClicked = ImGui.Selectable($"##sel{i}", sel, ImGuiSelectableFlags.None, new Vector2(0, 0));
+                        ImGui.SameLine();
+                        ImGui.Text($"0x{h.Address:X14}");
+                        if (rowClicked) _selectedHit = i;
 
                         ImGui.TableSetColumnIndex(3);
                         float frac = h.MaxHealth > 0 ? h.Health / h.MaxHealth : 0;

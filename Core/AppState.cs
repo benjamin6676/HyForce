@@ -91,6 +91,30 @@ public class AppState : IDisposable
         _retryTimer.Start();
         // Permanent key log setup
         InitPermanentKeyLog();
+
+        // Subscribe to background decryption results — background worker fires OnDecrypted
+        // when it successfully decrypts a queued packet. Match it back to the PacketLogEntry.
+        PacketDecryptor.OnDecrypted += (rawBytes, plaintext) =>
+        {
+            try
+            {
+                // Find the most recent PacketLogEntry with matching raw bytes
+                var entries = PacketLog.GetLast(200);
+                var entry = entries.LastOrDefault(e => e.RawBytes != null &&
+                    e.RawBytes.Length == rawBytes.Length &&
+                    !e.WasDecrypted &&
+                    e.RawBytes.AsSpan().SequenceEqual(rawBytes.AsSpan()));
+                if (entry != null)
+                {
+                    entry.DecryptedBytes = plaintext;
+                    entry.EncryptionHint = "decrypted";
+                    if (plaintext.Length >= 8)
+                        entry.ParsedPacketId = BitConverter.ToUInt32(plaintext, 4);
+                    OnKeysUpdated?.Invoke();
+                }
+            }
+            catch { /* silent */ }
+        };
     }
 
 
@@ -630,8 +654,18 @@ public class AppState : IDisposable
     /// </summary>
     public void OnHookPacket(CapturedPacket packet)
     {
-        if (packet?.RawBytes == null || packet.RawBytes.Length < 4) return;  // was 20, lowered for short QUIC packets
+        if (packet?.RawBytes == null || packet.RawBytes.Length < 4) return;
         PacketLog.Add(packet);
+
+        // Queue for decryption immediately on arrival — result arrives via OnDecrypted callback
+        if (PacketDecryptor.AutoDecryptEnabled &&
+            PacketDecryptor.DiscoveredKeys.Count > 0 &&
+            packet.RawBytes.Length >= 21 &&
+            (packet.RawBytes[0] & 0x40) != 0) // QUIC fixed bit
+        {
+            PacketDecryptor.TryDecrypt(packet.RawBytes); // enqueues; OnDecrypted handles result
+        }
+
         _packetHandlerDelegate?.Invoke(packet);
     }
 
@@ -739,15 +773,13 @@ public class AppState : IDisposable
     // FIXED: Single SetupAutoDecryption method with 30 second interval
     private void SetupAutoDecryption()
     {
-        _autoDecryptTimer = new System.Timers.Timer(60000); // 60 seconds - very conservative
+        _autoDecryptTimer = new System.Timers.Timer(3000); // 3 seconds — fast enough to catch live packets
         _autoDecryptTimer.Elapsed += (s, e) =>
         {
-            // CRITICAL FIX: Only auto-decrypt if we have keys AND proxy is running
-            if (!(!PacketDecryptor.AutoDecryptEnabled ||
-                PacketDecryptor.DiscoveredKeys.Count <= 0 ||
-                !IsRunning)
-!)          {
-                // Run on thread pool to avoid blocking
+            if (PacketDecryptor.AutoDecryptEnabled &&
+                PacketDecryptor.DiscoveredKeys.Count > 0 &&
+                IsRunning)
+            {
                 Task.Run(() => TryAutoDecryptPackets());
             }
         };
@@ -755,29 +787,36 @@ public class AppState : IDisposable
         // DON'T start here - start in Start() method
     }
 
-    // FIXED: Single TryAutoDecryptPackets method - less aggressive
+    // FIXED: Process ALL undecrypted packets, any size, store result on entry
     private void TryAutoDecryptPackets()
     {
         if (!PacketDecryptor.AutoDecryptEnabled) return;
         if (PacketDecryptor.DiscoveredKeys.Count == 0) return;
 
-        // CRITICAL FIX: Only process a few packets at a time
-        var recentPackets = PacketLog.GetLast(3); // REDUCED from 10 to 3
+        // Get ALL recent packets — don't limit to 3, don't filter by size
+        var allPackets = PacketLog.GetLast(500);
         int decrypted = 0;
+        int attempted = 0;
 
-        foreach (var pkt in recentPackets)
+        foreach (var pkt in allPackets)
         {
-            if (pkt.EncryptionHint == "encrypted" && pkt.RawBytes.Length > 100)
-            {
-                // Use non-blocking decrypt
-                var result = PacketDecryptor.TryDecrypt(pkt.RawBytes);
-                if (result.Success) decrypted++;
-            }
+            // Skip already-decrypted and non-QUIC-looking packets
+            if (pkt.WasDecrypted) continue;
+            if (pkt.EncryptionHint != "encrypted") continue;
+            if (pkt.RawBytes == null || pkt.RawBytes.Length < 21) continue;
+            // QUIC fixed bit check (bit 6 of first byte must be 1)
+            if ((pkt.RawBytes[0] & 0x40) == 0) continue;
+
+            attempted++;
+            // TryDecrypt always returns Success=false/"Queued" — the actual result arrives
+            // asynchronously via PacketDecryptor.OnDecrypted → wired in constructor.
+            // Just call it to enqueue the packet for the background worker.
+            PacketDecryptor.TryDecrypt(pkt.RawBytes);
         }
 
         if (decrypted > 0)
         {
-            AddInGameLog($"[AUTO-DECRYPT] Decrypted {decrypted} packets");
+            AddInGameLog($"[AUTO-DECRYPT] Decrypted {decrypted}/{attempted} packets ({PacketDecryptor.DiscoveredKeys.Count} keys loaded)");
             OnKeysUpdated?.Invoke();
         }
     }

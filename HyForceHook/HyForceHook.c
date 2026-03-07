@@ -98,6 +98,8 @@ typedef struct {
     char* buf;
     int                  bufsz;
     struct sockaddr_in   peer;
+    struct sockaddr_in* peer_ptr;   /* live pointer filled by OS after GQCS */
+    LPINT                peer_len;   /* length pointer for recvfrom */
     volatile int         used;
 } OvlEntry;
 
@@ -147,17 +149,17 @@ static volatile int      g_watch_ms = 0;
 static HANDLE            g_watch_th = NULL;
 
 /* ── Freeze toggles ───────────────────────────────────────── */
-static volatile uint64_t g_freeze_hp_addr  = 0;   /* 0 = off */
-static volatile float    g_freeze_hp_val   = 0.f;
+static volatile uint64_t g_freeze_hp_addr = 0;   /* 0 = off */
+static volatile float    g_freeze_hp_val = 0.f;
 static volatile float    g_freeze_maxhp_val = 0.f;
-static HANDLE            g_freeze_hp_th    = NULL;
+static HANDLE            g_freeze_hp_th = NULL;
 static volatile uint64_t g_freeze_pos_addr = 0;   /* 0 = off */
 static volatile double   g_freeze_x = 0, g_freeze_y = 0, g_freeze_z = 0;
-static HANDLE            g_freeze_pos_th   = NULL;
+static HANDLE            g_freeze_pos_th = NULL;
 
 /* ── Generic value freeze (modular hotkey system) ─────────── */
 #define FREEZE_GENERIC_MAX 32
-typedef enum { FTYPE_F32=0, FTYPE_F64=1, FTYPE_I32=2, FTYPE_U8=3 } FreezeType;
+typedef enum { FTYPE_F32 = 0, FTYPE_F64 = 1, FTYPE_I32 = 2, FTYPE_U8 = 3 } FreezeType;
 typedef struct {
     volatile uint64_t  addr;
     volatile BOOL      active;
@@ -178,12 +180,13 @@ static DWORD WINAPI freeze_generic_th(LPVOID _) {
             if (!s->active || !s->addr) continue;
             __try {
                 switch (s->type) {
-                    case FTYPE_F32: *(float*)(uintptr_t)s->addr   = s->val.f32; break;
-                    case FTYPE_F64: *(double*)(uintptr_t)s->addr  = s->val.f64; break;
-                    case FTYPE_I32: *(int32_t*)(uintptr_t)s->addr = s->val.i32; break;
-                    case FTYPE_U8:  *(uint8_t*)(uintptr_t)s->addr = s->val.u8;  break;
+                case FTYPE_F32: *(float*)(uintptr_t)s->addr = s->val.f32; break;
+                case FTYPE_F64: *(double*)(uintptr_t)s->addr = s->val.f64; break;
+                case FTYPE_I32: *(int32_t*)(uintptr_t)s->addr = s->val.i32; break;
+                case FTYPE_U8:  *(uint8_t*)(uintptr_t)s->addr = s->val.u8;  break;
                 }
-            } __except (EXCEPTION_EXECUTE_HANDLER) { s->active = FALSE; }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { s->active = FALSE; }
         }
         LeaveCriticalSection(&g_freeze_cs);
         Sleep(50);
@@ -192,7 +195,7 @@ static DWORD WINAPI freeze_generic_th(LPVOID _) {
 }
 /* Call once: FREEZE_GENERIC <slot> <addr_hex> <type:f32|f64|i32|u8> <value> <interval_ms>
    slot -1 = find first free slot */
-/* ── Forward declarations ────────────────────────────────── */
+   /* ── Forward declarations ────────────────────────────────── */
 static int      IsReentrant(void);
 static void     EnterHook(void);
 static void     LeaveHook(void);
@@ -220,20 +223,21 @@ static void freeze_generic_set(int slot, uint64_t addr, const char* type, const 
     FreezeSlot* s = &g_freeze_slots[slot];
     EnterCriticalSection(&g_freeze_cs);
     s->addr = addr; s->interval_ms = (ms > 0) ? ms : 50; s->active = TRUE;
-    if (!strcmp(type,"f32"))      { s->type = FTYPE_F32; s->val.f32 = (float)atof(valstr); }
-    else if (!strcmp(type,"f64")) { s->type = FTYPE_F64; s->val.f64 = atof(valstr); }
-    else if (!strcmp(type,"i32")) { s->type = FTYPE_I32; s->val.i32 = atoi(valstr); }
-    else if (!strcmp(type,"u8"))  { s->type = FTYPE_U8;  s->val.u8  = (uint8_t)atoi(valstr); }
+    if (!strcmp(type, "f32")) { s->type = FTYPE_F32; s->val.f32 = (float)atof(valstr); }
+    else if (!strcmp(type, "f64")) { s->type = FTYPE_F64; s->val.f64 = atof(valstr); }
+    else if (!strcmp(type, "i32")) { s->type = FTYPE_I32; s->val.i32 = atoi(valstr); }
+    else if (!strcmp(type, "u8")) { s->type = FTYPE_U8;  s->val.u8 = (uint8_t)atoi(valstr); }
     LeaveCriticalSection(&g_freeze_cs);
     pipe_log("[FREEZE_GENERIC] slot=%d addr=0x%llx type=%s val=%s interval=%dms",
-             slot, (unsigned long long)addr, type, valstr, s->interval_ms);
+        slot, (unsigned long long)addr, type, valstr, s->interval_ms);
 }
 static void freeze_generic_stop(int slot) {
     if (slot < 0) { /* stop all */
         int i; EnterCriticalSection(&g_freeze_cs);
         for (i = 0; i < FREEZE_GENERIC_MAX; i++) g_freeze_slots[i].active = FALSE;
         LeaveCriticalSection(&g_freeze_cs);
-    } else if (slot < FREEZE_GENERIC_MAX) {
+    }
+    else if (slot < FREEZE_GENERIC_MAX) {
         EnterCriticalSection(&g_freeze_cs);
         g_freeze_slots[slot].active = FALSE;
         LeaveCriticalSection(&g_freeze_cs);
@@ -254,6 +258,9 @@ typedef int (WSAAPI* WSARecv_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSA
 typedef int (WSAAPI* sendto_t)(SOCKET, const char*, int, int, const struct sockaddr*, int);
 typedef int (WSAAPI* recvfrom_t)(SOCKET, char*, int, int, struct sockaddr*, int*);
 typedef BOOL(WINAPI* GQCS_t)(HANDLE, LPDWORD, PULONG_PTR, LPOVERLAPPED*, DWORD);
+
+/* Forward declaration for hook_WSARecv */
+int WSAAPI hook_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags, LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
 /* New v10: connected-socket send (no destination address) */
 typedef int (WSAAPI* WSASend_nb_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef int (WSAAPI* send_nb_t)(SOCKET, const char*, int, int);
@@ -263,21 +270,21 @@ typedef int (*ssl_read_fn_t)(SSL*, void*, int);
 static int hook_ssl_write(SSL* ssl, const void* buf, int num);
 static int hook_ssl_read(SSL* ssl, void* buf, int num);
 /* New v10: quiche stream hooks (plaintext pre-QUIC-encryption) */
-typedef intptr_t (*quiche_stream_recv_t)(void*, uint64_t, uint8_t*, size_t, int*);
-typedef intptr_t (*quiche_stream_send_t)(void*, uint64_t, const uint8_t*, size_t, int);
+typedef intptr_t(*quiche_stream_recv_t)(void*, uint64_t, uint8_t*, size_t, int*);
+typedef intptr_t(*quiche_stream_send_t)(void*, uint64_t, const uint8_t*, size_t, int);
 
 static WSASendTo_t   orig_WSASendTo = NULL;
 static WSARecvFrom_t orig_WSARecvFrom = NULL;
-static WSARecv_t     orig_WSARecv    = NULL;
+static WSARecv_t     orig_WSARecv = NULL;
 static sendto_t      orig_sendto = NULL;
 static recvfrom_t    orig_recvfrom = NULL;
 static GQCS_t        orig_GQCS = NULL;
 /* New v10: connected-socket send hooks */
 static WSASend_nb_t  orig_WSASend_nb = NULL;
-static send_nb_t     orig_send_nb    = NULL;
+static send_nb_t     orig_send_nb = NULL;
 /* New v10: BoringSSL plaintext hooks */
 static ssl_write_fn_t orig_ssl_write = NULL;
-static ssl_read_fn_t  orig_ssl_read  = NULL;
+static ssl_read_fn_t  orig_ssl_read = NULL;
 /* New v10: quiche stream hooks */
 static quiche_stream_recv_t orig_quiche_recv = NULL;
 static quiche_stream_send_t orig_quiche_send = NULL;
@@ -328,6 +335,7 @@ static void     store_kchain(SSL_CTX* ctx, ssl_keylog_cb_t orig);
 static void     sock_cache_set(SOCKET s, uint32_t ip, uint16_t port);
 static int      sock_cache_get(SOCKET s, uint32_t* ip, uint16_t* port);
 static void     probe_quiche(void);
+
 
 /* ── Reentrancy ──────────────────────────────────────────── */
 static int IsReentrant(void) {
@@ -725,7 +733,7 @@ static void ovl_fire(LPOVERLAPPED ov, DWORD bytes) {
                 uint16_t port = peer.sin_port;
                 /* After GQCS completes the OS has filled peer_ptr — prefer it over stale copy */
                 if (peer_ptr && peer_ptr->sin_family == AF_INET && peer_ptr->sin_addr.s_addr != 0) {
-                    ip   = peer_ptr->sin_addr.s_addr;
+                    ip = peer_ptr->sin_addr.s_addr;
                     port = peer_ptr->sin_port;
                 }
                 forward(1, (uint8_t*)buf, (int)bytes, ip, port);
@@ -747,6 +755,37 @@ static void ovl_free(LPOVERLAPPED ov) {
 }
 
 /* ── Hooks ───────────────────────────────────────────────── */
+
+/* hook_WSARecv implementation - handles connected UDP socket receives */
+static int WSAAPI hook_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags, LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine)
+{
+    if (IsReentrant()) return orig_WSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpOverlapped, lpCompletionRoutine);
+    EnterHook(); InterlockedIncrement(&g_fires_wsa_recv2); DWORD se = GetLastError();
+    EnterCriticalSection(&g_cs); jmp_restore(orig_WSARecv, sv_wsa_recv2); LeaveCriticalSection(&g_cs);
+
+    int ret = orig_WSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpOverlapped, lpCompletionRoutine);
+
+    EnterCriticalSection(&g_cs); jmp_write(orig_WSARecv, (void*)hook_WSARecv); LeaveCriticalSection(&g_cs);
+    if (ret != SOCKET_ERROR) SetLastError(se);
+
+    /* Handle completed receives immediately (non-IOCP) */
+    if (ret == 0 && lpNumberOfBytesRecvd && *lpNumberOfBytesRecvd > 0 && dwBufferCount > 0 && lpBuffers && lpBuffers[0].buf) {
+        uint32_t ip = 0; uint16_t port = 0;
+        /* Try to get peer info from socket cache or connected socket */
+        if (!sock_cache_get(s, &ip, &port)) {
+            struct sockaddr_in peer; int pl = sizeof(peer); memset(&peer, 0, sizeof(peer));
+            if (getpeername(s, (struct sockaddr*)&peer, &pl) == 0 && peer.sin_family == AF_INET) {
+                ip = peer.sin_addr.s_addr; port = peer.sin_port;
+                sock_cache_set(s, ip, port);
+            }
+        }
+        if (ip == 0) ip = g_server_ip;
+        forward(1, (uint8_t*)lpBuffers[0].buf, (int)*lpNumberOfBytesRecvd, ip, port);
+    }
+
+    LeaveHook(); return ret;
+}
+
 static int WSAAPI hook_WSASendTo(SOCKET s, LPWSABUF bufs, DWORD nb, LPDWORD sent, DWORD flags,
     const struct sockaddr* to, int tolen, LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cb)
 {
@@ -1077,7 +1116,7 @@ static void probe_quiche(void) {
      • Broad scan mode: skips velocity check entirely             */
 static int is_coord(double v) { return !isnan(v) && !isinf(v) && v > -10000000.0 && v < 10000000.0; }
 static int is_health(float h) { return !isnan(h) && !isinf(h) && h >= 1.0f && h <= 500000.0f; }
-static int is_vel(float v)    { return !isnan(v) && !isinf(v) && v > -500.0f && v < 500.0f; }
+static int is_vel(float v) { return !isnan(v) && !isinf(v) && v > -500.0f && v < 500.0f; }
 
 /* Send a 76-byte memscan hit payload: [u64 addr][u32 dataSize][bytes] */
 static void send_memscan_hit(uint8_t* p, SIZE_T avail) {
@@ -1553,9 +1592,9 @@ static DWORD WINAPI freeze_hp_th(LPVOID _) {
     (void)_;
     while (g_active && g_freeze_hp_addr) {
         __try {
-            float* hp  = (float*)(uintptr_t)g_freeze_hp_addr;
+            float* hp = (float*)(uintptr_t)g_freeze_hp_addr;
             float* mhp = hp + 1;          /* maxHealth is at offset +4 */
-            *hp  = g_freeze_hp_val;
+            *hp = g_freeze_hp_val;
             *mhp = g_freeze_maxhp_val;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { g_freeze_hp_addr = 0; break; }
@@ -1621,7 +1660,7 @@ static DWORD WINAPI hb_thread(LPVOID _) {
     while (g_active) {
         Sleep(5000); if (!g_active) break;
         pipe_log("[STATS] WSASendTo:%ld sendto:%ld WSARecvFrom:%ld recvfrom:%ld "
-                 "WSASend_nb:%ld send_nb:%ld pkts:%ld srvIP:%u.%u.%u.%u",
+            "WSASend_nb:%ld send_nb:%ld pkts:%ld srvIP:%u.%u.%u.%u",
             g_fires_wsa_send, g_fires_send, g_fires_wsa_recv, g_fires_recv,
             g_fires_wsa_send_nb, g_fires_send_nb, g_pkts_captured,
             g_server_ip & 0xFF, (g_server_ip >> 8) & 0xFF,
@@ -1658,22 +1697,22 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
             else if (!strcmp(buf, "MEMSCAN_BROAD")) { CreateThread(NULL, 0, memscan_broad_th, NULL, 0, NULL); }
             else if (!strncmp(buf, "MEMREAD ", 8)) {
                 uint64_t ra = 0; uint32_t rsz2 = 64;
-                sscanf(buf + 8, "%llx %u", (unsigned long long*)&ra, &rsz2);
+                sscanf(buf + 8, "%llx %u", (unsigned long long*) & ra, &rsz2);
                 memread_addr(ra, rsz2);
             }
             else if (!strncmp(buf, "MEMWRITE_F64 ", 13)) {
                 uint64_t addr = 0; double val = 0.0;
-                sscanf(buf + 13, "%llx %lf", (unsigned long long*)&addr, &val);
+                sscanf(buf + 13, "%llx %lf", (unsigned long long*) & addr, &val);
                 memwrite_f64(addr, val);
             }
             else if (!strncmp(buf, "MEMWRITE_I32 ", 13)) {
                 uint64_t addr = 0; int32_t val = 0;
-                sscanf(buf + 13, "%llx %d", (unsigned long long*)&addr, &val);
+                sscanf(buf + 13, "%llx %d", (unsigned long long*) & addr, &val);
                 memwrite_i32(addr, val);
             }
             else if (!strncmp(buf, "MEMWRITE_U8 ", 12)) {
                 uint64_t addr = 0; int val = 0;
-                sscanf(buf + 12, "%llx %d", (unsigned long long*)&addr, &val);
+                sscanf(buf + 12, "%llx %d", (unsigned long long*) & addr, &val);
                 __try { *(uint8_t*)(uintptr_t)addr = (uint8_t)val; pipe_log("[WRITE] u8 @ 0x%llx = %d", (unsigned long long)addr, val); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { pipe_log("[WRITE] u8 AV @ 0x%llx", (unsigned long long)addr); }
             }
@@ -1705,7 +1744,7 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
             else if (!strncmp(buf, "FREEZE_HP ", 10)) {
                 /* FREEZE_HP <addr_hex> <hp_float> <maxhp_float> */
                 uint64_t addr = 0; float hp = 100.f, mhp = 100.f;
-                sscanf(buf + 10, "%llx %f %f", (unsigned long long*)&addr, &hp, &mhp);
+                sscanf(buf + 10, "%llx %f %f", (unsigned long long*) & addr, &hp, &mhp);
                 g_freeze_hp_addr = addr; g_freeze_hp_val = hp; g_freeze_maxhp_val = mhp;
                 if (g_freeze_hp_th) { WaitForSingleObject(g_freeze_hp_th, 300); CloseHandle(g_freeze_hp_th); }
                 g_freeze_hp_th = CreateThread(NULL, 0, freeze_hp_th, NULL, 0, NULL);
@@ -1718,7 +1757,7 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
             else if (!strncmp(buf, "FREEZE_POS ", 11)) {
                 /* FREEZE_POS <addr_hex> <x> <y> <z>  (doubles) */
                 uint64_t addr = 0; double x = 0, y = 0, z = 0;
-                sscanf(buf + 11, "%llx %lf %lf %lf", (unsigned long long*)&addr, &x, &y, &z);
+                sscanf(buf + 11, "%llx %lf %lf %lf", (unsigned long long*) & addr, &x, &y, &z);
                 g_freeze_pos_addr = addr; g_freeze_x = x; g_freeze_y = y; g_freeze_z = z;
                 if (g_freeze_pos_th) { WaitForSingleObject(g_freeze_pos_th, 300); CloseHandle(g_freeze_pos_th); }
                 g_freeze_pos_th = CreateThread(NULL, 0, freeze_pos_th, NULL, 0, NULL);
@@ -1731,7 +1770,7 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
             else if (!strncmp(buf, "MEMWRITE_F32 ", 13)) {
                 /* MEMWRITE_F32 <addr_hex> <value_float>  — one-shot float write */
                 uint64_t addr = 0; float val = 0.f;
-                sscanf(buf + 13, "%llx %f", (unsigned long long*)&addr, &val);
+                sscanf(buf + 13, "%llx %f", (unsigned long long*) & addr, &val);
                 __try { *(float*)(uintptr_t)addr = val; pipe_log("[WRITE] f32 @ 0x%llx = %.6f", (unsigned long long)addr, val); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { pipe_log("[WRITE] f32 access violation @ 0x%llx", (unsigned long long)addr); }
             }
@@ -1756,16 +1795,17 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
             }
             else if (!strncmp(buf, "MEMWRITE_I32 ", 13)) {
                 uint64_t addr = 0; int32_t val = 0;
-                sscanf(buf + 13, "%llx %d", (unsigned long long*)&addr, &val);
+                sscanf(buf + 13, "%llx %d", (unsigned long long*) & addr, &val);
                 memwrite_i32(addr, val);
             }
             else if (!strncmp(buf, "FLYMODE ", 8)) {
-                uint64_t addr = 0; char onoff[8] = {0};
-                sscanf(buf + 8, "%llx %7s", (unsigned long long*)&addr, onoff);
+                uint64_t addr = 0; char onoff[8] = { 0 };
+                sscanf(buf + 8, "%llx %7s", (unsigned long long*) & addr, onoff);
                 int enable = (onoff[0] == '1');
                 float zero = 0.0f;
                 if (enable) {
-                    __try { *(float*)(uintptr_t)(addr + 36) = zero; } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                    __try { *(float*)(uintptr_t)(addr + 36) = zero; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {}
                 }
                 pipe_log("[FLY] %s @ 0x%llx", enable ? "ON" : "OFF", (unsigned long long)addr);
             }
@@ -1773,9 +1813,9 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
                slot=-1 for auto-slot. type: f32|f64|i32|u8 */
             else if (!strncmp(buf, "FREEZE_GENERIC ", 15)) {
                 int slot = -1; uint64_t addr = 0;
-                char type[8] = {0}, valstr[32] = {0}; int ms = 50;
+                char type[8] = { 0 }, valstr[32] = { 0 }; int ms = 50;
                 sscanf(buf + 15, "%d %llx %7s %31s %d",
-                       &slot, (unsigned long long*)&addr, type, valstr, &ms);
+                    &slot, (unsigned long long*) & addr, type, valstr, &ms);
                 freeze_generic_set(slot, addr, type, valstr, ms);
             }
             else if (!strncmp(buf, "FREEZE_GENERIC_STOP ", 20)) {
@@ -1939,14 +1979,14 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         /* Get original function addresses */
         orig_WSASendTo = (WSASendTo_t)GetProcAddress(ws2, "WSASendTo");
         orig_WSARecvFrom = (WSARecvFrom_t)GetProcAddress(ws2, "WSARecvFrom");
-        orig_WSARecv     = (WSARecv_t)GetProcAddress(ws2, "WSARecv");
+        orig_WSARecv = (WSARecv_t)GetProcAddress(ws2, "WSARecv");
         orig_sendto = (sendto_t)GetProcAddress(ws2, "sendto");
         orig_recvfrom = (recvfrom_t)GetProcAddress(ws2, "recvfrom");
 
         /* Install hooks */
         if (orig_WSASendTo) { memcpy(sv_wsa_send, orig_WSASendTo, 14); jmp_write(orig_WSASendTo, (void*)hook_WSASendTo); }
         if (orig_WSARecvFrom) { memcpy(sv_wsa_recv, orig_WSARecvFrom, 14); jmp_write(orig_WSARecvFrom, (void*)hook_WSARecvFrom); }
-        if (orig_WSARecv)     { memcpy(sv_wsa_recv2, orig_WSARecv, 14); jmp_write(orig_WSARecv, (void*)hook_WSARecv); }
+        if (orig_WSARecv) { memcpy(sv_wsa_recv2, orig_WSARecv, 14); jmp_write(orig_WSARecv, (void*)hook_WSARecv); }
         if (orig_sendto) { memcpy(sv_send, orig_sendto, 14); jmp_write(orig_sendto, (void*)hook_sendto); }
         if (orig_recvfrom) { memcpy(sv_recv, orig_recvfrom, 14); jmp_write(orig_recvfrom, (void*)hook_recvfrom); }
 
@@ -1983,7 +2023,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         /* Restore hooks */
         if (orig_WSASendTo)   jmp_restore(orig_WSASendTo, sv_wsa_send);
         if (orig_WSARecvFrom) jmp_restore(orig_WSARecvFrom, sv_wsa_recv);
-    if (orig_WSARecv)     jmp_restore(orig_WSARecv, sv_wsa_recv2);
+        if (orig_WSARecv)     jmp_restore(orig_WSARecv, sv_wsa_recv2);
         if (orig_sendto)      jmp_restore(orig_sendto, sv_send);
         if (orig_recvfrom)    jmp_restore(orig_recvfrom, sv_recv);
         if (orig_GQCS)        jmp_restore(orig_GQCS, sv_gqcs);
@@ -2011,7 +2051,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         if (g_cmd_th) { WaitForSingleObject(g_cmd_th, 500); CloseHandle(g_cmd_th); }
         if (g_watch_th) { WaitForSingleObject(g_watch_th, 500); CloseHandle(g_watch_th); }
         g_freeze_hp_addr = 0; g_freeze_pos_addr = 0;
-        if (g_freeze_hp_th)  { WaitForSingleObject(g_freeze_hp_th,  300); CloseHandle(g_freeze_hp_th); }
+        if (g_freeze_hp_th) { WaitForSingleObject(g_freeze_hp_th, 300); CloseHandle(g_freeze_hp_th); }
         if (g_freeze_pos_th) { WaitForSingleObject(g_freeze_pos_th, 300); CloseHandle(g_freeze_pos_th); }
 
         if (g_tls_idx != TLS_OUT_OF_INDEXES) { TlsFree(g_tls_idx); g_tls_idx = TLS_OUT_OF_INDEXES; }
