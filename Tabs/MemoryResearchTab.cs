@@ -130,7 +130,8 @@ namespace HyForce.Tabs
             ImGui.Separator();
 
             float tableH = ImGui.GetContentRegionAvail().Y - 4;
-            if (ImGui.BeginTable("##ent", 8,
+            // FIXED: Changed from 8 to 9 columns to match TableSetupColumn calls
+            if (ImGui.BeginTable("##ent", 9,
                 ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg |
                 ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable,
                 new Vector2(-1, tableH)))

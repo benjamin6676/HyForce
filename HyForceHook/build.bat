@@ -11,7 +11,7 @@ set DEST=%APPDATA%\HyForce\DLLs
 where cl.exe >nul 2>&1
 if %errorlevel%==0 (
     echo [MSVC x64] Building...
-    cl /O2 /LD /D_WIN32_WINNT=0x0A00 %SRC% /Fe:%OUT% ws2_32.lib psapi.lib iphlpapi.lib advapi32.lib
+   cl /O2 /LD /D_WIN32_WINNT=0x0A00 HyForceHook.c /Fe:HyForceHook.dll ws2_32.lib psapi.lib iphlpapi.lib advapi32.lib
     goto done
 )
 where x86_64-w64-mingw32-gcc >nul 2>&1

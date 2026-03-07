@@ -1,5 +1,5 @@
 ﻿C# Source Code Export
-Generated: 2026-03-06 20:57:36
+Generated: 2026-03-07 13:44:05
 Total Files: 37
 Root Path: C:\Users\benja\source\repos\HyForce
 ================================================================================
@@ -164,11 +164,7 @@ namespace HyForce.App
                     ImGui.TextColored(new Vector4(1f, 0.3f, 0.2f, 1f), "⚠️ HYTALE RESTART REQUIRED");
                     ImGui.Separator();
                     ImGui.TextWrapped(
-                        "SSLKEYLOGFILE has been configured for automatic key capture, " +
-                        "but Hytale was already running.\n\n" +
-                        "1. Close Hytale completely (check system tray)\n" +
-                        "2. Restart Hytale\n" +
-                        "3. Keys will appear automatically in the Decryption tab");
+                        "SSLKEYLOGFILE has been configured for automatic key capture, but Hytale was already running.\n\n1. Close Hytale completely (check system tray)\n2. Restart Hytale\n3. Keys will appear automatically in the Decryption tab");
 
                     if (ImGui.Button("I've Restarted Hytale", new Vector2(200, 40)))
                     {
@@ -451,7 +447,7 @@ public class ImGuiController : IDisposable
                 _clipboardPtr = IntPtr.Zero;
             }
 
-            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\\0");
+            var bytes = System.Text.Encoding.UTF8.GetBytes(_clipboardBuffer + "\0");
             _clipboardPtr = Marshal.AllocHGlobal(bytes.Length);
             Marshal.Copy(bytes, 0, _clipboardPtr, bytes.Length);
             return _clipboardPtr;
@@ -1019,8 +1015,7 @@ public class AppState : IDisposable
             if (!File.Exists(PermanentKeyLogPath))
             {
                 File.WriteAllText(PermanentKeyLogPath,
-                    "# HyForce permanent SSL key log - QUIC/TLS 1.3 keys for Hytale\n" +
-                    "# Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\n");
+                    "# HyForce permanent SSL key log - QUIC/TLS 1.3 keys for Hytale\n# Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\n");
             }
 
             // Start watching the file
@@ -1313,9 +1308,7 @@ public class AppState : IDisposable
             }
 
             // Append to working keys file
-            File.AppendAllText(WorkingHytaleKeysPath,
-                $"# Promoted at {DateTime.Now:yyyy-MM-dd HH:mm:ss}\r\n" +
-                FormatKeyLine(key) + "\r\n");
+            File.AppendAllText(WorkingHytaleKeysPath, $"# Promoted at {DateTime.Now:yyyy-MM-dd HH:mm:ss}\n" + FormatKeyLine(key) + "\n");
 
             AddInGameLog($"[KEYS] Promoted {key.Type} key to HytaleKeys.log");
         }
@@ -1456,6 +1449,33 @@ public class AppState : IDisposable
     }
 
     // Public: UI "Re-Import" button
+    /// <summary>
+    /// Accept a single SSL keylog line directly from the DLL pipe (MSG_KEYLOG 0x09).
+    /// This bypasses file I/O for real-time key extraction from BoringSSL hook.
+    /// Line format: "CLIENT_TRAFFIC_SECRET_0 &lt;client_random_hex&gt; &lt;secret_hex&gt;"
+    /// </summary>
+    public void ImportKeylogLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#")) return;
+        try
+        {
+            var key = ParseSSLKeyLogLine(line, "DLL_HOOK");
+            if (key != null)
+            {
+                PacketDecryptor.AddKey(key);
+                AddInGameLog($"[KEYLOG] Key imported: {key.Type} ({PacketDecryptor.DiscoveredKeys.Count} total)");
+                OnKeysUpdated?.Invoke();
+
+                // Also append to permanent log for persistence
+                if (!string.IsNullOrEmpty(PermanentKeyLogPath))
+                {
+                    try { File.AppendAllText(PermanentKeyLogPath, line + "\n"); } catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
     public void ForceReImportKeys()
     {
         _permFileReadPos = 0;
@@ -1481,7 +1501,7 @@ public class AppState : IDisposable
         {
             PacketDecryptor.ClearKeys();
             _permFileReadPos = 0;
-            File.WriteAllText(PermanentKeyLogPath, "# HyForce permanent SSL key log - cleared\r\n");
+            File.WriteAllText(PermanentKeyLogPath, "# HyForce permanent SSL key log - cleared\n");
             AddInGameLog("[AUTOKEY] Permanent log cleared.");
         }
         catch (Exception ex) { AddInGameLog($"[AUTOKEY] Clear error: {ex.Message}"); }
@@ -1501,7 +1521,7 @@ public class AppState : IDisposable
             Directory.CreateDirectory(ExportDirectory);
 
             // Create empty file (this triggers file watcher)
-            File.WriteAllText(keyLogPath, $"# HyForce Session {sessionId}\r\n");
+            File.WriteAllText(keyLogPath, $"# HyForce Session {sessionId}\n");
 
             // CRITICAL: Set for THIS PROCESS ONLY - Hytale must be restarted to pick this up
             Environment.SetEnvironmentVariable("SSLKEYLOGFILE", keyLogPath, EnvironmentVariableTarget.Process);
@@ -1749,7 +1769,7 @@ public class AppState : IDisposable
 
             var fileInfo = new FileInfo(sessionFilePath);
             var content = File.ReadAllText(sessionFilePath);
-            var lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            var lines = content.Split(' ', StringSplitOptions.RemoveEmptyEntries)
                               .Where(l => !string.IsNullOrWhiteSpace(l) && !l.StartsWith("#"))
                               .ToList();
 
@@ -1868,7 +1888,7 @@ public class AppState : IDisposable
                     }
 
                     // Create fresh empty file with header
-                    File.WriteAllText(path, "# SSL Key Log - Fresh session started by HyForce\r\n");
+                    File.WriteAllText(path, "# SSL Key Log - Fresh session started by HyForce\n");
                 }
                 catch (Exception ex)
                 {
@@ -1905,7 +1925,7 @@ public class AppState : IDisposable
             {
                 // Strategy 2: Delete and recreate
                 File.Delete(path);
-                File.WriteAllText(path, "# SSL Key Log - Fresh start\r\n");
+                File.WriteAllText(path, "# SSL Key Log - Fresh start\n");
                 return true;
             }
             catch
@@ -2451,9 +2471,7 @@ public class AppState : IDisposable
         var packets = PacketLog.GetAll();
         foreach (var pkt in packets)
         {
-            sb.AppendLine($"[{pkt.Timestamp:HH:mm:ss.fff}] {pkt.DirStr} {(pkt.IsTcp ? "TCP" : "UDP")} " +
-                $"0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeName}) {pkt.ByteLength} bytes " +
-                $"[{pkt.CompressionMethod}] [{(pkt.EncryptionHint == "encrypted" ? "ENC" : "CLR")}]");
+            sb.AppendLine($"[{pkt.Timestamp:HH:mm:ss.fff}] {pkt.DirStr} {(pkt.IsTcp ? "TCP" : "UDP")} 0x{pkt.OpcodeDecimal:X4} ({pkt.OpcodeName}) {pkt.ByteLength} bytes [{pkt.CompressionMethod}] [{(pkt.EncryptionHint == "encrypted" ? "ENC" : "CLR")}]");
 
             if (pkt.ByteLength <= 256 && !string.IsNullOrEmpty(pkt.RawHexPreview))
             {
@@ -3479,17 +3497,125 @@ using HyForce.Data;
 using HyForce.Networking;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO.Pipes;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Threading;
+using Microsoft.Win32.SafeHandles;
 
 namespace HyForce.Networking
 {
     public class PipeCaptureServer : IDisposable
     {
         public const string PIPE_DATA = "HyForcePipe";
-        public const string PIPE_CMD = "HyForceCmdPipe";
+        public const string PIPE_CMD  = "HyForceCmdPipe";
 
+        // ─────────────────────────────────────────────────────────────────────────
+        // ROOT-CAUSE FIX FOR "DLL never connects":
+        //   NamedPipeServerStream uses the process token DACL by default.
+        //   When HyForce runs at medium integrity and the game runs elevated,
+        //   the elevated DLL can't open a pipe owned by medium-IL process.
+        //   Fix: call CreateNamedPipeW directly via P/Invoke with a NULL DACL
+        //   security descriptor (bDaclPresent=true, pDacl=NULL = allow everyone).
+        //   No extra NuGet package needed — advapi32 + kernel32 are always present.
+        // ─────────────────────────────────────────────────────────────────────────
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SECURITY_ATTRIBUTES
+        {
+            public int    nLength;
+            public IntPtr lpSecurityDescriptor;
+            public int    bInheritHandle;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateNamedPipeW(
+            string lpName,
+            uint   dwOpenMode,
+            uint   dwPipeMode,
+            uint   nMaxInstances,
+            uint   nOutBufferSize,
+            uint   nInBufferSize,
+            uint   nDefaultTimeOut,
+            ref SECURITY_ATTRIBUTES lpSecurityAttributes);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool InitializeSecurityDescriptor(IntPtr pSD, uint dwRevision);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool SetSecurityDescriptorDacl(
+            IntPtr pSD,
+            bool   bDaclPresent,
+            IntPtr pDacl,
+            bool   bDaclDefaulted);
+
+        private const uint PIPE_ACCESS_INBOUND  = 0x00000001u;
+        private const uint PIPE_ACCESS_OUTBOUND = 0x00000002u;
+        private const uint FILE_FLAG_OVERLAPPED = 0x40000000u;
+        private const uint PIPE_TYPE_BYTE       = 0x00000000u;
+        private const uint PIPE_READMODE_BYTE   = 0x00000000u;
+        private const uint PIPE_WAIT            = 0x00000000u;
+        private const int  SD_MIN_LENGTH        = 40;
+        private static readonly IntPtr INVALID_PIPE_HANDLE = new IntPtr(-1);
+
+        /// <summary>
+        /// Creates a named pipe with NULL DACL — connectable from any integrity level.
+        /// </summary>
+        private static NamedPipeServerStream CreatePermissivePipe(
+            string name, PipeDirection dir, bool isAsync, int bufSize = 131072)
+        {
+            IntPtr pSD = Marshal.AllocHGlobal(SD_MIN_LENGTH);
+            try
+            {
+                // Zero the buffer; InitializeSecurityDescriptor will set the header
+                for (int i = 0; i < SD_MIN_LENGTH; i++)
+                    Marshal.WriteByte(pSD, i, 0);
+
+                if (!InitializeSecurityDescriptor(pSD, 1))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "InitializeSecurityDescriptor failed");
+
+                // NULL DACL with bDaclPresent = true means "no restrictions — allow all"
+                if (!SetSecurityDescriptorDacl(pSD, bDaclPresent: true, pDacl: IntPtr.Zero, bDaclDefaulted: false))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "SetSecurityDescriptorDacl failed");
+
+                var sa = new SECURITY_ATTRIBUTES
+                {
+                    nLength              = Marshal.SizeOf<SECURITY_ATTRIBUTES>(),
+                    lpSecurityDescriptor = pSD,
+                    bInheritHandle       = 0,
+                };
+
+                uint openMode = (dir == PipeDirection.In ? PIPE_ACCESS_INBOUND : PIPE_ACCESS_OUTBOUND)
+                              | (isAsync ? FILE_FLAG_OVERLAPPED : 0u);
+
+                IntPtr raw = CreateNamedPipeW(
+                    $@"\\.\pipe\{name}",
+                    openMode,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,              // nMaxInstances — 1 client at a time; loop recreates after disconnect
+                    (uint)bufSize,
+                    (uint)bufSize,
+                    0,              // nDefaultTimeOut — use system default (50 ms)
+                    ref sa);
+
+                if (raw == INVALID_PIPE_HANDLE)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        $"CreateNamedPipeW({name}) failed");
+
+                var safeHandle = new SafePipeHandle(raw, ownsHandle: true);
+                // isConnected = false: WaitForConnection hasn't been called yet
+                return new NamedPipeServerStream(dir, isAsync, isConnected: false, safeHandle);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pSD);
+            }
+        }
+
+        // ── Fields ────────────────────────────────────────────────────────────────
         private readonly AppState _state;
         private CancellationTokenSource? _cts;
         private Thread? _dataThread, _cmdThread;
@@ -3497,55 +3623,68 @@ namespace HyForce.Networking
 
         private volatile bool _running;
         private volatile bool _dllConnected;
-        private int _packetCount;
-        private string _dllStatus = "Not connected";
-        private DateTime _lastPkt = DateTime.Now; // FIXED: Not DateTime.MinValue
-        private DateTime _dllConnectedAt = DateTime.MinValue;
+        private int      _packetCount;
+        private string   _dllStatus       = "Not connected";
+        private DateTime _lastPkt         = DateTime.Now;
+        private DateTime _dllConnectedAt  = DateTime.MinValue;
 
-        private readonly object _memLock = new();
+        private readonly object _memLock    = new();
         private readonly object _timingLock = new();
-        private readonly object _seqLock = new();
+        private readonly object _seqLock    = new();
+        private readonly object _modLock    = new();
+        private readonly object _gadgetLock = new();
 
-        public readonly List<MemScanHit> MemHits = new();
-        public readonly List<TimingEntry> TimingLog = new();
+        public readonly List<MemScanHit>    MemHits      = new();
+        public readonly List<TimingEntry>   TimingLog    = new();
+        public readonly List<string>        SeqAnomalies = new();
+        public readonly List<MemWatchEntry> MemWatchLog  = new();
+        public readonly List<ModuleInfo>    Modules      = new();
+        public readonly List<GadgetHit>     Gadgets      = new();
+        public readonly List<StringHit>     Strings      = new();
+        public readonly object              StringLock   = new();
+
         public const int MAX_TIMING = 2000;
-        public readonly List<string> SeqAnomalies = new();
-
         public int LastRateLimitSent;
         public int LastRateLimitIntervalMs;
 
-        public bool IsRunning => _running;
-        public bool DllConnected => _dllConnected;
-        public int PacketCount => _packetCount;
-        public string DllStatus => _dllStatus;
-        public DateTime LastPacket => _lastPkt;
-        public DateTime DllConnectedAt => _dllConnectedAt;
+        // ── Public properties ─────────────────────────────────────────────────────
+        public bool     IsRunning       => _running;
+        public bool     DllConnected    => _dllConnected;
+        public int      PacketCount     => _packetCount;
+        public string   DllStatus       => _dllStatus;
+        public DateTime LastPacket      => _lastPkt;
+        public DateTime DllConnectedAt  => _dllConnectedAt;
         public TimeSpan TimeSinceConnected =>
-            _dllConnectedAt != DateTime.MinValue ? DateTime.Now - _dllConnectedAt : TimeSpan.Zero;
+            _dllConnectedAt != DateTime.MinValue
+                ? DateTime.Now - _dllConnectedAt
+                : TimeSpan.Zero;
 
         public event Action<CapturedPacket>? OnPacketReceived;
 
         public PipeCaptureServer(AppState state) { _state = state; }
 
+        // ── Lifecycle ─────────────────────────────────────────────────────────────
         public void Start()
         {
             if (_running) return;
-            _cts = new CancellationTokenSource();
-            _running = true;
+            _cts         = new CancellationTokenSource();
+            _running     = true;
             _packetCount = 0;
             _dllConnected = false;
-            _lastPkt = DateTime.Now;
+            _lastPkt     = DateTime.Now;
+
             _dataThread = new Thread(DataLoop) { IsBackground = true, Name = "HyForce-PipeData" };
             _dataThread.Start();
             _cmdThread = new Thread(CmdLoop) { IsBackground = true, Name = "HyForce-PipeCmd" };
             _cmdThread.Start();
-            _state.AddInGameLog("[PIPE] Servers started — waiting for DLL");
+
+            _state.AddInGameLog("[PIPE] Servers started (NULL-DACL) — waiting for DLL");
         }
 
         public void Stop()
         {
             if (!_running) return;
-            _running = false;
+            _running     = false;
             _cts?.Cancel();
             _dllConnected = false;
             try { _cmdPipe?.Close(); } catch { }
@@ -3554,6 +3693,7 @@ namespace HyForce.Networking
 
         public void Dispose() => Stop();
 
+        // ── Commands ──────────────────────────────────────────────────────────────
         public void SendCommand(string cmd)
         {
             try
@@ -3568,48 +3708,74 @@ namespace HyForce.Networking
             catch { }
         }
 
-        public void Fuzz(int bits) => SendCommand($"FUZZ {bits}");
-        public void Replay() => SendCommand("REPLAY");
-        public void ReplayHex(string hex) => SendCommand($"REPLAY {hex}");
+        // ── Convenience wrappers ──────────────────────────────────────────────────
+        public void Fuzz(int bits)               => SendCommand($"FUZZ {bits}");
+        public void Replay()                     => SendCommand("REPLAY");
         public void RateLimit(int count, int ms) => SendCommand($"RATELIMIT {count} {ms}");
-        public void StartPcap(string path) => SendCommand($"PCAP_START {path}");
-        public void StopPcap() => SendCommand("PCAP_STOP");
-        public void MemScan() => SendCommand("MEMSCAN");
-        public void SeqReset() => SendCommand("SEQRESET");
-        public void Ping() => SendCommand("PING");
+        public void StartPcap(string path)       => SendCommand($"PCAP_START {path}");
+        public void StopPcap()                   => SendCommand("PCAP_STOP");
+        public void MemScan()                    => SendCommand("MEMSCAN");
+        public void SeqReset()                   => SendCommand("SEQRESET");
+        public void Ping()                       => SendCommand("PING");
+        public void GetStats()                   => SendCommand("STATS");
+        public void KeylogFlush()                => SendCommand("KEYLOG_FLUSH");
+        public void Eject()                      => SendCommand("EJECT");
+        public void StringScan()                 => SendCommand("STRINGSCAN");
+        public void ModList()                    => SendCommand("MODLIST");
+        public void ThreadList()                 => SendCommand("THREADLIST");
+        public void GadgetScan()                 => SendCommand("GADGETSCAN");
+        public void ExploitProbe()               => SendCommand("EXPLOITPROBE");
+        public void SockEnum()                   => SendCommand("SOCKENUM");
+        public void PktForge(string hexPayload)  => SendCommand($"PKTFORGE {hexPayload}");
+        public void ProcDump(ulong addr, int sz) => SendCommand($"PROCDUMP {addr:X} {sz}");
+        public void PortScan(int lo, int hi)     => SendCommand($"PORTSCAN {lo} {hi}");
+
+        public void MemWatch(ulong address, int pollMs = 250)
+            => SendCommand($"MEMWATCH {address:X} {pollMs}");
+        public void MemWatchStop()
+            => SendCommand("MEMWATCH_STOP");
+
+        public void RegisterInjectorPid()
+            => SendCommand($"INJPID {System.Diagnostics.Process.GetCurrentProcess().Id}");
 
         public void ResetConnection()
         {
-            _dllConnected = false;
+            _dllConnected   = false;
             _dllConnectedAt = DateTime.MinValue;
-            _packetCount = 0;
+            _packetCount    = 0;
             try { _cmdPipe?.Close(); } catch { }
             _cmdPipe = null;
             _state.AddInGameLog("[PIPE] Connection reset");
         }
 
+        // ── Pipe server loops ─────────────────────────────────────────────────────
         private void DataLoop()
         {
             var token = _cts!.Token;
             while (_running && !token.IsCancellationRequested)
             {
+                NamedPipeServerStream? pipe = null;
                 try
                 {
-                    using var pipe = new NamedPipeServerStream(PIPE_DATA,
-                        PipeDirection.In, 1, PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous, 0, 131072);
-
+                    pipe = CreatePermissivePipe(PIPE_DATA, PipeDirection.In, isAsync: true);
                     _state.AddInGameLog("[PIPE] Waiting for DLL connection...");
                     pipe.WaitForConnectionAsync(token).GetAwaiter().GetResult();
 
-                    _dllConnected = true;
+                    _dllConnected   = true;
                     _dllConnectedAt = DateTime.Now;
-                    _lastPkt = DateTime.Now;
+                    _lastPkt        = DateTime.Now;
                     _state.AddInGameLog("[PIPE] DLL connected — capture live");
+
+                    // Send our PID to DLL monitor thread (delayed so cmd pipe connects first)
+                    _ = System.Threading.Tasks.Task.Run(() =>
+                    {
+                        Thread.Sleep(1200);
+                        RegisterInjectorPid();
+                    });
 
                     ReadMessages(pipe, token);
 
-                    _dllConnected = false;
+                    _dllConnected   = false;
                     _dllConnectedAt = DateTime.MinValue;
                     _state.AddInGameLog("[PIPE] DLL disconnected");
                 }
@@ -3619,6 +3785,10 @@ namespace HyForce.Networking
                     _state.AddInGameLog($"[PIPE] Error: {ex.Message}");
                     Thread.Sleep(1000);
                 }
+                finally
+                {
+                    try { pipe?.Dispose(); } catch { }
+                }
             }
         }
 
@@ -3627,12 +3797,10 @@ namespace HyForce.Networking
             var token = _cts!.Token;
             while (_running && !token.IsCancellationRequested)
             {
+                NamedPipeServerStream? pipe = null;
                 try
                 {
-                    var pipe = new NamedPipeServerStream(PIPE_CMD,
-                        PipeDirection.Out, 1, PipeTransmissionMode.Byte,
-                        PipeOptions.None, 131072, 0);
-
+                    pipe = CreatePermissivePipe(PIPE_CMD, PipeDirection.Out, isAsync: false);
                     pipe.WaitForConnectionAsync(token).GetAwaiter().GetResult();
                     _cmdPipe = pipe;
 
@@ -3640,7 +3808,6 @@ namespace HyForce.Networking
                         Thread.Sleep(100);
 
                     _cmdPipe = null;
-                    try { pipe.Close(); } catch { }
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex) when (!token.IsCancellationRequested)
@@ -3648,9 +3815,15 @@ namespace HyForce.Networking
                     _state.AddInGameLog($"[PIPE/CMD] {ex.Message}");
                     Thread.Sleep(1000);
                 }
+                finally
+                {
+                    _cmdPipe = null;
+                    try { pipe?.Dispose(); } catch { }
+                }
             }
         }
 
+        // ── Message dispatcher ────────────────────────────────────────────────────
         private void ReadMessages(NamedPipeServerStream pipe, CancellationToken token)
         {
             byte[] hdr = new byte[5];
@@ -3659,7 +3832,7 @@ namespace HyForce.Networking
                 if (!ReadExact(pipe, hdr, 5)) return;
 
                 byte type = hdr[0];
-                uint len = BitConverter.ToUInt32(hdr, 1);
+                uint len  = BitConverter.ToUInt32(hdr, 1);
                 if (len > 131072) return;
 
                 byte[] pay = len > 0 ? new byte[len] : Array.Empty<byte>();
@@ -3669,51 +3842,69 @@ namespace HyForce.Networking
 
                 switch (type)
                 {
-                    case 0x01: HandlePacket(pay); break;
-                    case 0x02:
-                        _dllStatus = System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0');
-                        _state.AddInGameLog($"[PIPE] {_dllStatus}");
-                        break;
-                    case 0x03:
-                        _state.AddInGameLog($"[DLL] {System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0')}");
-                        break;
-                    case 0x04: HandleTiming(pay); break;
-                    case 0x05: HandleSeqAnomaly(pay); break;
-                    case 0x06: HandleMemScan(pay); break;
-                    case 0x07: HandleRateLimit(pay); break;
+                    case 0x01: HandlePacket(pay);        break;
+                    case 0x02: HandleStatus(pay);        break;
+                    case 0x03: HandleLog(pay);           break;
+                    case 0x04: HandleTiming(pay);        break;
+                    case 0x05: HandleSeqAnomaly(pay);    break;
+                    case 0x06: HandleMemScan(pay);       break;
+                    case 0x07: HandleRateLimit(pay);     break;
+                    case 0x08: HandleEjected(); return;  // exit loop immediately
+                    case 0x09: HandleKeylog(pay);        break;
+                    case 0x0B: HandleMemWatch(pay);      break;
+                    case 0x10: HandleStringScan(pay);    break;
+                    case 0x11: HandleModInfo(pay);       break;
+                    case 0x12: HandleGadget(pay);        break;
+                    case 0x13: HandleExploitResult(pay); break;
+                    case 0x14: HandleProcDump(pay);      break;
+                    // Unknown types are silently skipped
                 }
             }
         }
 
+        // ── Message handlers ──────────────────────────────────────────────────────
         private void HandlePacket(byte[] pay)
         {
             if (pay.Length < 8) return;
-            byte dir = pay[0];
-            uint ipRaw = BitConverter.ToUInt32(pay, 1);
+            byte   dir     = pay[0];
+            uint   ipRaw   = BitConverter.ToUInt32(pay, 1);
             ushort portRaw = BitConverter.ToUInt16(pay, 5);
-            int dataLen = pay.Length - 7;
+            int    dataLen = pay.Length - 7;
             if (dataLen <= 0) return;
 
             byte[] data = new byte[dataLen];
             Buffer.BlockCopy(pay, 7, data, 0, dataLen);
-            string ip = new IPAddress(ipRaw).ToString();
-            int port = IPAddress.NetworkToHostOrder((short)portRaw) & 0xFFFF;
+
+            string ip   = new IPAddress(ipRaw).ToString();
+            int    port = IPAddress.NetworkToHostOrder((short)portRaw) & 0xFFFF;
 
             var pkt = new CapturedPacket
             {
-                RawBytes = data,
-                Direction = dir == 0 ? PacketDirection.ClientToServer : PacketDirection.ServerToClient,
+                RawBytes       = data,
+                Direction      = dir == 0 ? PacketDirection.ClientToServer : PacketDirection.ServerToClient,
                 EncryptionHint = "encrypted",
-                Timestamp = DateTime.Now,
-                SourceAddress = dir == 0 ? "127.0.0.1" : ip,
-                DestAddress = dir == 0 ? ip : "127.0.0.1",
-                SourcePort = dir == 0 ? 0 : port,
-                DestPort = dir == 0 ? port : 0,
+                Timestamp      = DateTime.Now,
+                SourceAddress  = dir == 0 ? "127.0.0.1" : ip,
+                DestAddress    = dir == 0 ? ip : "127.0.0.1",
+                SourcePort     = dir == 0 ? 0 : port,
+                DestPort       = dir == 0 ? port : 0,
             };
 
             Interlocked.Increment(ref _packetCount);
             _lastPkt = DateTime.Now;
             OnPacketReceived?.Invoke(pkt);
+        }
+
+        private void HandleStatus(byte[] pay)
+        {
+            _dllStatus = System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0');
+            _state.AddInGameLog($"[DLL] {_dllStatus}");
+        }
+
+        private void HandleLog(byte[] pay)
+        {
+            _state.AddInGameLog(
+                $"[DLL] {System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0')}");
         }
 
         private void HandleTiming(byte[] pay)
@@ -3722,24 +3913,23 @@ namespace HyForce.Networking
             var e = new TimingEntry
             {
                 TimestampUs = BitConverter.ToUInt64(pay, 0),
-                Length = BitConverter.ToUInt32(pay, 8),
-                Dir = pay[12],
+                Length      = BitConverter.ToUInt32(pay, 8),
+                Dir         = pay[12],
             };
             lock (_timingLock)
             {
                 TimingLog.Add(e);
-                if (TimingLog.Count > MAX_TIMING)
-                    TimingLog.RemoveAt(0);
+                if (TimingLog.Count > MAX_TIMING) TimingLog.RemoveAt(0);
             }
         }
 
         private void HandleSeqAnomaly(byte[] pay)
         {
             if (pay.Length < 17) return;
-            ulong expected = BitConverter.ToUInt64(pay, 0);
-            ulong got = BitConverter.ToUInt64(pay, 8);
-            byte dir = pay[16];
-            string msg = $"SEQ ANOMALY dir={dir} expected>{expected} got={got}";
+            ulong  expected = BitConverter.ToUInt64(pay, 0);
+            ulong  got      = BitConverter.ToUInt64(pay, 8);
+            byte   dir      = pay[16];
+            string msg      = $"SEQ dir={dir} expected>{expected} got={got}";
             lock (_seqLock) { SeqAnomalies.Add($"{DateTime.Now:HH:mm:ss.fff}  {msg}"); }
             _state.AddInGameLog($"[SEQ] {msg}");
         }
@@ -3747,19 +3937,21 @@ namespace HyForce.Networking
         private void HandleMemScan(byte[] pay)
         {
             if (pay.Length < 12) return;
-            ulong addr = BitConverter.ToUInt64(pay, 0);
-            uint sz = BitConverter.ToUInt32(pay, 8);
+            ulong  addr = BitConverter.ToUInt64(pay, 0);
             byte[] data = new byte[pay.Length - 12];
             if (data.Length > 0) Buffer.BlockCopy(pay, 12, data, 0, data.Length);
 
-            var hit = new MemScanHit { Address = addr, StructBytes = data };
-            if (data.Length >= 32)
+            var hit = new MemScanHit { Address = addr, StructBytes = data, FoundAt = DateTime.Now };
+            if (data.Length >= 44)
             {
-                hit.Health = BitConverter.ToSingle(data, 0);
+                hit.Health    = BitConverter.ToSingle(data, 0);
                 hit.MaxHealth = BitConverter.ToSingle(data, 4);
-                hit.X = BitConverter.ToDouble(data, 8);
-                hit.Y = BitConverter.ToDouble(data, 16);
-                hit.Z = BitConverter.ToDouble(data, 24);
+                hit.X         = BitConverter.ToDouble(data, 8);
+                hit.Y         = BitConverter.ToDouble(data, 16);
+                hit.Z         = BitConverter.ToDouble(data, 24);
+                hit.VelX      = BitConverter.ToSingle(data, 32);
+                hit.VelY      = BitConverter.ToSingle(data, 36);
+                hit.VelZ      = BitConverter.ToSingle(data, 40);
             }
             lock (_memLock) { MemHits.Add(hit); }
         }
@@ -3767,8 +3959,127 @@ namespace HyForce.Networking
         private void HandleRateLimit(byte[] pay)
         {
             if (pay.Length < 8) return;
-            LastRateLimitSent = (int)BitConverter.ToUInt32(pay, 0);
+            LastRateLimitSent       = (int)BitConverter.ToUInt32(pay, 0);
             LastRateLimitIntervalMs = (int)BitConverter.ToUInt32(pay, 4);
+        }
+
+        private void HandleEjected()
+        {
+            _state.AddInGameLog("[PIPE] DLL ejected itself — pipe closed");
+            _dllConnected = false;
+        }
+
+        private void HandleKeylog(byte[] pay)
+        {
+            string line = System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0', '\n', '\r');
+            if (string.IsNullOrWhiteSpace(line)) return;
+            _state.ImportKeylogLine(line);
+            _state.AddInGameLog($"[KEYLOG] {line[..Math.Min(80, line.Length)]}");
+        }
+
+        private void HandleMemWatch(byte[] pay)
+        {
+            if (pay.Length < 72) return;
+            ulong  addr = BitConverter.ToUInt64(pay, 0);
+            byte[] data = new byte[64];
+            Buffer.BlockCopy(pay, 8, data, 0, 64);
+
+            var entry = new MemWatchEntry
+            {
+                Address   = addr,
+                Snapshot  = data,
+                Timestamp = DateTime.Now,
+            };
+            if (data.Length >= 44)
+            {
+                entry.Health    = BitConverter.ToSingle(data, 0);
+                entry.MaxHealth = BitConverter.ToSingle(data, 4);
+                entry.X         = BitConverter.ToDouble(data, 8);
+                entry.Y         = BitConverter.ToDouble(data, 16);
+                entry.Z         = BitConverter.ToDouble(data, 24);
+            }
+            lock (_memLock)
+            {
+                MemWatchLog.Add(entry);
+                if (MemWatchLog.Count > 500) MemWatchLog.RemoveAt(0);
+            }
+            _state.TriggerMemoryScan();
+        }
+
+        private void HandleStringScan(byte[] pay)
+        {
+            // Format: [8B addr][4B slen][UTF-8 string bytes, no null]
+            if (pay.Length < 13) return;
+            ulong  addr = BitConverter.ToUInt64(pay, 0);
+            int    slen = (int)BitConverter.ToUInt32(pay, 8);
+            int    avail = pay.Length - 12;
+            if (avail <= 0) return;
+            string text = System.Text.Encoding.UTF8.GetString(pay, 12, Math.Min(slen, avail));
+
+            var hit = new StringHit { Address = addr, Text = text, FoundAt = DateTime.Now };
+            lock (StringLock)
+            {
+                Strings.Add(hit);
+                if (Strings.Count > 5000) Strings.RemoveAt(0);
+            }
+        }
+
+        private void HandleModInfo(byte[] pay)
+        {
+            // Format: [8B base][4B size][ASCII name, null-terminated]
+            if (pay.Length < 13) return;
+            ulong  baseAddr = BitConverter.ToUInt64(pay, 0);
+            uint   size     = BitConverter.ToUInt32(pay, 8);
+            string name     = System.Text.Encoding.ASCII.GetString(pay, 12, pay.Length - 12)
+                                                        .TrimEnd('\0');
+            var info = new ModuleInfo { BaseAddress = baseAddr, Size = size, Name = name };
+            lock (_modLock)
+            {
+                Modules.RemoveAll(m => m.Name == name);
+                Modules.Add(info);
+            }
+        }
+
+        private void HandleGadget(byte[] pay)
+        {
+            // Format: [8B addr][1B type][ASCII desc, null-terminated]
+            if (pay.Length < 10) return;
+            ulong  addr  = BitConverter.ToUInt64(pay, 0);
+            byte   gtype = pay[8];
+            string desc  = System.Text.Encoding.ASCII.GetString(pay, 9, pay.Length - 9)
+                                                      .TrimEnd('\0');
+            var hit = new GadgetHit
+            {
+                Address     = addr,
+                GadgetType  = gtype,
+                Description = desc,
+                FoundAt     = DateTime.Now,
+            };
+            lock (_gadgetLock)
+            {
+                Gadgets.Add(hit);
+                if (Gadgets.Count > 2000) Gadgets.RemoveAt(0);
+            }
+            _state.AddInGameLog($"[GADGET] 0x{addr:X16}  {desc}");
+        }
+
+        private void HandleExploitResult(byte[] pay)
+        {
+            string result = System.Text.Encoding.ASCII.GetString(pay).TrimEnd('\0');
+            _state.AddInGameLog($"[EXPLOIT] {result}");
+        }
+
+        private void HandleProcDump(byte[] pay)
+        {
+            if (pay.Length < 12) return;
+            ulong  addr = BitConverter.ToUInt64(pay, 0);
+            uint   sz   = BitConverter.ToUInt32(pay, 8);
+            int    avail = pay.Length - 12;
+            string hex  = avail > 0
+                ? BitConverter.ToString(pay, 12, Math.Min((int)sz, avail)).Replace("-", "")
+                : "";
+            _state.AddInGameLog(
+                $"[DUMP] @0x{addr:X16} {sz}B  {hex[..Math.Min(64, hex.Length)]}{(hex.Length > 64 ? "..." : "")}");
         }
 
         private static bool ReadExact(System.IO.Stream s, byte[] buf, int count)
@@ -3784,22 +4095,61 @@ namespace HyForce.Networking
         }
     }
 
+    // ── Supporting data types ─────────────────────────────────────────────────────
     public class TimingEntry
     {
         public ulong TimestampUs { get; set; }
-        public uint Length { get; set; }
-        public byte Dir { get; set; }
+        public uint  Length      { get; set; }
+        public byte  Dir         { get; set; }
     }
 
     public class MemScanHit
     {
-        public ulong Address { get; set; }
-        public float Health { get; set; }
-        public float MaxHealth { get; set; }
-        public double X { get; set; }
-        public double Y { get; set; }
-        public double Z { get; set; }
-        public byte[] StructBytes { get; set; } = Array.Empty<byte>();
+        public ulong    Address     { get; set; }
+        public float    Health      { get; set; }
+        public float    MaxHealth   { get; set; }
+        public double   X           { get; set; }
+        public double   Y           { get; set; }
+        public double   Z           { get; set; }
+        public float    VelX        { get; set; }
+        public float    VelY        { get; set; }
+        public float    VelZ        { get; set; }
+        public byte[]   StructBytes { get; set; } = Array.Empty<byte>();
+        public DateTime FoundAt     { get; set; } = DateTime.Now;
+        public string   Label       { get; set; } = "";
+    }
+
+    public class MemWatchEntry
+    {
+        public ulong    Address    { get; set; }
+        public float    Health     { get; set; }
+        public float    MaxHealth  { get; set; }
+        public double   X          { get; set; }
+        public double   Y          { get; set; }
+        public double   Z          { get; set; }
+        public byte[]   Snapshot   { get; set; } = Array.Empty<byte>();
+        public DateTime Timestamp  { get; set; } = DateTime.Now;
+    }
+
+    public class ModuleInfo
+    {
+        public ulong  BaseAddress { get; set; }
+        public uint   Size        { get; set; }
+        public string Name        { get; set; } = "";
+    }
+
+    public class GadgetHit
+    {
+        public ulong    Address     { get; set; }
+        public byte     GadgetType  { get; set; }
+        public string   Description { get; set; } = "";
+        public DateTime FoundAt     { get; set; } = DateTime.Now;
+    }
+
+    public class StringHit
+    {
+        public ulong    Address { get; set; }
+        public string   Text    { get; set; } = "";
         public DateTime FoundAt { get; set; } = DateTime.Now;
     }
 }
@@ -4313,6 +4663,8 @@ namespace HyForce
             public IntPtr? MemoryAddress { get; set; }
             public bool IsClient => Type == EncryptionType.QUIC_Client1RTT || Type == EncryptionType.QUIC_ClientHandshake || Type == EncryptionType.QUIC_Client0RTT;
             public bool IsValid => Key != null && Key.Length > 0 && IV != null && IV.Length > 0;
+
+           
         }
         
         public class DecryptionResult
@@ -5292,7 +5644,6 @@ public class PacketInspector
     public string QuicHeaderType { get; set; } = "";
     public string QuicVersion { get; set; } = "";
 }
-
 
 
 // ============================================================
@@ -7398,7 +7749,7 @@ namespace HyForce.Tabs
     {
         public string Name => "Memory Research";
 
-        private readonly AppState          _state;
+        private readonly AppState _state;
         private readonly PipeCaptureServer _pipe;
 
         // ── Bookmarks ─────────────────────────────────────────────
@@ -7416,12 +7767,12 @@ namespace HyForce.Tabs
         // ── Pattern scanner ───────────────────────────────────────
         private string _patternHex = "3F 80 00 00";
         private string _stringFilter = "";
-        private int    _minStrLen    = 5;
+        private int _minStrLen = 5;
 
         // ── Sub-tab ───────────────────────────────────────────────
-        private int  _subTab       = 0;
-        private int  _selectedHit  = -1;
-        private int  _selectedBm   = -1;
+        private int _subTab = 0;
+        private int _selectedHit = -1;
+        private int _selectedBm = -1;
 
         // Notes editor
         private string _notes = DefaultNotes;
@@ -7429,7 +7780,7 @@ namespace HyForce.Tabs
         public MemoryResearchTab(AppState state, PipeCaptureServer pipe)
         {
             _state = state;
-            _pipe  = pipe;
+            _pipe = pipe;
             _bookmarkFile = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 "HyForce", "bookmarks.json");
@@ -7446,10 +7797,10 @@ namespace HyForce.Tabs
                 _lastAutoRefresh = DateTime.Now;
             }
 
-            ImGui.TextColored(new Vector4(0.75f,0.45f,1f,1f), "Memory Research");
+            ImGui.TextColored(new Vector4(0.75f, 0.45f, 1f, 1f), "Memory Research");
             ImGui.SameLine();
             bool live = _pipe.DllConnected;
-            ImGui.TextColored(live ? new Vector4(0.1f,1f,0.4f,1f) : new Vector4(0.7f,0.3f,0.3f,1f),
+            ImGui.TextColored(live ? new Vector4(0.1f, 1f, 0.4f, 1f) : new Vector4(0.7f, 0.3f, 0.3f, 1f),
                 live ? $"● DLL Live" : "○ DLL offline");
             ImGui.SameLine();
             if (ImGui.SmallButton("Scan Now"))
@@ -7461,7 +7812,7 @@ namespace HyForce.Tabs
             string[] tabs = { "Entity Finder", $"Bookmarks ({_bookmarks.Count})",
                               "Saved Scans", "Struct Viewer",
                               "Client↔Packet", "Pattern Scan",
-                              "String Heap", "Module Map", "Notes" };
+                              "String Heap", "Module Map", "Notes", "Live Watch" };
 
             ImGui.SetNextItemWidth(-1);
             ImGui.BeginTabBar("##mrt");
@@ -7473,15 +7824,16 @@ namespace HyForce.Tabs
             ImGui.Spacing();
             switch (_subTab)
             {
-                case 0: RenderEntityFinder();  break;
-                case 1: RenderBookmarks();     break;
-                case 2: RenderSavedScans();    break;
-                case 3: RenderStructViewer();  break;
-                case 4: RenderClientVsPacket();break;
-                case 5: RenderPatternScan();   break;
-                case 6: RenderStringHeap();    break;
-                case 7: RenderModuleMap();     break;
-                case 8: RenderNotes();         break;
+                case 0: RenderEntityFinder(); break;
+                case 1: RenderBookmarks(); break;
+                case 2: RenderSavedScans(); break;
+                case 3: RenderStructViewer(); break;
+                case 4: RenderClientVsPacket(); break;
+                case 5: RenderPatternScan(); break;
+                case 6: RenderStringHeap(); break;
+                case 7: RenderModuleMap(); break;
+                case 8: RenderNotes(); break;
+                case 9: RenderLiveWatch(); break;
             }
         }
 
@@ -7489,11 +7841,7 @@ namespace HyForce.Tabs
         private void RenderEntityFinder()
         {
             ImGui.TextColored(Accent, "Entity / Player Struct Finder");
-            ImGui.TextWrapped(
-                "Scans process memory for structs matching the pattern: " +
-                "[float health][float maxHP][double X][double Y][double Z][float vx][float vy][float vz]. " +
-                "NOTE: JVM heap objects move on GC. Re-scan periodically. " +
-                "If no hits: Hytale may use different struct layout — try Pattern Scan with known values.");
+            ImGui.TextWrapped("Scans process memory for structs matching the pattern: [float health][float maxHP][double X][double Y][double Z][float vx][float vy][float vz]. NOTE: JVM heap objects move on GC. Re-scan periodically. If no hits: Hytale may use different struct layout — try Pattern Scan with known values.");
             ImGui.Spacing();
 
             ImGui.Text($"Results: {_pipe.MemHits.Count}");
@@ -7504,20 +7852,22 @@ namespace HyForce.Tabs
             ImGui.Separator();
 
             float tableH = ImGui.GetContentRegionAvail().Y - 4;
-            if (ImGui.BeginTable("##ent", 8,
+            // FIXED: Changed from 8 to 9 columns to match TableSetupColumn calls
+            if (ImGui.BeginTable("##ent", 9,
                 ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg |
                 ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable,
                 new Vector2(-1, tableH)))
             {
                 ImGui.TableSetupScrollFreeze(0, 1);
-                ImGui.TableSetupColumn("★",        ImGuiTableColumnFlags.WidthFixed, 24);
-                ImGui.TableSetupColumn("#",        ImGuiTableColumnFlags.WidthFixed, 28);
-                ImGui.TableSetupColumn("Address",  ImGuiTableColumnFlags.WidthFixed, 145);
-                ImGui.TableSetupColumn("HP",       ImGuiTableColumnFlags.WidthFixed, 90);
-                ImGui.TableSetupColumn("X",        ImGuiTableColumnFlags.WidthFixed, 90);
-                ImGui.TableSetupColumn("Y",        ImGuiTableColumnFlags.WidthFixed, 80);
-                ImGui.TableSetupColumn("Z",        ImGuiTableColumnFlags.WidthFixed, 90);
-                ImGui.TableSetupColumn("Actions",  ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableSetupColumn("★", ImGuiTableColumnFlags.WidthFixed, 24);
+                ImGui.TableSetupColumn("#", ImGuiTableColumnFlags.WidthFixed, 28);
+                ImGui.TableSetupColumn("Address", ImGuiTableColumnFlags.WidthFixed, 145);
+                ImGui.TableSetupColumn("HP", ImGuiTableColumnFlags.WidthFixed, 90);
+                ImGui.TableSetupColumn("X", ImGuiTableColumnFlags.WidthFixed, 90);
+                ImGui.TableSetupColumn("Y", ImGuiTableColumnFlags.WidthFixed, 80);
+                ImGui.TableSetupColumn("Z", ImGuiTableColumnFlags.WidthFixed, 90);
+                ImGui.TableSetupColumn("Vel", ImGuiTableColumnFlags.WidthFixed, 100);
+                ImGui.TableSetupColumn("Actions", ImGuiTableColumnFlags.WidthStretch);
                 ImGui.TableHeadersRow();
 
                 lock (_pipe.MemHits)
@@ -7544,7 +7894,7 @@ namespace HyForce.Tabs
                             _selectedHit = i;
 
                         ImGui.TableSetColumnIndex(3);
-                        float frac = h.MaxHealth > 0 ? h.Health/h.MaxHealth : 0;
+                        float frac = h.MaxHealth > 0 ? h.Health / h.MaxHealth : 0;
                         var hc = frac > 0.6f ? Green : frac > 0.3f ? Yellow : Red;
                         ImGui.TextColored(hc, $"{h.Health:F0}/{h.MaxHealth:F0}");
 
@@ -7553,6 +7903,11 @@ namespace HyForce.Tabs
                         ImGui.TableSetColumnIndex(6); ImGui.Text($"{h.Z:F2}");
 
                         ImGui.TableSetColumnIndex(7);
+                        float speed = MathF.Sqrt(h.VelX * h.VelX + h.VelY * h.VelY + h.VelZ * h.VelZ);
+                        var vc = speed > 10f ? new Vector4(1f, 0.5f, 0.1f, 1f) : new Vector4(0.6f, 0.6f, 0.6f, 1f);
+                        ImGui.TextColored(vc, $"{speed:F1}m/s");
+
+                        ImGui.TableSetColumnIndex(8);
                         if (ImGui.SmallButton($"View##sv{i}"))
                         { _selectedHit = i; _subTab = 3; }
                         ImGui.SameLine();
@@ -7576,10 +7931,7 @@ namespace HyForce.Tabs
         private void RenderBookmarks()
         {
             ImGui.TextColored(Accent, "Bookmarked Memory Locations");
-            ImGui.TextWrapped(
-                "Starred entities from the Entity Finder appear here. " +
-                "Each bookmark stores the base address and field snapshot. " +
-                "Use 'Refresh' to re-read current values from memory via the DLL.");
+            ImGui.TextWrapped("Starred entities from the Entity Finder appear here. Each bookmark stores the base address and field snapshot. Use 'Refresh' to re-read current values from memory via the DLL.");
             ImGui.Spacing();
 
             // Pending bookmark dialog
@@ -7593,17 +7945,17 @@ namespace HyForce.Tabs
                 {
                     var bm = new BookmarkedHit
                     {
-                        Address    = _pendingBookmarkHit.Address,
-                        Label      = _bookmarkLabel,
-                        Category   = GuessCategory(_pendingBookmarkHit),
-                        CreatedAt  = DateTime.Now,
-                        LastSeen   = DateTime.Now,
+                        Address = _pendingBookmarkHit.Address,
+                        Label = _bookmarkLabel,
+                        Category = GuessCategory(_pendingBookmarkHit),
+                        CreatedAt = DateTime.Now,
+                        LastSeen = DateTime.Now,
                         LastHealth = _pendingBookmarkHit.Health,
-                        LastMaxHP  = _pendingBookmarkHit.MaxHealth,
-                        LastX      = _pendingBookmarkHit.X,
-                        LastY      = _pendingBookmarkHit.Y,
-                        LastZ      = _pendingBookmarkHit.Z,
-                        StructBytes= _pendingBookmarkHit.StructBytes,
+                        LastMaxHP = _pendingBookmarkHit.MaxHealth,
+                        LastX = _pendingBookmarkHit.X,
+                        LastY = _pendingBookmarkHit.Y,
+                        LastZ = _pendingBookmarkHit.Z,
+                        StructBytes = _pendingBookmarkHit.StructBytes,
                     };
                     _bookmarks.Add(bm);
                     SaveBookmarks();
@@ -7646,20 +7998,18 @@ namespace HyForce.Tabs
                         bm.LastSeen = DateTime.Now;
                     }
 
-                    ImGui.TextColored(live!=null ? Green : Muted,
-                        $"HP {bm.LastHealth:F0}/{bm.LastMaxHP:F0}  " +
-                        $"({bm.LastX:F1}, {bm.LastY:F1}, {bm.LastZ:F1})");
+                    ImGui.TextColored(live != null ? Green : Muted,
+                        $"HP {bm.LastHealth:F0}/{bm.LastMaxHP:F0}  ({bm.LastX:F1}, {bm.LastY:F1}, {bm.LastZ:F1})");
                     ImGui.SameLine();
                     ImGui.TextColored(Muted, $"0x{bm.Address:X14}");
                     ImGui.SameLine();
 
-                    if (ImGui.SmallButton("View")) { _selectedBm=_bookmarks.IndexOf(bm); _subTab=3; }
+                    if (ImGui.SmallButton("View")) { _selectedBm = _bookmarks.IndexOf(bm); _subTab = 3; }
                     ImGui.SameLine();
                     if (ImGui.SmallButton("Delete"))
                     { _bookmarks.Remove(bm); SaveBookmarks(); ImGui.PopID(); break; }
 
-                    ImGui.TextColored(Muted, $"  Created {bm.CreatedAt:HH:mm:ss}  " +
-                        $"Last seen {bm.LastSeen:HH:mm:ss}");
+                    ImGui.TextColored(Muted, $"  Created {bm.CreatedAt:HH:mm:ss}  Last seen {bm.LastSeen:HH:mm:ss}");
                     ImGui.PopID();
                     ImGui.Separator();
                 }
@@ -7679,9 +8029,9 @@ namespace HyForce.Tabs
             if (_savedScans.Any(s => s.Address == h.Address)) return;
             _savedScans.Add(new SavedScan
             {
-                Address   = h.Address,
-                Name      = $"Entity 0x{h.Address:X10}",
-                Fields    = new List<WatchField>
+                Address = h.Address,
+                Name = $"Entity 0x{h.Address:X10}",
+                Fields = new List<WatchField>
                 {
                     new("Health",    0,  FieldType.Float32),
                     new("MaxHealth", 4,  FieldType.Float32),
@@ -7698,10 +8048,7 @@ namespace HyForce.Tabs
         private void RenderSavedScans()
         {
             ImGui.TextColored(Accent, "Saved Scan Watch List");
-            ImGui.TextWrapped(
-                "Entities saved here get their values updated every time the DLL returns a scan hit " +
-                "with a matching address. NOTE: JVM GC moves objects — addresses become stale. " +
-                "Re-scan to find the new address, then update the entry.");
+            ImGui.TextWrapped("Entities saved here get their values updated every time the DLL returns a scan hit with a matching address. NOTE: JVM GC moves objects — addresses become stale. Re-scan to find the new address, then update the entry.");
             ImGui.Spacing();
 
             ImGui.Checkbox("Auto-refresh on DLL connection", ref _autoRefreshScans);
@@ -7748,10 +8095,10 @@ namespace HyForce.Tabs
                 if (ImGui.BeginTable($"##wf{scan.Address}", 4,
                     ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
                 {
-                    ImGui.TableSetupColumn("Field",  ImGuiTableColumnFlags.WidthFixed, 100);
+                    ImGui.TableSetupColumn("Field", ImGuiTableColumnFlags.WidthFixed, 100);
                     ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.WidthFixed, 60);
-                    ImGui.TableSetupColumn("Type",   ImGuiTableColumnFlags.WidthFixed, 80);
-                    ImGui.TableSetupColumn("Value",  ImGuiTableColumnFlags.WidthStretch);
+                    ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.WidthFixed, 80);
+                    ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthStretch);
                     ImGui.TableHeadersRow();
 
                     foreach (var f in scan.Fields)
@@ -7763,7 +8110,7 @@ namespace HyForce.Tabs
                         ImGui.TableSetColumnIndex(3);
                         bool changed = f.HasChanged;
                         if (changed) ImGui.TableSetBgColor(ImGuiTableBgTarget.CellBg,
-                            ImGui.ColorConvertFloat4ToU32(new Vector4(0.4f,0.2f,0f,0.6f)));
+                            ImGui.ColorConvertFloat4ToU32(new Vector4(0.4f, 0.2f, 0f, 0.6f)));
                         ImGui.TextColored(changed ? Yellow : Vector4.One, f.ValueStr);
                     }
                     ImGui.EndTable();
@@ -7772,13 +8119,13 @@ namespace HyForce.Tabs
                 // Add custom field
                 ImGui.TextColored(Muted, "Add field: ");
                 ImGui.SameLine();
-                if (ImGui.SmallButton("+float32")) scan.Fields.Add(new WatchField($"f+{scan.Fields.Count*4}", scan.Fields.Count*4, FieldType.Float32));
+                if (ImGui.SmallButton("+float32")) scan.Fields.Add(new WatchField($"f+{scan.Fields.Count * 4}", scan.Fields.Count * 4, FieldType.Float32));
                 ImGui.SameLine();
-                if (ImGui.SmallButton("+float64")) scan.Fields.Add(new WatchField($"d+{scan.Fields.Count*8}", scan.Fields.Count*8, FieldType.Float64));
+                if (ImGui.SmallButton("+float64")) scan.Fields.Add(new WatchField($"d+{scan.Fields.Count * 8}", scan.Fields.Count * 8, FieldType.Float64));
                 ImGui.SameLine();
-                if (ImGui.SmallButton("+int32"))   scan.Fields.Add(new WatchField($"i+{scan.Fields.Count*4}", scan.Fields.Count*4, FieldType.Int32));
+                if (ImGui.SmallButton("+int32")) scan.Fields.Add(new WatchField($"i+{scan.Fields.Count * 4}", scan.Fields.Count * 4, FieldType.Int32));
                 ImGui.SameLine();
-                if (ImGui.SmallButton("+byte"))    scan.Fields.Add(new WatchField($"b+{scan.Fields.Count}",  scan.Fields.Count,    FieldType.Byte));
+                if (ImGui.SmallButton("+byte")) scan.Fields.Add(new WatchField($"b+{scan.Fields.Count}", scan.Fields.Count, FieldType.Byte));
 
                 ImGui.PopID();
                 ImGui.Spacing();
@@ -7795,9 +8142,16 @@ namespace HyForce.Tabs
             else if (_selectedBm >= 0 && _selectedBm < _bookmarks.Count)
             {
                 var bm = _bookmarks[_selectedBm];
-                hit = new MemScanHit {
-                    Address=bm.Address, Health=bm.LastHealth, MaxHealth=bm.LastMaxHP,
-                    X=bm.LastX, Y=bm.LastY, Z=bm.LastZ, StructBytes=bm.StructBytes };
+                hit = new MemScanHit
+                {
+                    Address = bm.Address,
+                    Health = bm.LastHealth,
+                    MaxHealth = bm.LastMaxHP,
+                    X = bm.LastX,
+                    Y = bm.LastY,
+                    Z = bm.LastZ,
+                    StructBytes = bm.StructBytes
+                };
             }
 
             if (hit == null)
@@ -7822,14 +8176,15 @@ namespace HyForce.Tabs
                     for (int row = 0; row < b.Length; row += 16)
                     {
                         sb.Append($"  +{row:X4}  ");
-                        for (int c = 0; c < 16; c++) {
-                            if (row+c < b.Length) sb.Append($"{b[row+c]:X2} ");
+                        for (int c = 0; c < 16; c++)
+                        {
+                            if (row + c < b.Length) sb.Append($"{b[row + c]:X2} ");
                             else sb.Append("   ");
                             if (c == 7) sb.Append(" ");
                         }
                         sb.Append("  ");
-                        for (int c = 0; c < 16 && row+c < b.Length; c++)
-                        { char ch=(char)b[row+c]; sb.Append(ch>=0x20&&ch<0x7F?ch:'.'); }
+                        for (int c = 0; c < 16 && row + c < b.Length; c++)
+                        { char ch = (char)b[row + c]; sb.Append(ch >= 0x20 && ch < 0x7F ? ch : '.'); }
                         sb.AppendLine();
                     }
                     var hexDump = sb.ToString();
@@ -7841,12 +8196,12 @@ namespace HyForce.Tabs
                 {
                     byte[] b = hit.StructBytes;
                     if (ImGui.BeginTable("##interp", 4,
-                        ImGuiTableFlags.Borders|ImGuiTableFlags.RowBg|ImGuiTableFlags.ScrollY))
+                        ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY))
                     {
                         ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.WidthFixed, 60);
-                        ImGui.TableSetupColumn("Hex",    ImGuiTableColumnFlags.WidthFixed, 120);
-                        ImGui.TableSetupColumn("float32",ImGuiTableColumnFlags.WidthFixed, 120);
-                        ImGui.TableSetupColumn("float64",ImGuiTableColumnFlags.WidthStretch);
+                        ImGui.TableSetupColumn("Hex", ImGuiTableColumnFlags.WidthFixed, 120);
+                        ImGui.TableSetupColumn("float32", ImGuiTableColumnFlags.WidthFixed, 120);
+                        ImGui.TableSetupColumn("float64", ImGuiTableColumnFlags.WidthStretch);
                         ImGui.TableHeadersRow();
 
                         for (int off = 0; off + 4 <= b.Length; off += 4)
@@ -7854,18 +8209,19 @@ namespace HyForce.Tabs
                             ImGui.TableNextRow();
                             ImGui.TableSetColumnIndex(0); ImGui.Text($"+{off:X2}");
                             ImGui.TableSetColumnIndex(1);
-                            string hex = off+4<=b.Length ? BitConverter.ToString(b, off, 4) : "";
+                            string hex = off + 4 <= b.Length ? BitConverter.ToString(b, off, 4) : "";
                             ImGui.Text(hex);
                             ImGui.TableSetColumnIndex(2);
-                            float f = off+4<=b.Length ? BitConverter.ToSingle(b, off) : 0;
-                            if (!float.IsNaN(f)&&!float.IsInfinity(f)&&Math.Abs(f)<1e9)
+                            float f = off + 4 <= b.Length ? BitConverter.ToSingle(b, off) : 0;
+                            if (!float.IsNaN(f) && !float.IsInfinity(f) && Math.Abs(f) < 1e9)
                                 ImGui.TextColored(Yellow, $"{f:G6}");
                             else ImGui.TextColored(Muted, "---");
                             ImGui.TableSetColumnIndex(3);
-                            if (off+8<=b.Length){
+                            if (off + 8 <= b.Length)
+                            {
                                 double d = BitConverter.ToDouble(b, off);
-                                if (!double.IsNaN(d)&&!double.IsInfinity(d)&&Math.Abs(d)<1e12)
-                                    ImGui.TextColored(new Vector4(0.5f,0.9f,1f,1f), $"{d:G10}");
+                                if (!double.IsNaN(d) && !double.IsInfinity(d) && Math.Abs(d) < 1e12)
+                                    ImGui.TextColored(new Vector4(0.5f, 0.9f, 1f, 1f), $"{d:G10}");
                                 else ImGui.TextColored(Muted, "---");
                             }
                         }
@@ -7881,9 +8237,7 @@ namespace HyForce.Tabs
         private void RenderClientVsPacket()
         {
             ImGui.TextColored(Accent, "Client Memory  ↔  Outgoing Packet Values");
-            ImGui.TextWrapped(
-                "If what the client holds in memory differs from what it sends to the server, " +
-                "that's a server-trust vulnerability. Every mismatch is a potential finding.");
+            ImGui.TextWrapped("If what the client holds in memory differs from what it sends to the server, that's a server-trust vulnerability. Every mismatch is a potential finding.");
             ImGui.Spacing();
 
             lock (_pipe.MemHits)
@@ -7892,48 +8246,46 @@ namespace HyForce.Tabs
                 { ImGui.TextColored(Muted, "Run entity scan first."); return; }
 
                 var lp = _pipe.MemHits[0];
-                ImGui.TextColored(new Vector4(0.4f,0.9f,1f,1f), "First scan hit (local player candidate):");
+                ImGui.TextColored(new Vector4(0.4f, 0.9f, 1f, 1f), "First scan hit (local player candidate):");
                 if (ImGui.BeginTable("##lpv", 2, ImGuiTableFlags.Borders))
                 {
                     ImGui.TableSetupColumn("Field", ImGuiTableColumnFlags.WidthFixed, 120);
                     ImGui.TableSetupColumn("Memory Value", ImGuiTableColumnFlags.WidthStretch);
                     ImGui.TableHeadersRow();
-                    void Row(string k, string v){ ImGui.TableNextRow();
-                        ImGui.TableSetColumnIndex(0);ImGui.Text(k);
-                        ImGui.TableSetColumnIndex(1);ImGui.Text(v);}
-                    Row("Address",  $"0x{lp.Address:X14}");
-                    Row("Health",   $"{lp.Health:F3}  /  {lp.MaxHealth:F3}");
+                    void Row(string k, string v)
+                    {
+                        ImGui.TableNextRow();
+                        ImGui.TableSetColumnIndex(0); ImGui.Text(k);
+                        ImGui.TableSetColumnIndex(1); ImGui.Text(v);
+                    }
+                    Row("Address", $"0x{lp.Address:X14}");
+                    Row("Health", $"{lp.Health:F3}  /  {lp.MaxHealth:F3}");
                     Row("Position", $"({lp.X:F4}, {lp.Y:F4}, {lp.Z:F4})");
-                    Row("Scan time",lp.FoundAt.ToString("HH:mm:ss.fff"));
+                    Row("Scan time", lp.FoundAt.ToString("HH:mm:ss.fff"));
                     ImGui.EndTable();
                 }
             }
 
             ImGui.Spacing();
-            ImGui.TextColored(Muted,
-                "Packet-side position values will appear here once decryption is working.\n" +
-                "The hook fires stats every 5s — watch STATS lines in the Log tab to confirm\n" +
-                "which hook variant (WSASendTo or sendto) is catching Hytale's traffic.");
+            ImGui.TextColored(Muted, "Packet-side position values will appear here once decryption is working.");
+            ImGui.TextColored(Muted, "The hook fires stats every 5s — watch STATS lines in the Log tab to confirm");
+            ImGui.TextColored(Muted, "which hook variant (WSASendTo or sendto) is catching Hytale's traffic.");
             ImGui.Spacing();
 
             // Show recent packet count as proxy for whether capture is working
-            ImGui.TextColored(new Vector4(0.5f,0.9f,0.5f,1f),
+            ImGui.TextColored(new Vector4(0.5f, 0.9f, 0.5f, 1f),
                 $"Packets captured so far: {_pipe.PacketCount}");
             if (_pipe.PacketCount == 0)
-                ImGui.TextColored(Red,
-                    "0 packets — DLL hooks not firing. Check STATS in Log tab.\n" +
-                    "If all 4 fire counts are 0, Hytale may use IOCP (async I/O).\n" +
-                    "Next step: WinDivert capture (see Settings tab for setup guide).");
+                ImGui.TextColored(Red, "0 packets — DLL hooks not firing. Check STATS in Log tab.");
+            ImGui.TextColored(Red, "If all 4 fire counts are 0, Hytale may use IOCP (async I/O).");
+            ImGui.TextColored(Red, "Next step: WinDivert capture (see Settings tab for setup guide).");
         }
 
         // ─── Pattern Scan ─────────────────────────────────────────
         private void RenderPatternScan()
         {
             ImGui.TextColored(Accent, "Byte Pattern Scanner");
-            ImGui.TextWrapped(
-                "Know a value that exists in a struct (e.g. your exact HP = 87.5)? " +
-                "Convert it to hex and scan for it. Then watch which address changes when " +
-                "you take damage — that's the live struct.");
+            ImGui.TextWrapped("Know a value that exists in a struct (e.g. your exact HP = 87.5)? Convert it to hex and scan for it. Then watch which address changes when you take damage — that's the live struct.");
             ImGui.Spacing();
 
             ImGui.SetNextItemWidth(460);
@@ -7943,60 +8295,57 @@ namespace HyForce.Tabs
 
             ImGui.Spacing();
             ImGui.Text("Value → Hex converters:");
-            float  fIn  = 0; double dIn = 0; int iIn = 0;
+            float fIn = 0; double dIn = 0; int iIn = 0;
             ImGui.SetNextItemWidth(120); ImGui.InputFloat("float##fi", ref fIn);
             ImGui.SameLine();
             if (ImGui.SmallButton("Use##f"))
-                _patternHex = BitConverter.ToString(BitConverter.GetBytes(fIn)).Replace('-',' ');
+                _patternHex = BitConverter.ToString(BitConverter.GetBytes(fIn)).Replace('-', ' ');
             ImGui.SameLine(0, 20);
             ImGui.SetNextItemWidth(120); ImGui.InputDouble("double##di", ref dIn);
             ImGui.SameLine();
             if (ImGui.SmallButton("Use##d"))
-                _patternHex = BitConverter.ToString(BitConverter.GetBytes(dIn)).Replace('-',' ');
+                _patternHex = BitConverter.ToString(BitConverter.GetBytes(dIn)).Replace('-', ' ');
             ImGui.SameLine(0, 20);
             ImGui.SetNextItemWidth(120); ImGui.InputInt("int32##ii", ref iIn);
             ImGui.SameLine();
             if (ImGui.SmallButton("Use##i"))
-                _patternHex = BitConverter.ToString(BitConverter.GetBytes(iIn)).Replace('-',' ');
+                _patternHex = BitConverter.ToString(BitConverter.GetBytes(iIn)).Replace('-', ' ');
 
             ImGui.Spacing();
             ImGui.Text("Presets:");
-            if (ImGui.SmallButton("float 1.0"))   _patternHex = "3F 80 00 00";
+            if (ImGui.SmallButton("float 1.0")) _patternHex = "3F 80 00 00";
             ImGui.SameLine();
             if (ImGui.SmallButton("float 100.0")) _patternHex = "42 C8 00 00";
             ImGui.SameLine();
-            if (ImGui.SmallButton("\"Hytale\""))  _patternHex = "48 79 74 61 6C 65";
+            if (ImGui.SmallButton("\"Hytale\"")) _patternHex = "48 79 74 61 6C 65";
             ImGui.SameLine();
-            if (ImGui.SmallButton("\"QUIC\""))    _patternHex = "51 55 49 43";
+            if (ImGui.SmallButton("\"QUIC\"")) _patternHex = "51 55 49 43";
             ImGui.SameLine();
-            if (ImGui.SmallButton("UUID pattern"))_patternHex = "?? ?? ?? ?? - ?? ?? - ?? ?? - ?? ?? - ?? ?? ?? ?? ?? ??";
+            if (ImGui.SmallButton("UUID pattern")) _patternHex = "?? ?? ?? ?? - ?? ?? - ?? ?? - ?? ?? - ?? ?? ?? ?? ?? ??";
 
             ImGui.Spacing();
-            if (ImGui.Button("Trigger Scan", new Vector2(140,28)))
-            { _pipe.MemHits.Clear(); _pipe.MemScan(); _subTab=0; }
+            if (ImGui.Button("Trigger Scan", new Vector2(140, 28)))
+            { _pipe.MemHits.Clear(); _pipe.MemScan(); _subTab = 0; }
             ImGui.SameLine();
             ImGui.TextColored(Muted, "→ results appear in Entity Finder tab");
 
             ImGui.Spacing();
             ImGui.Separator();
-            ImGui.TextColored(Muted,
-                "Workflow for finding unknown structs:\n" +
-                "  1. Note a known value (your HP = 87.5)\n" +
-                "  2. Enter it in the float converter → click Use\n" +
-                "  3. Scan, note all addresses found\n" +
-                "  4. Change the value in-game (take damage)\n" +
-                "  5. Re-scan with new value — surviving address = live struct\n" +
-                "  6. Inspect surrounding bytes in Struct Viewer\n" +
-                "  7. Map all fields → cross-reference with captured packets");
+            ImGui.TextColored(Muted, "Workflow for finding unknown structs:");
+            ImGui.TextColored(Muted, "  1. Note a known value (your HP = 87.5)");
+            ImGui.TextColored(Muted, "  2. Enter it in the float converter → click Use");
+            ImGui.TextColored(Muted, "  3. Scan, note all addresses found");
+            ImGui.TextColored(Muted, "  4. Change the value in-game (take damage)");
+            ImGui.TextColored(Muted, "  5. Re-scan with new value — surviving address = live struct");
+            ImGui.TextColored(Muted, "  6. Inspect surrounding bytes in Struct Viewer");
+            ImGui.TextColored(Muted, "  7. Map all fields → cross-reference with captured packets");
         }
 
         // ─── String Heap ──────────────────────────────────────────
         private void RenderStringHeap()
         {
             ImGui.TextColored(Accent, "String Heap Scanner");
-            ImGui.TextWrapped(
-                "Finds ASCII strings in client memory. Useful for discovering internal " +
-                "server hostnames, auth tokens, debug strings, and protocol identifiers.");
+            ImGui.TextWrapped("Finds ASCII strings in client memory. Useful for discovering internal server hostnames, auth tokens, debug strings, and protocol identifiers.");
             ImGui.Spacing();
 
             ImGui.SetNextItemWidth(280);
@@ -8010,30 +8359,26 @@ namespace HyForce.Tabs
             { _pipe.SendCommand("STRINGSCAN"); _pipe.MemScan(); }
 
             ImGui.Spacing();
-            ImGui.TextColored(Muted,
-                "Interesting findings to look for:\n" +
-                "  ● Internal IPs / hostnames  → dev/staging server exposure\n" +
-                "  ● 'admin' / 'debug' flags    → undocumented privilege levels\n" +
-                "  ● JWT tokens in cleartext    → auth token leakage\n" +
-                "  ● Error messages / stack paths → internal code layout\n" +
-                "  ● Encryption key-like strings  → critical if present\n\n" +
-                "Results appear in the Log tab as [DLL] lines.");
+            ImGui.TextColored(Muted, "Interesting findings to look for:");
+            ImGui.TextColored(Muted, "  ● Internal IPs / hostnames  → dev/staging server exposure");
+            ImGui.TextColored(Muted, "  ● 'admin' / 'debug' flags    → undocumented privilege levels");
+            ImGui.TextColored(Muted, "  ● JWT tokens in cleartext    → auth token leakage");
+            ImGui.TextColored(Muted, "  ● Error messages / stack paths → internal code layout");
+            ImGui.TextColored(Muted, "  ● Encryption key-like strings  → critical if present");
+            ImGui.TextColored(Muted, "Results appear in the Log tab as [DLL] lines.");
         }
 
         // ─── Module Map ───────────────────────────────────────────
         private void RenderModuleMap()
         {
             ImGui.TextColored(Accent, "Loaded Module Map");
-            ImGui.TextWrapped(
-                "Shows DLLs loaded in the Hytale process. Identifies which crypto/network " +
-                "libraries are in use and their approximate base addresses.");
+            ImGui.TextWrapped("Shows DLLs loaded in the Hytale process. Identifies which crypto/network libraries are in use and their approximate base addresses.");
             ImGui.Spacing();
             if (ImGui.Button("Request Module List##ml"))
                 _pipe.SendCommand("MODLIST");
             ImGui.Spacing();
-            ImGui.TextColored(Muted,
-                "Results appear in Log tab as [DLL] MODULE: entries.\n" +
-                "Look for: BoringSSL, OpenSSL, netty, libquiche, jvm.dll versions.");
+            ImGui.TextColored(Muted, "Results appear in Log tab as [DLL] MODULE: entries.");
+            ImGui.TextColored(Muted, "Look for: BoringSSL, OpenSSL, netty, libquiche, jvm.dll versions.");
         }
 
         // ─── Notes ────────────────────────────────────────────────
@@ -8045,14 +8390,16 @@ namespace HyForce.Tabs
                 new Vector2(-1, ImGui.GetContentRegionAvail().Y - 32));
             if (ImGui.Button("Export Notes"))
             {
-                try {
+                try
+                {
                     string path = Path.Combine(
                         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                        "HyForce","Exports",$"notes_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                        "HyForce", "Exports", $"notes_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
                     Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                     File.WriteAllText(path, _notes);
                     _state.AddInGameLog($"[MEM] Notes exported: {path}");
-                } catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
+                }
+                catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
             }
         }
 
@@ -8066,126 +8413,192 @@ namespace HyForce.Tabs
 
         private void ExportStruct(MemScanHit h)
         {
-            try {
+            try
+            {
                 string path = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "HyForce","Exports",$"struct_0x{h.Address:X14}_{DateTime.Now:HHmmss}.bin");
+                    "HyForce", "Exports", $"struct_0x{h.Address:X14}_{DateTime.Now:HHmmss}.bin");
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 File.WriteAllBytes(path, h.StructBytes);
                 _state.AddInGameLog($"[MEM] Exported: {path}");
-            } catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
+            }
+            catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
         }
 
         private void ExportBookmarks()
         {
-            try {
+            try
+            {
                 string path = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "HyForce","Exports",$"bookmarks_{DateTime.Now:yyyyMMdd}.json");
+                    "HyForce", "Exports", $"bookmarks_{DateTime.Now:yyyyMMdd}.json");
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                File.WriteAllText(path, JsonSerializer.Serialize(_bookmarks, new JsonSerializerOptions{WriteIndented=true}));
+                File.WriteAllText(path, JsonSerializer.Serialize(_bookmarks, new JsonSerializerOptions { WriteIndented = true }));
                 _state.AddInGameLog($"[MEM] Bookmarks exported: {path}");
-            } catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
+            }
+            catch (Exception ex) { _state.AddInGameLog($"[MEM] {ex.Message}"); }
         }
 
         private void LoadBookmarks()
         {
-            try {
-                if (File.Exists(_bookmarkFile)) {
+            try
+            {
+                if (File.Exists(_bookmarkFile))
+                {
                     var loaded = JsonSerializer.Deserialize<List<BookmarkedHit>>(File.ReadAllText(_bookmarkFile));
                     if (loaded != null) { _bookmarks.Clear(); _bookmarks.AddRange(loaded); }
                 }
-            } catch { }
+            }
+            catch { }
         }
 
         private void SaveBookmarks()
         {
-            try {
+            try
+            {
                 Directory.CreateDirectory(Path.GetDirectoryName(_bookmarkFile)!);
-                File.WriteAllText(_bookmarkFile, JsonSerializer.Serialize(_bookmarks, new JsonSerializerOptions{WriteIndented=true}));
-            } catch { }
+                File.WriteAllText(_bookmarkFile, JsonSerializer.Serialize(_bookmarks, new JsonSerializerOptions { WriteIndented = true }));
+            }
+            catch { }
         }
 
         // ─── Colours ──────────────────────────────────────────────
-        static readonly Vector4 Accent = new(0.75f,0.45f,1f,1f);
-        static readonly Vector4 Yellow = new(1f,0.85f,0.1f,1f);
-        static readonly Vector4 Green  = new(0.2f,1f,0.4f,1f);
-        static readonly Vector4 Red    = new(1f,0.3f,0.2f,1f);
-        static readonly Vector4 Muted  = new(0.55f,0.55f,0.55f,1f);
+        static readonly Vector4 Accent = new(0.75f, 0.45f, 1f, 1f);
+        static readonly Vector4 Yellow = new(1f, 0.85f, 0.1f, 1f);
+        static readonly Vector4 Green = new(0.2f, 1f, 0.4f, 1f);
+        static readonly Vector4 Red = new(1f, 0.3f, 0.2f, 1f);
+        static readonly Vector4 Muted = new(0.55f, 0.55f, 0.55f, 1f);
 
-        const string DefaultNotes = @"# HyForce Memory Research Notes
+        const string DefaultNotes = @"# HyForce Memory Research Notes\n\n## Entity Findings\n[Document entity struct addresses, field offsets, and what values the server trusts]\n\n## Packet-Memory Correlation\n[Note which packet fields correspond to which memory offsets]\n\n## Visibility Issues\n[Does client receive position data for hidden entities?]\n\n## Server Trust Issues\n[Which fields can be influenced client-side and accepted by server?]\n\n## Other Findings\n";
 
-## Entity Findings
-[Document entity struct addresses, field offsets, and what values the server trusts]
 
-## Packet-Memory Correlation
-[Note which packet fields correspond to which memory offsets]
+        // ─── Live Watch ───────────────────────────────────────────────
+        private string _watchAddrStr = "";
+        private int _watchMs = 250;
 
-## Visibility Issues
-[Does client receive position data for hidden entities?]
-
-## Server Trust Issues
-[Which fields can be influenced client-side and accepted by server?]
-
-## Other Findings
-";
-    }
-
-    // ─── Data types ───────────────────────────────────────────────
-    public class BookmarkedHit
-    {
-        public ulong    Address    { get; set; }
-        public string   Label      { get; set; } = "";
-        public string   Category   { get; set; } = "Unknown";
-        public DateTime CreatedAt  { get; set; } = DateTime.Now;
-        public DateTime LastSeen   { get; set; } = DateTime.Now;
-        public float    LastHealth { get; set; }
-        public float    LastMaxHP  { get; set; }
-        public double   LastX      { get; set; }
-        public double   LastY      { get; set; }
-        public double   LastZ      { get; set; }
-        public byte[]   StructBytes{ get; set; } = Array.Empty<byte>();
-    }
-
-    public enum FieldType { Byte, Int16, Int32, Int64, Float32, Float64 }
-
-    public class WatchField
-    {
-        public string    Name        { get; set; }
-        public int       Offset      { get; set; }
-        public FieldType Type        { get; set; }
-        public string    ValueStr    { get; private set; } = "---";
-        public string    PrevStr     { get; private set; } = "";
-        public bool      HasChanged  => ValueStr != PrevStr;
-
-        public WatchField(string name, int offset, FieldType type)
-        { Name=name; Offset=offset; Type=type; }
-
-        public void Update(byte[] buf)
+        private void RenderLiveWatch()
         {
-            PrevStr = ValueStr;
-            if (Offset < 0 || Offset >= buf.Length) { ValueStr="[OOB]"; return; }
-            try {
-                ValueStr = Type switch {
-                    FieldType.Byte    => $"{buf[Offset]}",
-                    FieldType.Int16   => Offset+2<=buf.Length ? $"{BitConverter.ToInt16(buf,Offset)}" : "[OOB]",
-                    FieldType.Int32   => Offset+4<=buf.Length ? $"{BitConverter.ToInt32(buf,Offset)}" : "[OOB]",
-                    FieldType.Int64   => Offset+8<=buf.Length ? $"{BitConverter.ToInt64(buf,Offset)}" : "[OOB]",
-                    FieldType.Float32 => Offset+4<=buf.Length ? $"{BitConverter.ToSingle(buf,Offset):G6}" : "[OOB]",
-                    FieldType.Float64 => Offset+8<=buf.Length ? $"{BitConverter.ToDouble(buf,Offset):G10}" : "[OOB]",
-                    _ => "?"
-                };
-            } catch { ValueStr="[ERR]"; }
-        }
-    }
+            bool live = _pipe.DllConnected;
+            ImGui.Spacing();
+            ImGui.TextColored(live ? Green : Red, live ? "● DLL Connected — watch active" : "○ DLL Disconnected");
+            ImGui.Separator();
+            ImGui.Spacing();
 
-    public class SavedScan
-    {
-        public ulong           Address    { get; set; }
-        public string          Name       { get; set; } = "";
-        public List<WatchField> Fields    { get; set; } = new();
-        public DateTime        LastUpdate { get; set; } = DateTime.MinValue;
-        public bool            Stale      { get; set; } = false;
+            ImGui.Text("Watch Address (hex):");
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(160);
+            ImGui.InputText("##waddr", ref _watchAddrStr, 20);
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(70);
+            ImGui.InputInt("ms##wms", ref _watchMs);
+            _watchMs = Math.Max(50, _watchMs);
+            ImGui.SameLine();
+            if (ImGui.Button("Start Watch") && live)
+            {
+                if (ulong.TryParse(_watchAddrStr.TrimStart('0', 'x', 'X'),
+                    System.Globalization.NumberStyles.HexNumber, null, out ulong addr))
+                    _pipe.MemWatch(addr, _watchMs);
+                else
+                    _state.AddInGameLog("[MEMWATCH] Invalid hex address");
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Stop")) _pipe.MemWatchStop();
+            ImGui.SameLine();
+            ImGui.TextColored(Muted, $"{_pipe.MemWatchLog.Count} deltas");
+
+            ImGui.Spacing();
+            ImGui.Separator();
+            ImGui.TextColored(Yellow, "Live snapshots (most recent first):");
+            ImGui.Spacing();
+
+            var log = _pipe.MemWatchLog;
+            lock (log)
+            {
+                for (int i = log.Count - 1; i >= Math.Max(0, log.Count - 30); i--)
+                {
+                    var e = log[i];
+                    ImGui.TextColored(Muted, $"{e.Timestamp:HH:mm:ss.fff}");
+                    ImGui.SameLine(0, 8);
+
+                    float frac = e.MaxHealth > 0 ? e.Health / e.MaxHealth : 0;
+                    var hc = frac > 0.6f ? Green : frac > 0.3f ? Yellow : Red;
+                    ImGui.TextColored(hc, $"HP {e.Health:F1}/{e.MaxHealth:F1}");
+                    ImGui.SameLine(0, 8);
+                    ImGui.Text($"({e.X:F1}, {e.Y:F1}, {e.Z:F1})");
+
+                    if (e.Snapshot.Length >= 16)
+                    {
+                        var sb2 = new System.Text.StringBuilder();
+                        for (int j = 0; j < Math.Min(16, e.Snapshot.Length); j++)
+                            sb2.Append($"{e.Snapshot[j]:X2} ");
+                        ImGui.SameLine(0, 8);
+                        ImGui.TextColored(Muted, sb2.ToString().TrimEnd());
+                    }
+                }
+            }
+            if (log.Count == 0)
+                ImGui.TextColored(Muted, "No data yet — bookmark an entity, copy its address, click Start Watch.");
+        }
+
+        // ─── Data types ───────────────────────────────────────────────
+        public class BookmarkedHit
+        {
+            public ulong Address { get; set; }
+            public string Label { get; set; } = "";
+            public string Category { get; set; } = "Unknown";
+            public DateTime CreatedAt { get; set; } = DateTime.Now;
+            public DateTime LastSeen { get; set; } = DateTime.Now;
+            public float LastHealth { get; set; }
+            public float LastMaxHP { get; set; }
+            public double LastX { get; set; }
+            public double LastY { get; set; }
+            public double LastZ { get; set; }
+            public byte[] StructBytes { get; set; } = Array.Empty<byte>();
+        }
+
+        public enum FieldType { Byte, Int16, Int32, Int64, Float32, Float64 }
+
+        public class WatchField
+        {
+            public string Name { get; set; }
+            public int Offset { get; set; }
+            public FieldType Type { get; set; }
+            public string ValueStr { get; private set; } = "---";
+            public string PrevStr { get; private set; } = "";
+            public bool HasChanged => ValueStr != PrevStr;
+
+            public WatchField(string name, int offset, FieldType type)
+            { Name = name; Offset = offset; Type = type; }
+
+            public void Update(byte[] buf)
+            {
+                PrevStr = ValueStr;
+                if (Offset < 0 || Offset >= buf.Length) { ValueStr = "[OOB]"; return; }
+                try
+                {
+                    ValueStr = Type switch
+                    {
+                        FieldType.Byte => $"{buf[Offset]}",
+                        FieldType.Int16 => Offset + 2 <= buf.Length ? $"{BitConverter.ToInt16(buf, Offset)}" : "[OOB]",
+                        FieldType.Int32 => Offset + 4 <= buf.Length ? $"{BitConverter.ToInt32(buf, Offset)}" : "[OOB]",
+                        FieldType.Int64 => Offset + 8 <= buf.Length ? $"{BitConverter.ToInt64(buf, Offset)}" : "[OOB]",
+                        FieldType.Float32 => Offset + 4 <= buf.Length ? $"{BitConverter.ToSingle(buf, Offset):G6}" : "[OOB]",
+                        FieldType.Float64 => Offset + 8 <= buf.Length ? $"{BitConverter.ToDouble(buf, Offset):G10}" : "[OOB]",
+                        _ => "?"
+                    };
+                }
+                catch { ValueStr = "[ERR]"; }
+            }
+        }
+
+        public class SavedScan
+        {
+            public ulong Address { get; set; }
+            public string Name { get; set; } = "";
+            public List<WatchField> Fields { get; set; } = new();
+            public DateTime LastUpdate { get; set; } = DateTime.MinValue;
+            public bool Stale { get; set; } = false;
+        }
     }
 }
 
@@ -9365,11 +9778,6 @@ using System.Text;
 
 namespace HyForce.Tabs
 {
-    /// <summary>
-    /// Protocol Lab — server-side security testing tools:
-    ///   Fuzzer, Replay, Rate-limit prober, PCAP export,
-    ///   Sequence tracker, Opcode map, RTT/timing graph
-    /// </summary>
     public class ProtocolLabTab : ITab
     {
         public string Name => "Protocol Lab";
@@ -9377,46 +9785,34 @@ namespace HyForce.Tabs
         private readonly AppState          _state;
         private readonly PipeCaptureServer _pipe;
 
-        // ── Fuzzer ────────────────────────────────────────────────
-        private int    _fuzzBits    = 4;
-        private string _fuzzResult  = "";
+        private int    _fuzzBits   = 4;
+        private string _fuzzResult = "";
 
-        // ── Replay ────────────────────────────────────────────────
-        private string _replayHex   = "";
-        private string _replayStatus= "";
+        private string _replayHex    = "";
+        private string _replayStatus = "";
 
-        // ── Rate-limit ────────────────────────────────────────────
-        private int  _rlCount  = 100;
-        private int  _rlMs     = 1000;
-        private bool _rlRunning= false;
+        private int  _rlCount   = 100;
+        private int  _rlMs      = 1000;
+        private bool _rlRunning = false;
 
-        // ── PCAP ──────────────────────────────────────────────────
         private string _pcapPath   = "";
         private bool   _pcapActive = false;
 
-        // ── Opcode map ───────────────────────────────────────────
-        private Dictionary<byte, int> _opcodeMap = new();
-        private readonly object        _opLock    = new();
+        private Dictionary<byte, int>    _opcodeMap    = new();
+        private readonly object          _opLock       = new();
         private List<(byte op, int cnt)> _opcodeSorted = new();
         private DateTime _lastOpSort = DateTime.MinValue;
 
-        // ── RTT graph ────────────────────────────────────────────
-        private float[] _rttGraph  = new float[200];
-        private int     _rttHead   = 0;
-        private ulong   _lastSendUs= 0;
-
-        // ── Seq anomaly log ───────────────────────────────────────
-        private int _seqAnomalyCount = 0;
+        private float[] _rttGraph = new float[200];
+        private int     _rttHead  = 0;
 
         public ProtocolLabTab(AppState state, PipeCaptureServer pipe)
         {
             _state = state;
             _pipe  = pipe;
 
-            // Hook packet feed to build opcode map + RTT graph
             pipe.OnPacketReceived += OnPacket;
 
-            // Default pcap path
             _pcapPath = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 "HyForce", "Exports", $"capture_{DateTime.Now:yyyyMMdd_HHmmss}.pcap");
@@ -9426,20 +9822,21 @@ namespace HyForce.Tabs
         {
             if (pkt.RawBytes.Length < 2) return;
 
-            // Opcode map — first byte of decrypted or raw payload
             byte op = pkt.RawBytes[0];
-            lock (_opLock) { _opcodeMap.TryGetValue(op, out int cnt); _opcodeMap[op] = cnt+1; }
+            lock (_opLock) { _opcodeMap.TryGetValue(op, out int cnt); _opcodeMap[op] = cnt + 1; }
 
-            // RTT: track last send timestamp, compute round-trip on recv
-            // Simple approximation: timestamp delta between last C→S and first S→C after it
-            lock (_rttGraph) {
+            lock (_rttGraph)
+            {
                 var timing = _pipe.TimingLog;
-                if (timing.Count >= 2) {
-                    var last = timing[timing.Count-1];
-                    var prev = timing[timing.Count-2];
-                    if (last.Dir == 1 && prev.Dir == 0 && last.TimestampUs > prev.TimestampUs) {
+                if (timing.Count >= 2)
+                {
+                    var last = timing[timing.Count - 1];
+                    var prev = timing[timing.Count - 2];
+                    if (last.Dir == 1 && prev.Dir == 0 && last.TimestampUs > prev.TimestampUs)
+                    {
                         float rtt_ms = (last.TimestampUs - prev.TimestampUs) / 1000f;
-                        if (rtt_ms < 5000) { // sanity cap
+                        if (rtt_ms < 5000)
+                        {
                             _rttGraph[_rttHead % 200] = rtt_ms;
                             _rttHead++;
                         }
@@ -9450,33 +9847,31 @@ namespace HyForce.Tabs
 
         public void Render()
         {
-            ImGui.TextColored(new Vector4(0.4f,0.9f,0.6f,1f), "Protocol Lab  —  Server Security Testing");
+            ImGui.TextColored(new Vector4(0.4f, 0.9f, 0.6f, 1f), "Protocol Lab  -  Server Security Testing");
             ImGui.SameLine();
             bool live = _pipe.DllConnected;
-            ImGui.TextColored(live ? new Vector4(0.1f,1f,0.4f,1f) : new Vector4(0.7f,0.3f,0.3f,1f),
+            ImGui.TextColored(
+                live ? new Vector4(0.1f, 1f, 0.4f, 1f) : new Vector4(0.7f, 0.3f, 0.3f, 1f),
                 live ? "● DLL Live" : "○ DLL not connected (inject first)");
             ImGui.Separator();
 
             if (ImGui.BeginTabBar("##plab"))
             {
-                if (ImGui.BeginTabItem("Fuzzer"))       { RenderFuzzer();    ImGui.EndTabItem(); }
-                if (ImGui.BeginTabItem("Replay"))       { RenderReplay();    ImGui.EndTabItem(); }
-                if (ImGui.BeginTabItem("Rate Limit"))   { RenderRateLimit(); ImGui.EndTabItem(); }
-                if (ImGui.BeginTabItem("PCAP Export"))  { RenderPcap();      ImGui.EndTabItem(); }
-                if (ImGui.BeginTabItem("Seq Tracker"))  { RenderSeq();       ImGui.EndTabItem(); }
-                if (ImGui.BeginTabItem("Opcode Map"))   { RenderOpcodeMap(); ImGui.EndTabItem(); }
-                if (ImGui.BeginTabItem("RTT / Timing")) { RenderTiming();    ImGui.EndTabItem(); }
+                if (ImGui.BeginTabItem("Fuzzer"))      { RenderFuzzer();    ImGui.EndTabItem(); }
+                if (ImGui.BeginTabItem("Replay"))      { RenderReplay();    ImGui.EndTabItem(); }
+                if (ImGui.BeginTabItem("Rate Limit"))  { RenderRateLimit(); ImGui.EndTabItem(); }
+                if (ImGui.BeginTabItem("PCAP Export")) { RenderPcap();      ImGui.EndTabItem(); }
+                if (ImGui.BeginTabItem("Seq Tracker")) { RenderSeq();       ImGui.EndTabItem(); }
+                if (ImGui.BeginTabItem("Opcode Map"))  { RenderOpcodeMap(); ImGui.EndTabItem(); }
+                if (ImGui.BeginTabItem("RTT / Timing")){ RenderTiming();    ImGui.EndTabItem(); }
                 ImGui.EndTabBar();
             }
         }
 
-        // ─── Fuzzer ───────────────────────────────────────────────
         private void RenderFuzzer()
         {
-            ImGui.TextColored(new Vector4(0.9f,0.7f,0.2f,1f), "Packet Fuzzer");
-            ImGui.TextWrapped("Flips random bits in the NEXT outgoing C→S packet, then sends it. " +
-                "Observe whether the server disconnects you, sends an error opcode, or accepts it silently " +
-                "(silent acceptance = missing validation).");
+            ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1f), "Packet Fuzzer");
+            ImGui.TextWrapped("Flips random bits in the NEXT outgoing C->S packet, then sends it. Observe whether the server disconnects, sends an error opcode, or accepts it silently (silent acceptance = missing validation).");
             ImGui.Spacing();
 
             ImGui.SetNextItemWidth(200);
@@ -9488,33 +9883,29 @@ namespace HyForce.Tabs
                 _fuzzResult = $"Armed: next outgoing packet will have {_fuzzBits} random bit(s) flipped.";
             }
             if (!string.IsNullOrEmpty(_fuzzResult))
-                ImGui.TextColored(new Vector4(0.9f,0.8f,0.2f,1f), _fuzzResult);
+                ImGui.TextColored(new Vector4(0.9f, 0.8f, 0.2f, 1f), _fuzzResult);
 
             ImGui.Spacing();
-            ImGui.TextColored(new Vector4(0.6f,0.6f,0.6f,1f),
-                "What to look for:\n" +
-                "  - Kicked / disconnected  →  server validates packet integrity\n" +
-                "  - Graceful error reply   →  server has error handling\n" +
-                "  - Nothing happens        →  server silently drops bad packets (good)\n" +
-                "  - Server crashes / hangs →  potential DoS vulnerability (report this!)");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "What to look for:");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  - Kicked / disconnected  ->  server validates packet integrity");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  - Graceful error reply   ->  server has error handling");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  - Nothing happens        ->  server silently drops bad packets (good)");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  - Server crashes / hangs ->  potential DoS vulnerability (report this!)");
         }
 
-        // ─── Replay ───────────────────────────────────────────────
         private void RenderReplay()
         {
-            ImGui.TextColored(new Vector4(0.9f,0.7f,0.2f,1f), "Packet Replay");
-            ImGui.TextWrapped("Resend a previously captured packet verbatim, or inject custom hex bytes. " +
-                "Tests replay-attack resistance and idempotency.");
+            ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1f), "Packet Replay");
+            ImGui.TextWrapped("Resend a previously captured packet verbatim, or inject custom hex bytes. Tests replay-attack resistance and idempotency.");
             ImGui.Spacing();
 
-            if (ImGui.Button("Replay Last C→S Packet"))
+            if (ImGui.Button("Replay Last C->S Packet"))
             {
                 _pipe.Replay();
                 _replayStatus = $"Replay command sent at {DateTime.Now:HH:mm:ss.fff}";
             }
             ImGui.SameLine();
-            ImGui.TextColored(new Vector4(0.6f,0.6f,0.6f,1f),
-                "(replays whatever the last client→server packet was)");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "(replays whatever the last client->server packet was)");
 
             ImGui.Spacing();
             ImGui.Separator();
@@ -9526,31 +9917,31 @@ namespace HyForce.Tabs
             ImGui.SameLine();
             if (ImGui.Button("Send##rhex"))
             {
-                string clean = _replayHex.Replace(" ","").Replace("\n","").Trim();
-                if (clean.Length > 0 && clean.Length % 2 == 0) {
-                    _pipe.ReplayHex(clean);
-                    _replayStatus = $"Sent {clean.Length/2}B custom packet.";
-                } else {
+                string clean = _replayHex.Replace(" ", "").Trim();
+                if (clean.Length > 0 && clean.Length % 2 == 0)
+                {
+                    _pipe.PktForge(clean);
+                    _replayStatus = $"Sent {clean.Length / 2}B custom packet.";
+                }
+                else
+                {
                     _replayStatus = "Bad hex (needs even number of hex chars, no spaces)";
                 }
             }
             if (!string.IsNullOrEmpty(_replayStatus))
-                ImGui.TextColored(new Vector4(0.2f,1f,0.5f,1f), _replayStatus);
+                ImGui.TextColored(new Vector4(0.2f, 1f, 0.5f, 1f), _replayStatus);
 
             ImGui.Spacing();
-            ImGui.TextColored(new Vector4(0.6f,0.6f,0.6f,1f),
-                "What to look for:\n" +
-                "  - Replay accepted = no replay protection (e.g. duplicate item use, duplicate purchase)\n" +
-                "  - Nonce / sequence rejection = server has replay protection\n" +
-                "  - Crash on custom hex = unsafe deserialization / missing length check");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "What to look for:");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  - Replay accepted = no replay protection (e.g. duplicate item use, duplicate purchase)");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  - Nonce / sequence rejection = server has replay protection");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  - Crash on custom hex = unsafe deserialization / missing length check");
         }
 
-        // ─── Rate Limit ───────────────────────────────────────────
         private void RenderRateLimit()
         {
-            ImGui.TextColored(new Vector4(0.9f,0.7f,0.2f,1f), "Rate-Limit Prober");
-            ImGui.TextWrapped("Floods the last captured C→S packet N times over T milliseconds " +
-                "to find where the server starts dropping, throttling, or kicking.");
+            ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1f), "Rate-Limit Prober");
+            ImGui.TextWrapped("Floods the last captured C->S packet N times over T milliseconds to find where the server starts dropping, throttling, or kicking.");
             ImGui.Spacing();
 
             ImGui.SetNextItemWidth(180);
@@ -9563,8 +9954,8 @@ namespace HyForce.Tabs
             if (_rlRunning) ImGui.BeginDisabled();
             if (ImGui.Button("Run##rl"))
             {
-                _rlCount  = Math.Max(1,  Math.Min(_rlCount, 10000));
-                _rlMs     = Math.Max(10, Math.Min(_rlMs,    60000));
+                _rlCount   = Math.Max(1,  Math.Min(_rlCount, 10000));
+                _rlMs      = Math.Max(10, Math.Min(_rlMs,    60000));
                 _pipe.RateLimit(_rlCount, _rlMs);
                 _rlRunning = true;
             }
@@ -9573,24 +9964,21 @@ namespace HyForce.Tabs
             if (_pipe.LastRateLimitSent > 0)
             {
                 _rlRunning = false;
-                ImGui.TextColored(new Vector4(0.2f,1f,0.5f,1f),
+                ImGui.TextColored(new Vector4(0.2f, 1f, 0.5f, 1f),
                     $"Result: {_pipe.LastRateLimitSent} packets sent over {_pipe.LastRateLimitIntervalMs}ms");
             }
 
             ImGui.Spacing();
-            ImGui.TextColored(new Vector4(0.6f,0.6f,0.6f,1f),
-                "Recommended test sequence:\n" +
-                "  10/1000ms → 50/1000ms → 100/1000ms → 500/1000ms\n" +
-                "  Watch the log for disconnects or error packets coming back.\n" +
-                "  Also watch server CPU via task manager if you have server access.");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Recommended test sequence:");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  10/1000ms -> 50/1000ms -> 100/1000ms -> 500/1000ms");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  Watch the log for disconnects or error packets coming back.");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "  Also watch server CPU via task manager if you have server access.");
         }
 
-        // ─── PCAP Export ──────────────────────────────────────────
         private void RenderPcap()
         {
-            ImGui.TextColored(new Vector4(0.9f,0.7f,0.2f,1f), "PCAP Export");
-            ImGui.TextWrapped("Write all captured UDP traffic to a .pcap file. " +
-                "Open in Wireshark for deep protocol analysis with its QUIC dissector.");
+            ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1f), "PCAP Export");
+            ImGui.TextWrapped("Write all captured UDP traffic to a .pcap file. Open in Wireshark for deep protocol analysis with its QUIC dissector.");
             ImGui.Spacing();
 
             ImGui.SetNextItemWidth(500);
@@ -9599,7 +9987,7 @@ namespace HyForce.Tabs
 
             if (!_pcapActive)
             {
-                if (ImGui.Button("  Start Recording  ", new Vector2(160,32)))
+                if (ImGui.Button("  Start Recording  ", new Vector2(160, 32)))
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(_pcapPath) ?? ".");
                     _pipe.StartPcap(_pcapPath);
@@ -9608,25 +9996,24 @@ namespace HyForce.Tabs
             }
             else
             {
-                ImGui.TextColored(new Vector4(0.1f,1f,0.4f,1f), "● Recording…");
+                ImGui.TextColored(new Vector4(0.1f, 1f, 0.4f, 1f), "● Recording...");
                 ImGui.SameLine();
                 if (ImGui.Button("Stop Recording"))
-                { _pipe.StopPcap(); _pcapActive = false; }
+                {
+                    _pipe.StopPcap();
+                    _pcapActive = false;
+                }
             }
 
             ImGui.Spacing();
-            ImGui.TextColored(new Vector4(0.6f,0.6f,0.6f,1f),
-                "In Wireshark: Edit → Preferences → Protocols → QUIC\n" +
-                "Add your SSLKEYLOGFILE path under 'TLS key log file' to decrypt inline.");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "In Wireshark: Edit -> Preferences -> Protocols -> QUIC");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Add your SSLKEYLOGFILE path under 'TLS key log file' to decrypt inline.");
         }
 
-        // ─── Sequence Tracker ─────────────────────────────────────
         private void RenderSeq()
         {
-            ImGui.TextColored(new Vector4(0.9f,0.7f,0.2f,1f), "QUIC Sequence Number Tracker");
-            ImGui.TextWrapped("QUIC packet numbers must be strictly monotonically increasing. " +
-                "Non-monotonic or duplicate packet numbers indicate a client-side bug or " +
-                "a server that doesn't properly reject replayed/reordered packets.");
+            ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1f), "QUIC Sequence Number Tracker");
+            ImGui.TextWrapped("QUIC packet numbers must be strictly monotonically increasing. Non-monotonic or duplicate packet numbers indicate a client-side bug or a server that does not properly reject replayed/reordered packets.");
             ImGui.Spacing();
 
             lock (_pipe.SeqAnomalies)
@@ -9638,37 +10025,39 @@ namespace HyForce.Tabs
                 ImGui.SameLine();
                 if (ImGui.SmallButton("Reset tracker")) _pipe.SeqReset();
 
-                if (count == 0) {
-                    ImGui.TextColored(new Vector4(0.2f,1f,0.4f,1f), "No anomalies — sequence numbers look clean.");
-                } else {
+                if (count == 0)
+                {
+                    ImGui.TextColored(new Vector4(0.2f, 1f, 0.4f, 1f), "No anomalies - sequence numbers look clean.");
+                }
+                else
+                {
                     ImGui.BeginChild("##seqlog", new Vector2(-1, -1), ImGuiChildFlags.Borders);
                     foreach (var a in _pipe.SeqAnomalies.TakeLast(200))
-                        ImGui.TextColored(new Vector4(1f,0.4f,0.2f,1f), a);
+                        ImGui.TextColored(new Vector4(1f, 0.4f, 0.2f, 1f), a);
                     ImGui.EndChild();
                 }
             }
         }
 
-        // ─── Opcode Map ───────────────────────────────────────────
         private void RenderOpcodeMap()
         {
-            ImGui.TextColored(new Vector4(0.9f,0.7f,0.2f,1f), "Opcode / Message-Type Map");
-            ImGui.TextWrapped("Catalogues unique first-byte values seen in captured packets. " +
-                "After decryption works, this maps the server's message type space.");
+            ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1f), "Opcode / Message-Type Map");
+            ImGui.TextWrapped("Catalogues unique first-byte values seen in captured packets. After decryption works, this maps the server's message type space.");
             ImGui.Spacing();
 
-            if ((DateTime.Now - _lastOpSort).TotalSeconds > 1) {
-                lock (_opLock) {
-                    _opcodeSorted = _opcodeMap.Select(kv=>(kv.Key,kv.Value))
-                        .OrderByDescending(x=>x.Value).ToList();
+            if ((DateTime.Now - _lastOpSort).TotalSeconds > 1)
+            {
+                lock (_opLock)
+                {
+                    _opcodeSorted = _opcodeMap.Select(kv => (kv.Key, kv.Value))
+                        .OrderByDescending(x => x.Value).ToList();
                 }
                 _lastOpSort = DateTime.Now;
             }
 
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Clear##op")) { lock(_opLock) _opcodeMap.Clear(); }
-
             ImGui.Text($"Unique first-bytes seen: {_opcodeSorted.Count}");
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Clear##op")) { lock (_opLock) _opcodeMap.Clear(); }
             ImGui.Separator();
 
             if (ImGui.BeginTable("##opmap", 3, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
@@ -9682,35 +10071,30 @@ namespace HyForce.Tabs
                 foreach (var (op, cnt) in _opcodeSorted.Take(64))
                 {
                     ImGui.TableNextRow();
-                    ImGui.TableSetColumnIndex(0);
-                    ImGui.Text($"0x{op:X2}  ({op})");
-                    ImGui.TableSetColumnIndex(1);
-                    ImGui.Text($"{cnt}");
+                    ImGui.TableSetColumnIndex(0); ImGui.Text($"0x{op:X2}  ({op})");
+                    ImGui.TableSetColumnIndex(1); ImGui.Text($"{cnt}");
                     ImGui.TableSetColumnIndex(2);
-                    float frac = maxCount > 0 ? (float)cnt/maxCount : 0;
+                    float frac = maxCount > 0 ? (float)cnt / maxCount : 0;
                     ImGui.ProgressBar(frac, new Vector2(-1, 0), "");
                 }
                 ImGui.EndTable();
             }
         }
 
-        // ─── RTT / Timing ─────────────────────────────────────────
         private void RenderTiming()
         {
-            ImGui.TextColored(new Vector4(0.9f,0.7f,0.2f,1f), "RTT / Timing Analysis");
-            ImGui.TextWrapped("Approximate round-trip times from C→S send to next S→C receive. " +
-                "Useful as baseline — large spikes during rate-limit tests indicate server load.");
+            ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1f), "RTT / Timing Analysis");
+            ImGui.TextWrapped("Approximate round-trip times from C->S send to next S->C receive. Useful as baseline - large spikes during rate-limit tests indicate server load.");
             ImGui.Spacing();
 
-            // Build a display array
             float[] disp = new float[200];
-            for (int i=0; i<200; i++)
+            for (int i = 0; i < 200; i++)
                 disp[i] = _rttGraph[((_rttHead - 200 + i) % 200 + 200) % 200];
 
             float maxV = disp.Length > 0 ? disp.Max() : 1f;
             if (maxV < 1f) maxV = 1f;
 
-            ImGui.PlotLines("##rtt", ref disp[0], 200, 0, $"RTT (ms) — max {maxV:F1}ms",
+            ImGui.PlotLines("##rtt", ref disp[0], 200, 0, $"RTT (ms) - max {maxV:F1}ms",
                 0f, maxV * 1.2f, new Vector2(-1, 120));
 
             ImGui.Spacing();
@@ -9721,12 +10105,12 @@ namespace HyForce.Tabs
                 ImGui.Text($"Total timing entries: {timing.Count}");
                 if (timing.Count > 2)
                 {
-                    var cs  = timing.Where(t=>t.Dir==0).ToList();
-                    var sc  = timing.Where(t=>t.Dir==1).ToList();
-                    float avgCs = cs.Count > 0 ? (float)cs.Average(t=>t.Length) : 0;
-                    float avgSc = sc.Count > 0 ? (float)sc.Average(t=>t.Length) : 0;
-                    ImGui.Text($"Avg C→S size: {avgCs:F0} bytes   Avg S→C size: {avgSc:F0} bytes");
-                    ImGui.Text($"C→S packets: {cs.Count}   S→C packets: {sc.Count}");
+                    var cs  = timing.Where(t => t.Dir == 0).ToList();
+                    var sc  = timing.Where(t => t.Dir == 1).ToList();
+                    float avgCs = cs.Count > 0 ? (float)cs.Average(t => t.Length) : 0;
+                    float avgSc = sc.Count > 0 ? (float)sc.Average(t => t.Length) : 0;
+                    ImGui.Text($"Avg C->S size: {avgCs:F0} bytes   Avg S->C size: {avgSc:F0} bytes");
+                    ImGui.Text($"C->S packets: {cs.Count}   S->C packets: {sc.Count}");
                 }
                 if (ImGui.SmallButton("Export Timing CSV"))
                     ExportTimingCsv(timing);
@@ -9735,17 +10119,19 @@ namespace HyForce.Tabs
 
         private void ExportTimingCsv(List<TimingEntry> entries)
         {
-            try {
+            try
+            {
                 string path = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "HyForce","Exports",$"timing_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+                    "HyForce", "Exports", $"timing_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 var sb = new StringBuilder("timestamp_us,length,direction\n");
                 foreach (var e in entries)
-                    sb.AppendLine($"{e.TimestampUs},{e.Length},{(e.Dir==0?"C->S":"S->C")}");
+                    sb.AppendLine($"{e.TimestampUs},{e.Length},{(e.Dir == 0 ? "C->S" : "S->C")}");
                 File.WriteAllText(path, sb.ToString());
                 _state.AddInGameLog($"[LAB] Timing CSV: {path}");
-            } catch (Exception ex) { _state.AddInGameLog($"[LAB] CSV export failed: {ex.Message}"); }
+            }
+            catch (Exception ex) { _state.AddInGameLog($"[LAB] CSV export failed: {ex.Message}"); }
         }
     }
 }
