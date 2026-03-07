@@ -139,7 +139,7 @@ static uint64_t g_seq_cs = UINT64_MAX;
 static uint64_t g_seq_sc = UINT64_MAX;
 
 static volatile LONG g_fires_wsa_send = 0, g_fires_send = 0;
-static volatile LONG g_fires_wsa_recv = 0, g_fires_recv = 0;
+static volatile LONG g_fires_wsa_recv = 0, g_fires_wsa_recv2 = 0, g_fires_recv = 0;
 static volatile LONG g_pkts_captured = 0;
 
 static volatile uint64_t g_watch_addr = 0;
@@ -250,6 +250,7 @@ static CRITICAL_SECTION g_ovl_cs;
 /* Hook function-pointer types */
 typedef int (WSAAPI* WSASendTo_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const struct sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef int (WSAAPI* WSARecvFrom_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, struct sockaddr*, LPINT, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+typedef int (WSAAPI* WSARecv_t)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef int (WSAAPI* sendto_t)(SOCKET, const char*, int, int, const struct sockaddr*, int);
 typedef int (WSAAPI* recvfrom_t)(SOCKET, char*, int, int, struct sockaddr*, int*);
 typedef BOOL(WINAPI* GQCS_t)(HANDLE, LPDWORD, PULONG_PTR, LPOVERLAPPED*, DWORD);
@@ -267,6 +268,7 @@ typedef intptr_t (*quiche_stream_send_t)(void*, uint64_t, const uint8_t*, size_t
 
 static WSASendTo_t   orig_WSASendTo = NULL;
 static WSARecvFrom_t orig_WSARecvFrom = NULL;
+static WSARecv_t     orig_WSARecv    = NULL;
 static sendto_t      orig_sendto = NULL;
 static recvfrom_t    orig_recvfrom = NULL;
 static GQCS_t        orig_GQCS = NULL;
@@ -280,7 +282,7 @@ static ssl_read_fn_t  orig_ssl_read  = NULL;
 static quiche_stream_recv_t orig_quiche_recv = NULL;
 static quiche_stream_send_t orig_quiche_send = NULL;
 
-static BYTE sv_wsa_send[14], sv_wsa_recv[14], sv_send[14], sv_recv[14], sv_gqcs[14];
+static BYTE sv_wsa_send[14], sv_wsa_recv[14], sv_wsa_recv2[14], sv_send[14], sv_recv[14], sv_gqcs[14];
 /* New v10 saved bytes */
 static BYTE sv_wsa_send_nb[14], sv_send_nb[14];
 static BYTE sv_ssl_write[14], sv_ssl_read[14];
@@ -626,15 +628,21 @@ static int is_hytale_port(uint16_t port_be) {
 static void forward(uint8_t dir, const uint8_t* data, int dlen, uint32_t ip, uint16_t port) {
     if (dlen <= 0 || dlen > MAX_PKT) return;
 
-    /* Learn server IP from first S2C packet so we can match C2S by IP */
-    if (dir == 1 && ip != 0 && g_server_ip == 0) {
+    /* Learn server IP from ANY packet with known IP on Hytale port */
+    if (ip != 0 && g_server_ip == 0 && is_hytale_port(port)) {
         InterlockedExchange((LONG*)&g_server_ip, (LONG)ip);
-        /* Also seed replay IP so pktforge works immediately */
         EnterCriticalSection(&g_replay_cs);
         if (g_last_cs_ip == 0) g_last_cs_ip = ip;
         LeaveCriticalSection(&g_replay_cs);
-        pipe_log("[HOOK] Server IP: %u.%u.%u.%u port %u",
+        pipe_log("[HOOK] Server IP learned (dir=%u): %u.%u.%u.%u port %u", dir,
             ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF, ntohs(port));
+    }
+    /* Also store C2S server IP even after first S2C: update replay IP */
+    if (dir == 1 && ip != 0 && g_server_ip == 0) {
+        InterlockedExchange((LONG*)&g_server_ip, (LONG)ip);
+        EnterCriticalSection(&g_replay_cs);
+        if (g_last_cs_ip == 0) g_last_cs_ip = ip;
+        LeaveCriticalSection(&g_replay_cs);
     }
 
     /* Pass if port is in Hytale range OR if IP matches known server */
@@ -647,6 +655,11 @@ static void forward(uint8_t dir, const uint8_t* data, int dlen, uint32_t ip, uin
         LeaveCriticalSection(&g_replay_cs);
         if ((sip && ip == sip) || (rip && ip == rip)) pass = 1;
     }
+    /* QUIC fallback: packet with unknown IP — pass if QUIC fixed bit set (0x40 always set in QUIC).
+       Applies to BOTH directions: C2S connected sockets lose IP, S2C IOCP recv fills peer AFTER
+       GQCS completion so ovl_register captures zeros. Both cases arrive here with ip=0. */
+    if (!pass && ip == 0 && dlen >= 21 && (data[0] & 0x40) != 0)
+        pass = 1;
     if (!pass) return;
 
     InterlockedIncrement(&g_pkts_captured);
@@ -688,6 +701,8 @@ static void ovl_register(LPOVERLAPPED ov, char* buf, int bufsz, struct sockaddr_
             g_ovl[i].ov = ov; g_ovl[i].buf = buf; g_ovl[i].bufsz = bufsz;
             if (peer) memcpy(&g_ovl[i].peer, peer, sizeof(struct sockaddr_in));
             else     memset(&g_ovl[i].peer, 0, sizeof(struct sockaddr_in));
+            g_ovl[i].peer_ptr = peer;  /* OS fills this buffer after GQCS fires */
+            g_ovl[i].peer_len = NULL;
             g_ovl[i].used = 1; break;
         }
     }
@@ -702,11 +717,17 @@ static void ovl_fire(LPOVERLAPPED ov, DWORD bytes) {
         if (g_ovl[i].used && g_ovl[i].ov == ov) {
             char* buf = g_ovl[i].buf; int bufsz = g_ovl[i].bufsz;
             struct sockaddr_in peer = g_ovl[i].peer;
+            struct sockaddr_in* peer_ptr = g_ovl[i].peer_ptr; /* live ptr filled by OS */
             g_ovl[i].used = 0;
             LeaveCriticalSection(&g_ovl_cs);
             if (buf && bytes > 0 && bytes <= (DWORD)bufsz) {
                 uint32_t ip = peer.sin_addr.s_addr;
                 uint16_t port = peer.sin_port;
+                /* After GQCS completes the OS has filled peer_ptr — prefer it over stale copy */
+                if (peer_ptr && peer_ptr->sin_family == AF_INET && peer_ptr->sin_addr.s_addr != 0) {
+                    ip   = peer_ptr->sin_addr.s_addr;
+                    port = peer_ptr->sin_port;
+                }
                 forward(1, (uint8_t*)buf, (int)bytes, ip, port);
             }
             return;
@@ -797,6 +818,18 @@ static int WSAAPI hook_WSARecvFrom(SOCKET s, LPWSABUF bufs, DWORD nb, LPDWORD re
         if (from && fromlen && *fromlen >= (int)sizeof(struct sockaddr_in))
             memcpy(&tmp_peer, from, sizeof(struct sockaddr_in));
         ovl_register(ov, bufs[0].buf, (int)bufs[0].len, &tmp_peer);
+        /* Patch: also store the live `from` pointer so ovl_fire can read it post-completion */
+        {
+            EnterCriticalSection(&g_ovl_cs);
+            int oi;
+            for (oi = 0; oi < MAX_OVL; oi++) {
+                if (g_ovl[oi].used && g_ovl[oi].ov == ov) {
+                    g_ovl[oi].peer_ptr = (struct sockaddr_in*)from;
+                    break;
+                }
+            }
+            LeaveCriticalSection(&g_ovl_cs);
+        }
     }
     int ret = orig_WSARecvFrom(s, bufs, nb, recvd, flags, from, fromlen, ov, cb);
     EnterCriticalSection(&g_cs); jmp_write(orig_WSARecvFrom, (void*)hook_WSARecvFrom); LeaveCriticalSection(&g_cs);
@@ -899,8 +932,7 @@ static int WSAAPI hook_WSASend_nb(SOCKET s, LPWSABUF bufs, DWORD nb, LPDWORD sen
             }
         }
         if (ip == 0) ip = g_server_ip; /* best guess */
-        if (ip != 0)
-            forward(0, (uint8_t*)bufs[0].buf, (int)bufs[0].len, ip, port);
+        forward(0, (uint8_t*)bufs[0].buf, (int)bufs[0].len, ip, port); /* always try */
     }
     LeaveHook(); return ret;
 }
@@ -926,8 +958,7 @@ static int WSAAPI hook_send_nb(SOCKET s, const char* buf, int len, int flags)
             }
         }
         if (ip == 0) ip = g_server_ip;
-        if (ip != 0)
-            forward(0, (uint8_t*)buf, ret, ip, port);
+        forward(0, (uint8_t*)buf, ret, ip, port); /* always try */
     }
     LeaveHook(); return ret;
 }
@@ -1045,7 +1076,7 @@ static void probe_quiche(void) {
      • Velocity extended to ±500 m/s  (mounted/falling)
      • Broad scan mode: skips velocity check entirely             */
 static int is_coord(double v) { return !isnan(v) && !isinf(v) && v > -10000000.0 && v < 10000000.0; }
-static int is_health(float h) { return !isnan(h) && !isinf(h) && h > 0.0f && h <= 1000000.0f; }
+static int is_health(float h) { return !isnan(h) && !isinf(h) && h >= 1.0f && h <= 500000.0f; }
 static int is_vel(float v)    { return !isnan(v) && !isinf(v) && v > -500.0f && v < 500.0f; }
 
 /* Send a 76-byte memscan hit payload: [u64 addr][u32 dataSize][bytes] */
@@ -1657,7 +1688,7 @@ static DWORD WINAPI cmd_thread(LPVOID _) {
             else if (!strcmp(buf, "SEQRESET")) { g_seq_cs = g_seq_sc = UINT64_MAX; }
             else if (!strcmp(buf, "QUICHEPROBE")) probe_quiche(); /* v10 */
             else if (!strcmp(buf, "STATS"))
-                pipe_log("[STATS] WSASendTo:%ld sendto:%ld WSARecvFrom:%ld recvfrom:%ld pkts:%ld",
+                pipe_log("[STATS] WSASendTo:%ld sendto:%ld WSARecvFrom:%ld WSARecv:%ld recvfrom:%ld pkts:%ld",
                     g_fires_wsa_send, g_fires_send, g_fires_wsa_recv, g_fires_recv, g_pkts_captured);
             else if (!strcmp(buf, "KEYLOG_FLUSH")) {
                 EnterCriticalSection(&g_kcs);
@@ -1908,12 +1939,14 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         /* Get original function addresses */
         orig_WSASendTo = (WSASendTo_t)GetProcAddress(ws2, "WSASendTo");
         orig_WSARecvFrom = (WSARecvFrom_t)GetProcAddress(ws2, "WSARecvFrom");
+        orig_WSARecv     = (WSARecv_t)GetProcAddress(ws2, "WSARecv");
         orig_sendto = (sendto_t)GetProcAddress(ws2, "sendto");
         orig_recvfrom = (recvfrom_t)GetProcAddress(ws2, "recvfrom");
 
         /* Install hooks */
         if (orig_WSASendTo) { memcpy(sv_wsa_send, orig_WSASendTo, 14); jmp_write(orig_WSASendTo, (void*)hook_WSASendTo); }
         if (orig_WSARecvFrom) { memcpy(sv_wsa_recv, orig_WSARecvFrom, 14); jmp_write(orig_WSARecvFrom, (void*)hook_WSARecvFrom); }
+        if (orig_WSARecv)     { memcpy(sv_wsa_recv2, orig_WSARecv, 14); jmp_write(orig_WSARecv, (void*)hook_WSARecv); }
         if (orig_sendto) { memcpy(sv_send, orig_sendto, 14); jmp_write(orig_sendto, (void*)hook_sendto); }
         if (orig_recvfrom) { memcpy(sv_recv, orig_recvfrom, 14); jmp_write(orig_recvfrom, (void*)hook_recvfrom); }
 
@@ -1950,6 +1983,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         /* Restore hooks */
         if (orig_WSASendTo)   jmp_restore(orig_WSASendTo, sv_wsa_send);
         if (orig_WSARecvFrom) jmp_restore(orig_WSARecvFrom, sv_wsa_recv);
+    if (orig_WSARecv)     jmp_restore(orig_WSARecv, sv_wsa_recv2);
         if (orig_sendto)      jmp_restore(orig_sendto, sv_send);
         if (orig_recvfrom)    jmp_restore(orig_recvfrom, sv_recv);
         if (orig_GQCS)        jmp_restore(orig_GQCS, sv_gqcs);
