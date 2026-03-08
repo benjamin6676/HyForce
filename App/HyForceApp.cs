@@ -70,6 +70,9 @@ namespace HyForce.App
             _pipeServer.OnPacketReceived += pkt => _state.OnHookPacket(pkt);
             _pipeServer.Start();
 
+            // v16: wire QUIC stream bytes to entity/inventory trackers
+            _state.ConnectStreamRouting(_pipeServer);
+
             // WinDivert auto-start check: if DLL shows 0 packets after 30s
             _winDivertCheckAt = DateTime.Now.AddSeconds(30);
 
@@ -78,11 +81,38 @@ namespace HyForce.App
             _tabs.Add(new DecryptionTab(_state));
             _toggleMgr = new HyForce.Core.MemoryToggleManager(_pipeServer, _state);
             var togglesTab    = new MemoryTogglesTab(_state, _pipeServer, _toggleMgr);
-            var valueToggleTab = new ValueToggleTab(_state, _pipeServer);   // v11 modular system
+            var valueToggleTab = new ValueToggleTab(_state, _pipeServer);
             _tabs.Add(new MemoryResearchTab(_state, _pipeServer));
             _tabs.Add(togglesTab);
             _tabs.Add(valueToggleTab);
             _tabs.Add(new ProtocolLabTab(_state, _pipeServer));
+            // ── v16/v17 bypass & extraction tabs ────────────────────────
+            _tabs.Add(new QuicBypassTab(_state, _pipeServer));
+            _tabs.Add(new RadarTab(_state, _pipeServer));
+            _tabs.Add(new EntityTrackerTab(_state.EntityTracker, _pipeServer));
+            _tabs.Add(new EntityPropertyTab(_state, _pipeServer));
+            _tabs.Add(new PlayerListTab(_state, _pipeServer));
+            _tabs.Add(new InventoryDumperTab(_state.InventoryTracker, _pipeServer));
+            _tabs.Add(new TeleportTab(_state, _pipeServer));
+            _tabs.Add(new HeartbeatTab(_state, _pipeServer));
+            _tabs.Add(new InteractionForgeTab(_state, _pipeServer));
+            _tabs.Add(new BlockForgeTab(_state, _pipeServer));
+            _tabs.Add(new PacketLabTab(_state, _pipeServer));
+            _tabs.Add(new PacketRecorderTab(_state, _pipeServer));
+            _tabs.Add(new OpcodeScannerTab(_state, _pipeServer));
+            _tabs.Add(new PermissionTab(_state, _pipeServer));
+            _tabs.Add(new PermissionEscalatorTab(_state, _pipeServer));
+            _tabs.Add(new TokenAnalysisTab(_state, _pipeServer));
+            _tabs.Add(new ChatTab(_state, _pipeServer));
+            _tabs.Add(new TradeTab(_state, _pipeServer));
+            _tabs.Add(new ItemFuzzerTab(_state, _pipeServer));
+            _tabs.Add(new ItemDuperTab(_state, _pipeServer));
+            _tabs.Add(new ItemManagerTab(_state, _pipeServer));
+            _tabs.Add(new InventorySnapshotTab(_state, _pipeServer));
+            _tabs.Add(new WaypointTab(_state, _pipeServer));
+            _tabs.Add(new ScriptTab(_state, _pipeServer));
+            _tabs.Add(new ChunkMapTab(_state, _pipeServer));
+            // ── Audit & debug ────────────────────────────────────────
             _tabs.Add(new SecurityAuditTab(_state, _pipeServer));
             _tabs.Add(new InjectionTab(_state, _pipeServer));
             _tabs.Add(new LogTab(_state));

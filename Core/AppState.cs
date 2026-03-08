@@ -1,6 +1,7 @@
 // FILE: Core/AppState.cs - FIXED: Removed duplicate TryAutoDecryptPackets
 using HyForce.Data;
 using HyForce.Networking;
+using HyForce.Protocol;
 using Serilog;
 using System.Security.Cryptography;
 using static HyForce.PacketDecryptor;
@@ -53,6 +54,31 @@ public class AppState : IDisposable
     public event Action? OnMemoryDataUpdated;
     public event Action? OnKeysUpdated;
 
+    // ── v16/v17 plaintext bypass trackers ────────────────────────────────
+    public EntityTracker    EntityTracker    { get; } = new EntityTracker();
+    public InventoryTracker InventoryTracker { get; } = new InventoryTracker();
+    public PlayerTracker    PlayerTracker    { get; } = new PlayerTracker();
+    public SessionCapture   SessionCapture   { get; } = new SessionCapture();
+    public ItemFuzzer       ItemFuzzer       { get; }
+
+    // ── v18 new trackers ─────────────────────────────────────────────────
+    public PacketRecorder   PacketRecorder   { get; } = new PacketRecorder();
+    public ChunkAccumulator ChunkAccumulator { get; } = new ChunkAccumulator();
+    public TradeCapture     TradeCapture     { get; } = new TradeCapture();
+
+    // ── v19 new systems ───────────────────────────────────────────────────
+    public EntityPropertyScanner EntityPropertyScanner { get; } = new EntityPropertyScanner();
+    public TimeWeatherController TimeWeatherController  { get; } = new TimeWeatherController();
+    public TokenAnalyzer         TokenAnalyzer          { get; } = new TokenAnalyzer();
+
+    // ── v20 new systems ───────────────────────────────────────────────────
+    public PermissionEscalator   PermissionEscalator   { get; } = new PermissionEscalator();
+    public ItemDuplicator        ItemDuplicator        { get; } = new ItemDuplicator();
+    public OpcodeScanner         OpcodeScanner         { get; } = new OpcodeScanner();
+    public WaypointSystem        WaypointSystem        { get; } = new WaypointSystem();
+    public ScriptEngine          ScriptEngine          { get; } = new ScriptEngine();
+    public InventorySnapshot     InventorySnapshot     { get; } = new InventorySnapshot();
+
     private System.Timers.Timer? _autoDecryptTimer;
     private FileSystemWatcher? _sslKeyWatcher;
     private DateTime _lastKeyLoadTime     = DateTime.MinValue;
@@ -79,6 +105,7 @@ public class AppState : IDisposable
 
     public AppState()
     {
+        ItemFuzzer = new ItemFuzzer(InventoryTracker);
         PacketLog = new PacketLog(10000);
         _packetHandlerDelegate = HandlePacket;
         Directory.CreateDirectory(ExportDirectory);
@@ -91,6 +118,31 @@ public class AppState : IDisposable
         _retryTimer.Start();
         // Permanent key log setup
         InitPermanentKeyLog();
+
+        // ── v16/v17: wire tracker logs to InGameLog ───────────────────────
+        EntityTracker.OnLog    += msg => AddInGameLog(msg);
+        InventoryTracker.OnLog += msg => AddInGameLog(msg);
+        PlayerTracker.OnLog    += msg => AddInGameLog(msg);
+        SessionCapture.OnLog   += msg => AddInGameLog(msg);
+        ItemFuzzer.OnLog       += msg => AddInGameLog(msg);
+        PacketRecorder.OnLog   += msg => AddInGameLog(msg);
+        ChunkAccumulator.OnLog += msg => AddInGameLog(msg);
+        TradeCapture.OnLog     += msg => AddInGameLog(msg);
+        EntityPropertyScanner.OnLog += msg => AddInGameLog(msg);
+        TimeWeatherController.OnLog  += msg => AddInGameLog(msg);
+        TokenAnalyzer.OnLog          += msg => AddInGameLog(msg);
+        PermissionEscalator.OnLog    += msg => AddInGameLog(msg);
+        ItemDuplicator.OnLog         += msg => AddInGameLog(msg);
+        OpcodeScanner.OnLog          += msg => AddInGameLog(msg);
+        WaypointSystem.OnLog         += msg => AddInGameLog(msg);
+        ScriptEngine.OnLog           += msg => AddInGameLog(msg);
+        InventorySnapshot.OnLog      += msg => AddInGameLog(msg);
+
+        // Feed entity updates into PlayerTracker
+        EntityTracker.OnEntityUpdated += e => PlayerTracker.Feed(e);
+
+        // ItemFuzzer send callback — wired later once pipe is available (see ConnectStreamRouting)
+
 
         // Subscribe to background decryption results — background worker fires OnDecrypted
         // when it successfully decrypts a queued packet. Match it back to the PacketLogEntry.
@@ -826,6 +878,132 @@ public class AppState : IDisposable
         lock (InGameLog)
             return InGameLog.TakeLast(count).ToList();
     }
+
+    // ── v16: Route QUIC stream events to protocol parsers ──────────────────
+    public void ConnectStreamRouting(Networking.PipeCaptureServer pipe)
+    {
+        // Wire EntityPropertyScanner.SendPropForge
+        EntityPropertyScanner.SendPropForge = (eid, propId, val) =>
+        {
+            using var ms2 = new System.IO.MemoryStream();
+            using var bw2 = new System.IO.BinaryWriter(ms2);
+            uint flen = (uint)(4 + 8 + 4 + val.Length);
+            bw2.Write(flen); bw2.Write((ushort)0xA6); bw2.Write((ushort)0);
+            bw2.Write(eid); bw2.Write(propId); bw2.Write(val);
+            pipe.ForgeStream(ms2.ToArray());
+        };
+
+        // Wire TimeWeatherController pipe commands
+        TimeWeatherController.SendPipeCommand = cmd => pipe.SendCommand(cmd);
+
+        // Wire PermissionEscalator
+        PermissionEscalator.InjectBit  = bit  => pipe.PermTestBit(bit);
+        PermissionEscalator.InjectMask = mask => pipe.PermInjectMask(mask);
+
+        // Wire ItemDuplicator
+        ItemDuplicator.DupeSlotCmd      = (s,d,c2,r) => pipe.DupeSlot(s,d,c2,r);
+        ItemDuplicator.WindowStealCmd   = (w,c3,p)   => pipe.WindowSteal(w,c3,p);
+        ItemDuplicator.ItemSpamStartCmd = (t,s,c4,d) => pipe.ItemSpamStart(t,s,c4,d);
+        ItemDuplicator.ItemSpamStopCmd  = ()          => pipe.ItemSpamStop();
+
+        // Wire OpcodeScanner
+        OpcodeScanner.SendRaw = raw => pipe.ForgeStream(raw);
+
+        // Wire WaypointSystem
+        WaypointSystem.TeleportTo = (x,y,z) => pipe.Teleport(x,y,z);
+
+        // Wire ScriptEngine
+        ScriptEngine.SendCommand = cmd => pipe.SendCommand(cmd);
+
+        // Wire ItemFuzzer to send via pipe
+        ItemFuzzer.SendPacket = (opcode, payload) =>
+        {
+            using var ms = new System.IO.MemoryStream();
+            using var bw = new System.IO.BinaryWriter(ms);
+            bw.Write((uint)(payload.Length + 4));
+            bw.Write(opcode);
+            bw.Write((ushort)0);
+            bw.Write(payload);
+            pipe.ForgeStream(ms.ToArray());
+        };
+
+        pipe.OnQuicStream += entry =>
+        {
+            bool isS2C = entry.Direction != "C→S";
+            var packets = Protocol.StreamPacketParser.Feed(entry.StreamHandle, entry.Data, isS2C);
+            foreach (var pkt in packets)
+            {
+                switch (pkt.Opcode)
+                {
+                    case 0xA1: // EntityUpdates — feeds both EntityTracker and PlayerTracker
+                        EntityTracker.ProcessPacket(pkt.Payload);
+                        break;
+                    case 0xAA: // UpdatePlayerInventory
+                        InventoryTracker.ProcessInventoryPacket(pkt.Payload);
+                        break;
+                    case 0x28: // UpdateBlockTypes
+                    case 0x2E: // UpdateBlockSets
+                    case 0x2B: // UpdateItemSoundSets
+                        InventoryTracker.ProcessRegistryPacket(pkt.Payload, pkt.Opcode);
+                        InventoryTracker.RelabelSlots();
+                        break;
+                    case 0x02: // AuthToken
+                        SessionCapture.ProcessPacket(pkt.Opcode, pkt.Payload);
+                        TokenAnalyzer.Analyze(pkt.Payload, "AuthToken");
+                        break;
+                    case 0x03: // ConnectAccept
+                        SessionCapture.ProcessPacket(pkt.Opcode, pkt.Payload);
+                        TokenAnalyzer.Analyze(pkt.Payload, "ConnectAccept");
+                        break;
+                    case 0x12: // PlayerSetup
+                        SessionCapture.ProcessPacket(pkt.Opcode, pkt.Payload);
+                        if (SessionCapture.Current != null)
+                        {
+                            PlayerTracker.SetSelfEntityId(SessionCapture.Current.SelfEntityId);
+                            PermissionEscalator.SetOriginalMask(SessionCapture.Current.PermissionMask);
+                        }
+                        break;
+                    case 0xD2: // ChatMessage S2C — log to in-game log
+                        if (isS2C)
+                        {
+                            string msg = System.Text.Encoding.UTF8.GetString(
+                                pkt.Payload, 0, Math.Min(pkt.Payload.Length, 512));
+                            AddInGameLog($"[CHAT] {msg}");
+                            ChatHistory.Add((DateTime.UtcNow, true, msg));
+                            if (ChatHistory.Count > 2000) ChatHistory.RemoveAt(0);
+                        }
+                        break;
+                    case 0x92: // UpdateTime
+                        AddInGameLog($"[TIME] UpdateTime packet  {pkt.Payload.Length}B");
+                        break;
+                    case 0x95: // UpdateWeather
+                        AddInGameLog($"[WEATHER] UpdateWeather packet  {pkt.Payload.Length}B");
+                        break;
+                    case 0x83: // SetChunk
+                    case 0x84: // SetChunkHeightmap
+                        ChunkAccumulator.ProcessChunkPacket(pkt.Payload, pkt.Opcode);
+                        break;
+                    case 0xCB: // SendWindowAction C2S — forward to TradeCapture
+                        if (!isS2C)
+                            TradeCapture.FeedWindowAction(pkt.Payload);
+                        break;
+                }
+                // v20: feed S2C opcodes to scanner + permission escalator
+                if (isS2C)
+                {
+                    OpcodeScanner.ObserveS2C(pkt.Opcode);
+                    PermissionEscalator.ObserveS2COpcode(pkt.Opcode);
+                }
+
+                // Feed every packet to PacketRecorder
+                PacketRecorder.Feed(new RecordedFrame(
+                    DateTime.UtcNow, pkt.Opcode, pkt.Payload, isS2C));
+            }
+        };
+    }
+
+    // Chat history accessible by ChatTab
+    public List<(DateTime Time, bool IsServer, string Text)> ChatHistory { get; } = new();
 
 
     public void AddInGameLog(string message)

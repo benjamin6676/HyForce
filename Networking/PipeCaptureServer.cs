@@ -396,6 +396,8 @@ namespace HyForce.Networking
                     case 0x13: HandleExploitResult(pay); break;
                     case 0x14: HandleProcDump(pay);      break;
                     case 0x15: HandlePlaintext(pay);     break;
+                    case 0x16: HandleQuicStream(pay);    break;  // v16 msquic plaintext
+                    case 0x17: HandleQuicEvent(pay);     break;  // v16 stream lifecycle
                     case 0x1C: HandleMemRead(pay);       break;
                     // Unknown types are silently skipped
                 }
@@ -697,6 +699,132 @@ namespace HyForce.Networking
             _state.AddInGameLog($"[PLAIN] {entry.Direction} {entry.RemoteAddr}  {dLen}B  {entry.HexPreview[..Math.Min(32, entry.HexPreview.Length)]}");
         }
 
+        public readonly List<QuicStreamEntry> QuicStreamPackets = new();
+        public readonly object                QuicStreamLock    = new();
+        public event Action<QuicStreamEntry>? OnQuicStream;
+
+        private void HandleQuicStream(byte[] pay)
+        {
+            // [u8 dir][u64 stream_handle][u32 data_len][data]
+            if (pay.Length < 13) return;
+            byte   dir    = pay[0];
+            ulong  handle = BitConverter.ToUInt64(pay, 1);
+            uint   dLen   = BitConverter.ToUInt32(pay, 9);
+            if (pay.Length < 13 + (int)dLen) return;
+            byte[] data = new byte[dLen];
+            Array.Copy(pay, 13, data, 0, (int)dLen);
+
+            string dirStr = dir == 0xC2 ? "C→S" : dir >= 0xD0 ? $"DUP-{dir & 0x0F}" : "S→C"; // 0x52=S2C, 0xC2=C2S
+            var entry = new QuicStreamEntry
+            {
+                Timestamp   = DateTime.UtcNow,
+                StreamHandle = handle,
+                Direction   = dirStr,
+                Data        = data,
+                HexPreview  = BitConverter.ToString(data, 0, Math.Min(32, data.Length)).Replace("-", " ")
+            };
+
+            lock (QuicStreamLock)
+            {
+                QuicStreamPackets.Add(entry);
+                if (QuicStreamPackets.Count > 5000) QuicStreamPackets.RemoveAt(0);
+            }
+            OnQuicStream?.Invoke(entry);
+            _state.AddInGameLog($"[QUIC-PLAIN] {dirStr} stream=0x{handle:X}  {dLen}B  {entry.HexPreview[..Math.Min(48, entry.HexPreview.Length)]}");
+        }
+
+        private void HandleQuicEvent(byte[] pay)
+        {
+            if (pay.Length < 9) return;
+            byte  evType = pay[0];
+            ulong handle = BitConverter.ToUInt64(pay, 1);
+            _state.AddInGameLog($"[QUIC-EV] stream=0x{handle:X}  ev={evType}");
+        }
+
+        // v16 msquic command helpers
+        public void QuicProbe()                          => SendCommand("QUIC_PROBE");
+        public void QuicListStreams()                    => SendCommand("QUIC_STREAMS");
+        public void QuicSetRaceDelay(int ms)             => SendCommand($"QUIC_RACE {ms}");
+        public void QuicFuzzStream(int bits)             => SendCommand($"QUIC_FUZZ_STREAM {bits}");
+        public void QuicDuplicate(int count)             => SendCommand($"QUIC_DUP {count}");
+        public void QuicDropNext()                       => SendCommand("QUIC_DROP");
+        public void QuicReplayStream()                   => SendCommand("QUIC_REPLAY_STREAM");
+        public void QuicInject(byte[] data)              => SendCommand($"QUIC_INJECT {BitConverter.ToString(data).Replace("-", "").ToLower()}");
+
+        // v16 C2S filter helpers
+        public void QuicDropC2S(uint opcode)             => SendCommand(opcode == 0 ? "QUIC_DROP_C2S 0" : $"QUIC_DROP_C2S {opcode:X4}");
+        public void QuicDupC2S(uint opcode, int count)   => SendCommand(opcode == 0 ? "QUIC_DUP_C2S 0 0" : $"QUIC_DUP_C2S {opcode:X4} {count}");
+        public void QuicC2SLogOn()                       => SendCommand("QUIC_C2S_LOG_ON");
+        public void QuicC2SLogOff()                      => SendCommand("QUIC_C2S_LOG_OFF");
+        public void QuicC2SStats()                       => SendCommand("QUIC_C2S_STATS");
+
+        // v16 position / teleport / interaction forge
+        public void Teleport(float x, float y, float z)      => SendCommand($"TELEPORT {x:G6} {y:G6} {z:G6}");
+        public void PosOverride(float x, float y, float z)   => SendCommand($"POS_OVERRIDE {x:G6} {y:G6} {z:G6}");
+        public void PosOverrideOff()                          => SendCommand("POS_OVERRIDE_OFF");
+        public void SpeedMultiplier(float mul)                => SendCommand($"SPEED_MUL {mul:G6}");
+        public void SpeedMultiplierOff()                      => SendCommand("SPEED_MUL_OFF");
+        public void ForgeStream(byte[] payload)               => SendCommand($"FORGE_STREAM {BitConverter.ToString(payload).Replace("-","").ToLower()}");
+
+        // v17 chat / permission / admin / S2C filter
+        public void SendChat(byte[] utf8Payload)               => SendCommand($"SEND_CHAT {BitConverter.ToString(utf8Payload).Replace("-","").ToLower()}");
+        public void SetGameMode(uint mode)                     => SendCommand($"SET_GAMEMODE {mode}");
+        public void ReplaySetup(byte[] patchedPayload)         => SendCommand($"REPLAY_SETUP {BitConverter.ToString(patchedPayload).Replace("-","").ToLower()}");
+        public void KickEntity(ulong entityId)                 => SendCommand($"KICK_ENTITY {entityId:X16}");
+        public void AdminCmd(ushort opcode, byte[] payload)    => SendCommand($"ADMIN_CMD {opcode:X4} {BitConverter.ToString(payload).Replace("-","").ToLower()}");
+        public void S2CDropOpcode(uint opcode)                 => SendCommand($"S2C_DROP_OPCODE {opcode:X4}");
+
+        // v18
+        public void AutoPongOn()                               => SendCommand("AUTO_PONG_ON");
+        public void AutoPongOff()                              => SendCommand("AUTO_PONG_OFF");
+        public void BlockPlace(int x, int y, int z, uint typeId, uint face = 0) => SendCommand($"BLOCK_PLACE {x} {y} {z} {typeId:X} {face}");
+        public void BlockBreak(int x, int y, int z)            => SendCommand($"BLOCK_BREAK {x} {y} {z}");
+        public void SetEntityProp(ulong eid, uint prop, byte[] val) => SendCommand($"SET_ENTITY_PROP {eid:X16} {prop} {BitConverter.ToString(val).Replace("-","").ToLower()}");
+        public void RecordOn()                                 => SendCommand("RECORD_ON");
+        public void RecordOff()                                => SendCommand("RECORD_OFF");
+        public void RecordClear()                              => SendCommand("RECORD_CLEAR");
+        public void RecordStats()                              => SendCommand("RECORD_STATS");
+        public void SpoofS2C(byte[] payload)                   => SendCommand($"SPOOF_S2C {BitConverter.ToString(payload).Replace("-","").ToLower()}");
+        public void TradeCaptureOn()                           => SendCommand("TRADE_CAPTURE_ON");
+        public void TradeCaptureOff()                          => SendCommand("TRADE_CAPTURE_OFF");
+
+        // v19
+        public void VelocityLaunch(float vx, float vy, float vz) => SendCommand($"VELOCITY_LAUNCH {vx:G6} {vy:G6} {vz:G6}");
+        public void VelocityLaunchOff()                           => SendCommand("VELOCITY_LAUNCH_OFF");
+        public void TimeSet(uint ticks)                            => SendCommand($"TIME_SET {ticks}");
+        public void WeatherSet(uint type)                          => SendCommand($"WEATHER_SET {type}");
+        public void RespawnForce()                                 => SendCommand("RESPAWN_FORCE");
+        public void EntityScan(ulong eid)                          => SendCommand($"ENTITY_SCAN {eid:X16}");
+        public void EntityScanStop()                               => SendCommand("ENTITY_SCAN_STOP");
+        public void SpectateOn()                                   => SendCommand("SPECTATE_ON");
+        public void SpectateOff()                                  => SendCommand("SPECTATE_OFF");
+        public void NoclipOn()                                     => SendCommand("NOCLIP_ON");
+        public void NoclipOff()                                    => SendCommand("NOCLIP_OFF");
+        public void InfiniteReachOn()                              => SendCommand("INF_REACH_ON");
+        public void InfiniteReachOff()                             => SendCommand("INF_REACH_OFF");
+
+        // v20
+        public void InvSnapshot()                                  => SendCommand("INV_SNAPSHOT");
+        public void InvLockOn()                                    => SendCommand("INV_LOCK_ON");
+        public void InvLockOff()                                   => SendCommand("INV_LOCK_OFF");
+        public void InvCacheSet(byte[] payload)                    => SendCommand($"INV_CACHE_SET {BitConverter.ToString(payload).Replace("-","").ToLower()}");
+        public void DupeSlot(uint src, uint dst, uint count, uint repeat) => SendCommand($"DUPE_SLOT {src} {dst} {count} {repeat}");
+        public void WindowSteal(uint windowId, uint containerSlot, uint playerSlot) => SendCommand($"WINDOW_STEAL {windowId} {containerSlot} {playerSlot}");
+        public void ItemSpamStart(uint typeId, uint slot, uint count, uint delayMs) => SendCommand($"ITEM_SPAM_START {typeId:X} {slot} {count} {delayMs}");
+        public void ItemSpamStop()                                 => SendCommand("ITEM_SPAM_STOP");
+        public void PermTestBit(int bit)                           => SendCommand($"PERM_TEST_BIT {bit}");
+        public void PermInjectMask(uint mask)                      => SendCommand($"PERM_INJECT_MASK {mask:X8}");
+        public void OpcodeFuzzStart(uint start, uint end, uint delayMs) => SendCommand($"OPCODE_FUZZ_START {start:X} {end:X} {delayMs}");
+        public void OpcodeFuzzStop()                               => SendCommand("OPCODE_FUZZ_STOP");
+        public void OpcodeFuzzStatus()                             => SendCommand("OPCODE_FUZZ_STATUS");
+        public void WaypointAdd(float x, float y, float z)        => SendCommand($"WAYPOINT_ADD {x:G6} {y:G6} {z:G6}");
+        public void WaypointClear()                                => SendCommand("WAYPOINT_CLEAR");
+        public void WaypointRun(uint delayMs)                      => SendCommand($"WAYPOINT_RUN {delayMs}");
+        public void WaypointStop()                                 => SendCommand("WAYPOINT_STOP");
+        public void WaypointStatus()                               => SendCommand("WAYPOINT_STATUS");
+        public void ScriptExec(string script)                      => SendCommand($"SCRIPT_EXEC {BitConverter.ToString(System.Text.Encoding.UTF8.GetBytes(script)).Replace("-","").ToLower()}");
+        public void ScriptStop()                                   => SendCommand("SCRIPT_STOP");
+
         public void QuicheProbe() => SendCommand("QUICHEPROBE");
         public void MemScanBroad()                           => SendCommand("MEMSCAN_BROAD");
         public void MemRead(ulong address, uint size = 64)   => SendCommand($"MEMREAD {address:X} {size}");
@@ -722,6 +850,17 @@ namespace HyForce.Networking
     }
 
     // ── Supporting data types ─────────────────────────────────────────────────────
+    public class QuicStreamEntry
+    {
+        public DateTime Timestamp    { get; set; }
+        public ulong    StreamHandle { get; set; }
+        public string   Direction    { get; set; } = "";
+        public byte[]   Data         { get; set; } = Array.Empty<byte>();
+        public string   HexPreview   { get; set; } = "";
+        public string   AsciiPreview => System.Text.Encoding.ASCII.GetString(
+            Array.ConvertAll(Data, b => b is >= 32 and < 127 ? b : (byte)'.'));
+    }
+
     public class PlaintextEntry
     {
         public DateTime Timestamp  { get; set; }

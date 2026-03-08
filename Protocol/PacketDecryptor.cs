@@ -422,7 +422,8 @@ namespace HyForce
             try
             {
                 int sampleOffset = 1 + dcidLen + 4;
-                if (sampleOffset + 16 > packet.Length) return false;
+                // v16 fix: packet too short to sample → unknown, don't exclude
+                if (sampleOffset + 16 > packet.Length) return true;
                 var mask = ComputeHPMask(hpKey, packet.Skip(sampleOffset).Take(16).ToArray());
                 byte unprotected = (byte)((packet[0] & 0xE0) | ((packet[0] & 0x1F) ^ (mask[0] & 0x1F)));
                 return (unprotected & 0x40) != 0 && (unprotected & 0x18) == 0;
